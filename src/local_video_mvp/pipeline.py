@@ -26,6 +26,7 @@ class VideoPipeline:
         self.http.headers.update({"User-Agent": "local-video-mvp/0.1"})
         self.stage_times: dict[str, float] = {}
         self.warnings: list[str] = []
+        self.caption_stats: dict[str, Any] = {}
         self.used_template_fallback = False
         self._ollama_ready = False
         self._started_at: dt.datetime | None = None
@@ -66,6 +67,7 @@ class VideoPipeline:
                 lambda: self._generate_captions(plan, self.paths["narration_wav"]),
             )
             self._write_srt(self.paths["captions"], captions)
+            self._write_ass(self.paths["captions_ass"], captions)
 
             timeline = self._run_stage("timeline", "Stage 5/7: Building timeline", lambda: self._build_timeline(plan))
             self._write_json(
@@ -93,6 +95,7 @@ class VideoPipeline:
                 "timeline": str(self.paths["timeline"].resolve()),
                 "narration": str(self.paths["narration_wav"].resolve()),
                 "captions": str(self.paths["captions"].resolve()),
+                "captions_ass": str(self.paths["captions_ass"].resolve()),
                 "final_mp4": str(self.paths["final_mp4"].resolve()),
                 "final_srt": str(self.paths["final_srt"].resolve()),
                 "manifest": str(self.paths["manifest"].resolve()),
@@ -122,6 +125,7 @@ class VideoPipeline:
             "narration_raw": project_dir / "narration.raw.wav",
             "narration_wav": project_dir / "narration.wav",
             "captions": project_dir / "captions.srt",
+            "captions_ass": project_dir / "captions.ass",
             "timeline": project_dir / "timeline.json",
             "manifest": project_dir / "rights_manifest.json",
             "run_log": project_dir / "run.log",
@@ -654,19 +658,37 @@ class VideoPipeline:
         return output
 
     def _generate_captions(self, plan: ScriptPlan, narration_wav: Path) -> list[tuple[float, float, str]]:
+        captions: list[tuple[float, float, str]] = []
+
         if self.config.caption_engine == "faster-whisper":
-            segments = self._captions_from_faster_whisper(narration_wav)
-            if segments:
-                return segments
-            self._log("faster-whisper caption pass failed; falling back to heuristic captions")
+            words, segments = self._transcribe_with_faster_whisper(narration_wav)
+            if words:
+                captions = self._chunk_word_events(words)
+                self.caption_stats["source"] = "faster-whisper-words"
+            elif segments:
+                pseudo_words = self._segments_to_pseudo_words(segments)
+                captions = self._chunk_word_events(pseudo_words)
+                self.caption_stats["source"] = "faster-whisper-segments"
+                self._warn("Word timestamps unavailable; using segment-based subtitle timing.")
+            else:
+                self._warn("faster-whisper caption pass failed; falling back to heuristic captions")
 
-        return self._captions_heuristic(plan)
+        if not captions:
+            captions = self._captions_heuristic(plan)
+            self.caption_stats["source"] = "heuristic"
 
-    def _captions_from_faster_whisper(self, narration_wav: Path) -> list[tuple[float, float, str]]:
+        self._update_caption_stats(captions)
+        return captions
+
+    def _transcribe_with_faster_whisper(
+        self,
+        narration_wav: Path,
+    ) -> tuple[list[tuple[float, float, str]], list[tuple[float, float, str]]]:
         try:
             from faster_whisper import WhisperModel  # type: ignore
         except Exception:
-            return []
+            self._warn("faster-whisper not installed; using heuristic subtitles")
+            return ([], [])
 
         try:
             model = WhisperModel("large-v3", device="auto", compute_type="int8")
@@ -674,41 +696,199 @@ class VideoPipeline:
                 str(narration_wav),
                 beam_size=5,
                 vad_filter=True,
-                word_timestamps=False,
+                word_timestamps=True,
             )
-            out: list[tuple[float, float, str]] = []
+
+            word_events: list[tuple[float, float, str]] = []
+            segment_events: list[tuple[float, float, str]] = []
+
             for segment in segments:
-                text = (segment.text or "").strip()
-                if not text:
+                seg_start = float(segment.start)
+                seg_end = float(segment.end)
+                seg_text = (segment.text or "").strip()
+                if seg_text:
+                    segment_events.append((seg_start, max(seg_start + 0.05, seg_end), seg_text))
+
+                raw_words = getattr(segment, "words", None)
+                if not raw_words:
                     continue
-                out.append((float(segment.start), float(segment.end), text))
-            return out
+
+                for raw_word in raw_words:
+                    token = (getattr(raw_word, "word", "") or "").strip()
+                    if not token:
+                        continue
+
+                    word_start = getattr(raw_word, "start", None)
+                    word_end = getattr(raw_word, "end", None)
+                    if word_start is None or word_end is None:
+                        continue
+
+                    start = float(word_start)
+                    end = float(word_end)
+                    if end <= start:
+                        continue
+                    word_events.append((start, end, token))
+
+            return (word_events, segment_events)
         except Exception as exc:
             self._log(f"faster-whisper error: {exc}")
-            return []
+            return ([], [])
+
+    def _segments_to_pseudo_words(
+        self,
+        segments: list[tuple[float, float, str]],
+    ) -> list[tuple[float, float, str]]:
+        words: list[tuple[float, float, str]] = []
+        for seg_start, seg_end, seg_text in segments:
+            tokens = self._tokenize_caption_text(seg_text)
+            if not tokens:
+                continue
+
+            duration = max(0.2, seg_end - seg_start)
+            per_token = duration / max(1, len(tokens))
+            for index, token in enumerate(tokens):
+                start = seg_start + (index * per_token)
+                end = seg_start + ((index + 1) * per_token)
+                words.append((start, end, token))
+
+        return words
 
     def _captions_heuristic(self, plan: ScriptPlan) -> list[tuple[float, float, str]]:
-        chunks: list[tuple[float, float, str]] = []
+        words: list[tuple[float, float, str]] = []
         cursor = 0.0
 
         for scene in plan.scenes:
-            words = scene.voiceover.split()
-            if not words:
+            tokens = self._tokenize_caption_text(scene.voiceover)
+            if not tokens:
                 cursor += scene.seconds
                 continue
 
-            chunk_size = 12
-            lines = [" ".join(words[i : i + chunk_size]) for i in range(0, len(words), chunk_size)]
-            scene_start = cursor
-            line_count = max(1, len(lines))
+            scene_duration = max(scene.seconds, 0.4)
+            per_token = scene_duration / max(1, len(tokens))
+            for index, token in enumerate(tokens):
+                start = cursor + (index * per_token)
+                end = cursor + ((index + 1) * per_token)
+                words.append((start, end, token))
 
-            for idx, line in enumerate(lines):
-                start = scene_start + (scene.seconds * idx / line_count)
-                end = scene_start + (scene.seconds * (idx + 1) / line_count)
-                chunks.append((start, end, line.strip()))
-            cursor = scene_start + scene.seconds
+            cursor += scene_duration
 
-        return chunks
+        return self._chunk_word_events(words)
+
+    def _chunk_word_events(self, words: list[tuple[float, float, str]]) -> list[tuple[float, float, str]]:
+        if not words:
+            return []
+
+        if self.config.caption_style == "line":
+            min_words = max(4, self.config.caption_words_min)
+            max_words = max(min_words, max(self.config.caption_words_max, 10))
+            max_chars = max(self.config.caption_max_chars, 42)
+            min_seconds = max(self.config.caption_min_seconds, 1.0)
+            max_seconds = max(self.config.caption_max_seconds, 4.0)
+        else:
+            min_words = self.config.caption_words_min
+            max_words = self.config.caption_words_max
+            max_chars = self.config.caption_max_chars
+            min_seconds = self.config.caption_min_seconds
+            max_seconds = self.config.caption_max_seconds
+
+        chunks: list[tuple[float, float, str]] = []
+        current: list[tuple[float, float, str]] = []
+
+        def flush_current() -> None:
+            if not current:
+                return
+            start = float(current[0][0])
+            end = float(current[-1][1])
+            text = self._join_caption_tokens([item[2] for item in current])
+            if text:
+                chunks.append((start, max(start + 0.05, end), text))
+            current.clear()
+
+        for start, end, token in words:
+            normalized = token.strip()
+            if not normalized:
+                continue
+
+            if not current:
+                current.append((start, end, normalized))
+                continue
+
+            gap = start - current[-1][1]
+            candidate_tokens = [item[2] for item in current] + [normalized]
+            candidate_text = self._join_caption_tokens(candidate_tokens)
+            candidate_words = len(candidate_tokens)
+            candidate_duration = end - current[0][0]
+
+            should_break = False
+            if gap >= 0.38 and len(current) >= min_words:
+                should_break = True
+            if candidate_words > max_words:
+                should_break = True
+            if len(candidate_text) > max_chars:
+                should_break = True
+            if candidate_duration > max_seconds:
+                should_break = True
+
+            if should_break:
+                flush_current()
+
+            current.append((start, end, normalized))
+
+            if self._token_has_terminal_punctuation(normalized) and len(current) >= min_words:
+                flush_current()
+
+        flush_current()
+
+        if not chunks:
+            return []
+
+        stabilized: list[tuple[float, float, str]] = []
+        for index, (start, end, text) in enumerate(chunks):
+            next_start = chunks[index + 1][0] if index + 1 < len(chunks) else None
+            target_end = end
+            if (end - start) < min_seconds:
+                target_end = start + min_seconds
+                if next_start is not None:
+                    target_end = min(target_end, max(start + 0.08, next_start - 0.03))
+            if target_end <= start:
+                target_end = end
+            stabilized.append((start, target_end, text))
+
+        return stabilized
+
+    def _tokenize_caption_text(self, text: str) -> list[str]:
+        return re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?|[.,!?;:]", text)
+
+    def _join_caption_tokens(self, tokens: list[str]) -> str:
+        punctuation = {".", ",", "!", "?", ";", ":"}
+        out = ""
+        for token in tokens:
+            if not out:
+                out = token
+            elif token in punctuation:
+                out += token
+            else:
+                out += " " + token
+        return out.strip()
+
+    def _token_has_terminal_punctuation(self, token: str) -> bool:
+        return token.endswith((".", "!", "?", ";"))
+
+    def _update_caption_stats(self, captions: list[tuple[float, float, str]]) -> None:
+        if not captions:
+            self.caption_stats["entries"] = 0
+            self.caption_stats["avg_words_per_entry"] = 0.0
+            return
+
+        word_counts = [len(text.split()) for _, _, text in captions if text.strip()]
+        durations = [max(0.01, end - start) for start, end, _ in captions]
+        avg_words = (sum(word_counts) / len(word_counts)) if word_counts else 0.0
+        avg_duration = (sum(durations) / len(durations)) if durations else 0.0
+
+        self.caption_stats["entries"] = len(captions)
+        self.caption_stats["avg_words_per_entry"] = round(avg_words, 2)
+        self.caption_stats["avg_duration_seconds"] = round(avg_duration, 2)
+        self.caption_stats["style"] = self.config.caption_style
 
     def _write_srt(self, srt_path: Path, captions: list[tuple[float, float, str]]) -> None:
         lines: list[str] = []
@@ -718,6 +898,44 @@ class VideoPipeline:
             lines.append(text)
             lines.append("")
         self._write_text(srt_path, "\n".join(lines))
+
+    def _write_ass(self, ass_path: Path, captions: list[tuple[float, float, str]]) -> None:
+        font_size = max(26, int(self.config.height * (0.05 if self.config.caption_style == "engagement" else 0.042)))
+        margin_v = max(30, int(self.config.height * 0.075))
+        outline = 2.6 if self.config.caption_style == "engagement" else 2.0
+        shadow = 0.8 if self.config.caption_style == "engagement" else 0.5
+
+        lines = [
+            "[Script Info]",
+            "ScriptType: v4.00+",
+            "WrapStyle: 2",
+            "ScaledBorderAndShadow: yes",
+            "YCbCr Matrix: TV.709",
+            "",
+            "[V4+ Styles]",
+            (
+                "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+                "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, "
+                "Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding"
+            ),
+            (
+                "Style: Caption,Helvetica Neue,"
+                f"{font_size},&H00FFFFFF,&H00FFFFFF,&H00101010,&H64000000,"
+                "-1,0,0,0,100,100,0,0,1,"
+                f"{outline},{shadow},2,40,40,{margin_v},1"
+            ),
+            "",
+            "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+        ]
+
+        for start, end, text in captions:
+            safe_text = self._escape_ass_text(text)
+            lines.append(
+                f"Dialogue: 0,{self._format_ass_time(start)},{self._format_ass_time(end)},Caption,,0,0,0,,{safe_text}"
+            )
+
+        self._write_text(ass_path, "\n".join(lines) + "\n")
 
     def _build_timeline(self, plan: ScriptPlan) -> list[TimelineClip]:
         clips: list[TimelineClip] = []
@@ -780,6 +998,7 @@ class VideoPipeline:
         if concat.returncode != 0:
             raise RuntimeError(f"Failed to concat clips: {concat.stderr.strip()}")
 
+        mixed_mp4 = render_dir / "master_with_audio.mp4"
         mux = self._run_command(
             [
                 "ffmpeg",
@@ -799,13 +1018,18 @@ class VideoPipeline:
                 "-b:a",
                 "192k",
                 "-shortest",
-                str(final_mp4),
+                str(mixed_mp4),
             ],
             timeout=1200,
             check=False,
         )
         if mux.returncode != 0:
             raise RuntimeError(f"Failed to mux narration and video: {mux.stderr.strip()}")
+
+        if self.config.burn_subtitles:
+            self._burn_subtitles(mixed_mp4, self.paths["captions_ass"], final_mp4)
+        else:
+            shutil.copy2(mixed_mp4, final_mp4)
 
     def _render_single_clip(self, clip: TimelineClip, output_clip: Path, index: int) -> None:
         duration = max(0.3, clip.seconds)
@@ -907,8 +1131,52 @@ class VideoPipeline:
             str(output_clip),
         ]
 
+    def _burn_subtitles(self, input_mp4: Path, subtitles_ass: Path, output_mp4: Path) -> None:
+        if not subtitles_ass.exists() or subtitles_ass.stat().st_size == 0:
+            self._warn("Subtitle burn-in skipped because captions.ass is missing or empty.")
+            shutil.copy2(input_mp4, output_mp4)
+            return
+
+        filter_value = self._ffmpeg_subtitles_filter(subtitles_ass)
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_mp4),
+            "-vf",
+            filter_value,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "copy",
+            str(output_mp4),
+        ]
+        result = self._run_command(command, timeout=2400, check=False)
+        if result.returncode != 0:
+            self._warn(f"Subtitle burn-in failed; shipping video without burned subtitles. Details: {result.stderr.strip()}")
+            shutil.copy2(input_mp4, output_mp4)
+
+    def _ffmpeg_subtitles_filter(self, subtitles_ass: Path) -> str:
+        value = str(subtitles_ass.resolve())
+        value = value.replace("\\", "\\\\")
+        value = value.replace(":", "\\:")
+        value = value.replace("'", "\\'")
+        return f"subtitles='{value}':charenc=UTF-8"
+
     def _build_manifest(self, plan: ScriptPlan, rights: list[AssetRight]) -> dict[str, Any]:
-        out_files = [self.paths["final_mp4"], self.paths["final_srt"], self.paths["script"], self.paths["timeline"]]
+        out_files = [
+            self.paths["final_mp4"],
+            self.paths["final_srt"],
+            self.paths["captions_ass"],
+            self.paths["script"],
+            self.paths["timeline"],
+        ]
         outputs: list[dict[str, Any]] = []
         for path in out_files:
             if path.exists():
@@ -952,6 +1220,8 @@ class VideoPipeline:
                 "script_engine": self.config.script_engine,
                 "tts_engine": self.config.tts_engine,
                 "caption_engine": self.config.caption_engine,
+                "caption_style": self.config.caption_style,
+                "burn_subtitles": self.config.burn_subtitles,
                 "ollama_model": self.config.ollama_model,
             },
             "inputs": {
@@ -1011,13 +1281,13 @@ class VideoPipeline:
         base = self._base_clip_vf()
         heading_clean = self._escape_drawtext((heading or "Explainer Segment")[:80])
         scene_label = self._escape_drawtext(f"Scene {index + 1}")
-        heading_size = max(24, int(self.config.height * 0.045))
-        label_size = max(18, int(self.config.height * 0.028))
+        heading_size = max(22, int(self.config.height * 0.038))
+        label_size = max(16, int(self.config.height * 0.024))
         return (
             f"{base},"
-            "drawbox=x=0:y=ih*0.76:w=iw:h=ih*0.24:color=black@0.45:t=fill,"
+            "drawbox=x=0:y=0:w=iw:h=ih*0.17:color=black@0.35:t=fill,"
             f"drawtext=text='{scene_label}':fontcolor=white@0.85:fontsize={label_size}:x=40:y=40,"
-            f"drawtext=text='{heading_clean}':fontcolor=white:fontsize={heading_size}:x=(w-text_w)/2:y=h*0.84:"
+            f"drawtext=text='{heading_clean}':fontcolor=white:fontsize={heading_size}:x=(w-text_w)/2:y=h*0.08:"
             "shadowcolor=black@0.9:shadowx=2:shadowy=2"
         )
 
@@ -1039,6 +1309,7 @@ class VideoPipeline:
             "total_seconds": round((finished - started).total_seconds(), 3),
             "stage_times": self.stage_times,
             "warnings": self.warnings,
+            "caption_stats": self.caption_stats,
             "fallbacks": {
                 "used_template_script": self.used_template_fallback,
             },
@@ -1147,6 +1418,22 @@ class VideoPipeline:
         secs = total_ms // 1000
         ms = total_ms % 1000
         return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
+    def _format_ass_time(self, seconds: float) -> str:
+        total_cs = max(0, int(math.floor(seconds * 100)))
+        hours = total_cs // 360000
+        total_cs %= 360000
+        minutes = total_cs // 6000
+        total_cs %= 6000
+        secs = total_cs // 100
+        cs = total_cs % 100
+        return f"{hours}:{minutes:02d}:{secs:02d}.{cs:02d}"
+
+    def _escape_ass_text(self, text: str) -> str:
+        value = text.replace("\\", r"\\")
+        value = value.replace("{", r"\{")
+        value = value.replace("}", r"\}")
+        return value
 
     def _log(self, message: str) -> None:
         self._log_with_level(message, level="INFO")

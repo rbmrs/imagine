@@ -18,6 +18,13 @@ class PipelineConfig:
     require_ollama: bool = False
     tts_engine: str = "melo"
     caption_engine: str = "heuristic"
+    caption_style: str = "engagement"
+    burn_subtitles: bool = True
+    caption_words_min: int = 2
+    caption_words_max: int = 5
+    caption_max_chars: int = 32
+    caption_min_seconds: float = 0.7
+    caption_max_seconds: float = 2.4
     strict_commercial_safe: bool = True
     allow_system_tts: bool = False
     pexels_api_key: str | None = None

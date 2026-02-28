@@ -24,7 +24,7 @@ Pipeline stages:
 ## Requirements
 
 - macOS (Apple Silicon recommended)
-- Python 3.10+
+- Python 3.9+
 - `ffmpeg` and `ffprobe` in PATH
 - Optional for script generation: `ollama`
 - Optional for local TTS: `melo-tts`
@@ -90,7 +90,9 @@ local-video-mvp run \
   --script-engine ollama \
   --ollama-model qwen2.5:14b \
   --tts-engine melo \
-  --caption-engine heuristic \
+  --caption-engine faster-whisper \
+  --caption-style engagement \
+  --burn-subtitles \
   --strict-commercial-safe
 ```
 
@@ -119,6 +121,7 @@ Every run writes:
 
 - `run.log` (line-by-line stage logs)
 - `run_report.json` (status, timings, warnings, outputs)
+- `captions.ass` (styled subtitle file used for burn-in)
 
 Inspect quickly:
 
@@ -138,6 +141,7 @@ projects/<project>/
   narration.raw.wav
   narration.wav
   captions.srt
+  captions.ass
   timeline.json
   rights_manifest.json
   assets/

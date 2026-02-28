@@ -64,6 +64,23 @@ def build_parser() -> argparse.ArgumentParser:
         default="heuristic",
         help="Caption generation backend",
     )
+    run.add_argument(
+        "--caption-style",
+        choices=["engagement", "line"],
+        default="engagement",
+        help="Subtitle style preset",
+    )
+    run.add_argument(
+        "--burn-subtitles",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Burn subtitles into final MP4 (default: true)",
+    )
+    run.add_argument("--caption-words-min", type=int, default=2, help="Minimum words per subtitle chunk")
+    run.add_argument("--caption-words-max", type=int, default=5, help="Maximum words per subtitle chunk")
+    run.add_argument("--caption-max-chars", type=int, default=32, help="Maximum characters per subtitle chunk")
+    run.add_argument("--caption-min-seconds", type=float, default=0.7, help="Minimum subtitle duration")
+    run.add_argument("--caption-max-seconds", type=float, default=2.4, help="Maximum subtitle duration")
 
     run.add_argument(
         "--strict-commercial-safe",
@@ -91,6 +108,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run_command(args: argparse.Namespace) -> int:
     width, height = _parse_resolution(args.resolution)
+    caption_words_min = max(1, int(args.caption_words_min))
+    caption_words_max = max(caption_words_min, int(args.caption_words_max))
+    caption_min_seconds = max(0.2, float(args.caption_min_seconds))
+    caption_max_seconds = max(caption_min_seconds, float(args.caption_max_seconds))
 
     config = PipelineConfig(
         prompt=args.prompt.strip(),
@@ -104,6 +125,13 @@ def run_command(args: argparse.Namespace) -> int:
         require_ollama=bool(args.require_ollama),
         tts_engine=args.tts_engine,
         caption_engine=args.caption_engine,
+        caption_style=args.caption_style,
+        burn_subtitles=bool(args.burn_subtitles),
+        caption_words_min=caption_words_min,
+        caption_words_max=caption_words_max,
+        caption_max_chars=max(8, int(args.caption_max_chars)),
+        caption_min_seconds=caption_min_seconds,
+        caption_max_seconds=caption_max_seconds,
         strict_commercial_safe=bool(args.strict_commercial_safe),
         allow_system_tts=bool(args.allow_system_tts),
         pexels_api_key=args.pexels_api_key,
@@ -126,6 +154,7 @@ def run_command(args: argparse.Namespace) -> int:
         "timeline",
         "narration",
         "captions",
+        "captions_ass",
         "final_mp4",
         "final_srt",
         "manifest",
@@ -169,6 +198,12 @@ def inspect_command(args: argparse.Namespace) -> int:
             print(f"  - {warning}")
     else:
         print("- warnings: none")
+
+    caption_stats = payload.get("caption_stats", {})
+    if isinstance(caption_stats, dict) and caption_stats:
+        print("- caption_stats:")
+        for key, value in caption_stats.items():
+            print(f"  - {key}: {value}")
 
     outputs = payload.get("outputs", {})
     if isinstance(outputs, dict) and outputs:
