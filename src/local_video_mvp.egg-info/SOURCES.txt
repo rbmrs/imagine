@@ -1,0 +1,12 @@
+README.md
+pyproject.toml
+src/local_video_mvp/__init__.py
+src/local_video_mvp/cli.py
+src/local_video_mvp/models.py
+src/local_video_mvp/pipeline.py
+src/local_video_mvp.egg-info/PKG-INFO
+src/local_video_mvp.egg-info/SOURCES.txt
+src/local_video_mvp.egg-info/dependency_links.txt
+src/local_video_mvp.egg-info/entry_points.txt
+src/local_video_mvp.egg-info/requires.txt
+src/local_video_mvp.egg-info/top_level.txt

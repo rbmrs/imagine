@@ -1,0 +1,7 @@
+requests>=2.32.0
+
+[captions]
+faster-whisper>=1.1.0
+
+[voice]
+MeloTTS @ git+https://github.com/myshell-ai/MeloTTS.git

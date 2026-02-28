@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-video-mvp"
+version = "0.1.0"
+description = "Local-first long-form explainer video generator MVP"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "requests>=2.32.0",
+]
+
+[project.optional-dependencies]
+voice = ["MeloTTS @ git+https://github.com/myshell-ai/MeloTTS.git"]
+captions = ["faster-whisper>=1.1.0"]
+
+[project.scripts]
+local-video-mvp = "local_video_mvp.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
