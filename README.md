@@ -125,6 +125,8 @@ Voice pacing defaults to `calm-documentary`. You can switch later with:
 - `--voice-profile balanced`
 - `--voice-profile energetic-explainer`
 
+Pause boundaries are automatically refined to avoid awkward breaks before tiny trailing words and after common function words.
+
 If you use `--script-engine ollama`, make sure Ollama server is running:
 
 ```bash

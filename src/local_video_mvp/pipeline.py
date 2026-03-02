@@ -18,6 +18,50 @@ import requests
 from .models import AssetRight, PipelineConfig, Scene, ScriptPlan, TimelineClip
 
 
+FUNCTION_WORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "being",
+    "between",
+    "but",
+    "by",
+    "for",
+    "from",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "our",
+    "so",
+    "than",
+    "that",
+    "the",
+    "their",
+    "there",
+    "these",
+    "this",
+    "those",
+    "to",
+    "was",
+    "were",
+    "which",
+    "while",
+    "with",
+    "without",
+}
+
+
 class VideoPipeline:
     def __init__(self, config: PipelineConfig):
         self.config = config
@@ -771,19 +815,31 @@ class VideoPipeline:
         max_words = int(settings["max_words_per_chunk"])
         paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
         chunks: list[dict[str, Any]] = []
+        merge_summary = {
+            "merged_boundaries": 0,
+            "function_word_avoids": 0,
+            "tiny_tail_avoids": 0,
+            "short_lead_avoids": 0,
+        }
 
         for p_idx, paragraph in enumerate(paragraphs):
             sentences = self._split_sentences(paragraph)
             for s_idx, sentence in enumerate(sentences):
                 fragments = self._split_long_sentence(sentence, max_words=max_words)
+                fragments, merge_counts = self._merge_awkward_fragment_boundaries(fragments, max_words=max_words)
+                for key in merge_summary:
+                    merge_summary[key] += int(merge_counts.get(key, 0))
+
                 for f_idx, fragment in enumerate(fragments):
                     fragment_text = fragment.strip()
                     if not fragment_text:
                         continue
 
-                    pause = float(settings["clause_pause"])
                     if f_idx == len(fragments) - 1:
                         pause = float(settings["sentence_pause"])
+                    else:
+                        pause = self._clause_pause_for_fragment(fragment_text, settings)
+
                     if s_idx == len(sentences) - 1 and f_idx == len(fragments) - 1 and p_idx < len(paragraphs) - 1:
                         pause = float(settings["paragraph_pause"])
 
@@ -808,6 +864,10 @@ class VideoPipeline:
             "planned_chunks": len(chunks),
             "planned_words": word_count,
             "planned_pause_seconds": round(pause_total, 3),
+            "merged_boundaries": merge_summary["merged_boundaries"],
+            "function_word_avoids": merge_summary["function_word_avoids"],
+            "tiny_tail_avoids": merge_summary["tiny_tail_avoids"],
+            "short_lead_avoids": merge_summary["short_lead_avoids"],
         }
         return chunks
 
@@ -852,6 +912,98 @@ class VideoPipeline:
             chunks.append(current.strip())
 
         return chunks or [sentence.strip()]
+
+    def _clause_pause_for_fragment(self, fragment: str, settings: dict[str, float]) -> float:
+        pause = float(settings["clause_pause"])
+        words = self._word_count_text(fragment)
+
+        # If a boundary came from hard splitting (no comma/semicolon), keep this micro-pause subtle.
+        if not self._has_clause_terminal_punctuation(fragment):
+            pause = min(pause, 0.08)
+
+        # Do not over-emphasize very short fragments.
+        if words <= 3:
+            pause = min(pause, 0.06)
+        elif words <= 5:
+            pause = min(pause, 0.09)
+
+        return max(0.02, pause)
+
+    def _merge_awkward_fragment_boundaries(
+        self,
+        fragments: list[str],
+        max_words: int,
+    ) -> tuple[list[str], dict[str, int]]:
+        counts = {
+            "merged_boundaries": 0,
+            "function_word_avoids": 0,
+            "tiny_tail_avoids": 0,
+            "short_lead_avoids": 0,
+        }
+        cleaned = [part.strip() for part in fragments if part.strip()]
+        if len(cleaned) <= 1:
+            return cleaned, counts
+
+        merged: list[str] = [cleaned[0]]
+        for right in cleaned[1:]:
+            left = merged[-1]
+            reason = self._boundary_merge_reason(left, right, max_words=max_words)
+            if reason is None:
+                merged.append(right)
+                continue
+
+            merged[-1] = f"{left} {right}".strip()
+            counts["merged_boundaries"] += 1
+            if reason == "function_word":
+                counts["function_word_avoids"] += 1
+            elif reason == "tiny_tail":
+                counts["tiny_tail_avoids"] += 1
+            elif reason == "short_lead":
+                counts["short_lead_avoids"] += 1
+
+        # Final guard: avoid ending with a tiny trailing chunk.
+        while len(merged) > 1 and self._word_count_text(merged[-1]) <= 2:
+            prev_words = self._word_count_text(merged[-2])
+            tail_words = self._word_count_text(merged[-1])
+            if prev_words + tail_words > (max_words + 4):
+                break
+            merged[-2] = f"{merged[-2]} {merged[-1]}".strip()
+            merged.pop()
+            counts["merged_boundaries"] += 1
+            counts["tiny_tail_avoids"] += 1
+
+        return merged, counts
+
+    def _boundary_merge_reason(self, left: str, right: str, max_words: int) -> str | None:
+        left_words = self._word_count_text(left)
+        right_words = self._word_count_text(right)
+        last_token = self._last_word_token(left)
+
+        if last_token and self._is_function_word(last_token):
+            return "function_word"
+
+        if right_words <= 2 and (left_words + right_words) <= (max_words + 4):
+            return "tiny_tail"
+
+        if left_words <= 3 and (left_words + right_words) <= (max_words + 2):
+            return "short_lead"
+
+        return None
+
+    def _last_word_token(self, text: str) -> str | None:
+        tokens = re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", text or "")
+        if not tokens:
+            return None
+        return tokens[-1].lower()
+
+    def _is_function_word(self, token: str | None) -> bool:
+        if not token:
+            return False
+        return token.lower() in FUNCTION_WORDS
+
+    def _has_clause_terminal_punctuation(self, text: str) -> bool:
+        value = (text or "").strip()
+        return value.endswith((",", ";", ":"))
 
     def _word_count_text(self, text: str) -> int:
         return len(re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", text or ""))
