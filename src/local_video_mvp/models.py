@@ -25,10 +25,16 @@ class PipelineConfig:
     caption_max_chars: int = 32
     caption_min_seconds: float = 0.7
     caption_max_seconds: float = 2.4
+    caption_font_scale: float = 0.9
+    caption_bottom_ratio: float = 0.055
+    duration_tolerance_ratio: float = 0.25
+    target_speech_wpm: int = 145
+    max_duration_adjust_passes: int = 2
     strict_commercial_safe: bool = True
     allow_system_tts: bool = False
     pexels_api_key: str | None = None
     pixabay_api_key: str | None = None
+    voice_profile: str = "calm-documentary"
     voice_speed: float = 1.0
     melo_language: str = "EN"
     melo_speaker: str = "EN-US"

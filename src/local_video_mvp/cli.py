@@ -54,6 +54,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="melo",
         help="Narration engine",
     )
+    run.add_argument(
+        "--voice-profile",
+        choices=["calm-documentary", "balanced", "energetic-explainer"],
+        default="calm-documentary",
+        help="Narration pacing profile",
+    )
     run.add_argument("--voice-speed", type=float, default=1.0, help="TTS speed multiplier")
     run.add_argument("--melo-language", default="EN", help="Melo language code")
     run.add_argument("--melo-speaker", default="EN-US", help="Preferred Melo speaker id")
@@ -81,6 +87,27 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--caption-max-chars", type=int, default=32, help="Maximum characters per subtitle chunk")
     run.add_argument("--caption-min-seconds", type=float, default=0.7, help="Minimum subtitle duration")
     run.add_argument("--caption-max-seconds", type=float, default=2.4, help="Maximum subtitle duration")
+    run.add_argument("--caption-font-scale", type=float, default=0.9, help="Subtitle font size scale multiplier")
+    run.add_argument(
+        "--caption-bottom-ratio",
+        type=float,
+        default=0.055,
+        help="Subtitle bottom margin ratio (smaller = lower on screen)",
+    )
+
+    run.add_argument(
+        "--duration-tolerance",
+        type=float,
+        default=0.25,
+        help="Allowed duration delta ratio. Example: 0.25 = +/-25%%",
+    )
+    run.add_argument("--target-speech-wpm", type=int, default=145, help="Target narration words-per-minute")
+    run.add_argument(
+        "--max-duration-adjust-passes",
+        type=int,
+        default=2,
+        help="Maximum script auto-adjust passes for duration control",
+    )
 
     run.add_argument(
         "--strict-commercial-safe",
@@ -103,6 +130,30 @@ def build_parser() -> argparse.ArgumentParser:
     inspect = subparsers.add_parser("inspect", help="Inspect latest run logs/report")
     inspect.add_argument("--project-dir", required=True, help="Project directory to inspect")
 
+    voices = subparsers.add_parser("voices", help="List available local Melo voices")
+    voices.add_argument("--melo-language", default="EN", help="Melo language code")
+
+    voice_ab = subparsers.add_parser("voice-ab", help="Generate local A/B voice samples")
+    voice_ab.add_argument("--project-dir", required=True, help="Project directory used as source and output root")
+    voice_ab.add_argument("--source-file", help="Optional text file used as sample source")
+    voice_ab.add_argument(
+        "--speakers",
+        nargs="+",
+        default=["EN-US", "EN-Default", "EN-AU"],
+        help="Speaker ids to compare",
+    )
+    voice_ab.add_argument("--sample-words", type=int, default=130, help="Approximate words used per sample")
+    voice_ab.add_argument(
+        "--voice-profile",
+        choices=["calm-documentary", "balanced", "energetic-explainer"],
+        default="calm-documentary",
+        help="Narration pacing profile for all samples",
+    )
+    voice_ab.add_argument("--voice-speed", type=float, default=1.0, help="Base voice speed multiplier")
+    voice_ab.add_argument("--melo-language", default="EN", help="Melo language code")
+    voice_ab.add_argument("--output-dir", help="Optional custom output directory")
+    voice_ab.add_argument("--verbose", action="store_true", help="Verbose logs")
+
     return parser
 
 
@@ -112,6 +163,9 @@ def run_command(args: argparse.Namespace) -> int:
     caption_words_max = max(caption_words_min, int(args.caption_words_max))
     caption_min_seconds = max(0.2, float(args.caption_min_seconds))
     caption_max_seconds = max(caption_min_seconds, float(args.caption_max_seconds))
+    caption_font_scale = max(0.65, min(1.4, float(args.caption_font_scale)))
+    caption_bottom_ratio = max(0.02, min(0.2, float(args.caption_bottom_ratio)))
+    duration_tolerance = max(0.05, min(0.6, float(args.duration_tolerance)))
 
     config = PipelineConfig(
         prompt=args.prompt.strip(),
@@ -132,10 +186,16 @@ def run_command(args: argparse.Namespace) -> int:
         caption_max_chars=max(8, int(args.caption_max_chars)),
         caption_min_seconds=caption_min_seconds,
         caption_max_seconds=caption_max_seconds,
+        caption_font_scale=caption_font_scale,
+        caption_bottom_ratio=caption_bottom_ratio,
+        duration_tolerance_ratio=duration_tolerance,
+        target_speech_wpm=max(90, min(220, int(args.target_speech_wpm))),
+        max_duration_adjust_passes=max(0, int(args.max_duration_adjust_passes)),
         strict_commercial_safe=bool(args.strict_commercial_safe),
         allow_system_tts=bool(args.allow_system_tts),
         pexels_api_key=args.pexels_api_key,
         pixabay_api_key=args.pixabay_api_key,
+        voice_profile=args.voice_profile,
         voice_speed=max(0.5, min(2.0, float(args.voice_speed))),
         melo_language=args.melo_language,
         melo_speaker=args.melo_speaker,
@@ -205,6 +265,18 @@ def inspect_command(args: argparse.Namespace) -> int:
         for key, value in caption_stats.items():
             print(f"  - {key}: {value}")
 
+    duration_stats = payload.get("duration_stats", {})
+    if isinstance(duration_stats, dict) and duration_stats:
+        print("- duration_stats:")
+        for key, value in duration_stats.items():
+            print(f"  - {key}: {value}")
+
+    pacing_stats = payload.get("pacing_stats", {})
+    if isinstance(pacing_stats, dict) and pacing_stats:
+        print("- pacing_stats:")
+        for key, value in pacing_stats.items():
+            print(f"  - {key}: {value}")
+
     outputs = payload.get("outputs", {})
     if isinstance(outputs, dict) and outputs:
         print("- outputs:")
@@ -213,6 +285,171 @@ def inspect_command(args: argparse.Namespace) -> int:
 
     print(f"- report_file: {report_path}")
     print(f"- log_file: {log_path}")
+    return 0
+
+
+def _load_melo_speakers(language: str) -> dict[str, int]:
+    from melo.api import TTS  # type: ignore
+
+    tts = TTS(language=language, device="auto")
+    hps = getattr(tts, "hps", None)
+    hps_data = getattr(hps, "data", None)
+    return dict(getattr(hps_data, "spk2id", {}) or {})
+
+
+def _load_voice_sample_source(project_dir: Path, source_file: str | None) -> str:
+    if source_file:
+        source_path = Path(source_file).expanduser().resolve()
+        if not source_path.exists():
+            raise RuntimeError(f"Source file not found: {source_path}")
+        return source_path.read_text(encoding="utf-8")
+
+    candidates = [
+        project_dir / "review" / "script_review.md",
+        project_dir / "narration.txt",
+        project_dir / "script.json",
+        project_dir / "prompt.txt",
+    ]
+
+    for path in candidates:
+        if not path.exists():
+            continue
+
+        if path.suffix.lower() == ".json":
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            scenes = payload.get("scenes", [])
+            if isinstance(scenes, list):
+                text = "\n\n".join(
+                    str(scene.get("voiceover") or "").strip()
+                    for scene in scenes
+                    if isinstance(scene, dict) and str(scene.get("voiceover") or "").strip()
+                )
+                if text.strip():
+                    return text
+            continue
+
+        raw = path.read_text(encoding="utf-8")
+        if path.suffix.lower() == ".md":
+            lines = [line for line in raw.splitlines() if not line.strip().startswith("#")]
+            raw = "\n".join(lines)
+        if raw.strip():
+            return raw
+
+    raise RuntimeError(
+        "Could not find source text. Provide --source-file or ensure narration/script files exist in the project."
+    )
+
+
+def voices_command(args: argparse.Namespace) -> int:
+    try:
+        spk2id = _load_melo_speakers(args.melo_language)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            "MeloTTS not available. Install voice dependencies with: "
+            "python -m pip install -e '.[voice]'",
+            file=sys.stderr,
+        )
+        return 2
+
+    if not spk2id:
+        print("No Melo speakers reported for this language/model.")
+        return 0
+
+    print("\nAvailable Melo voices:\n")
+    for name, speaker_id in sorted(spk2id.items(), key=lambda pair: str(pair[0])):
+        print(f"- {name}: {speaker_id}")
+    return 0
+
+
+def voice_ab_command(args: argparse.Namespace) -> int:
+    project_dir = Path(args.project_dir).expanduser().resolve()
+    if not project_dir.exists():
+        raise RuntimeError(f"Project directory not found: {project_dir}")
+
+    source_text = _load_voice_sample_source(project_dir, args.source_file)
+
+    try:
+        available = _load_melo_speakers(args.melo_language)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error loading Melo voices: {exc}", file=sys.stderr)
+        return 2
+
+    requested: list[str] = []
+    seen: set[str] = set()
+    for speaker in args.speakers:
+        key = str(speaker).strip()
+        if not key:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        requested.append(key)
+
+    valid = [speaker for speaker in requested if speaker in available]
+    invalid = [speaker for speaker in requested if speaker not in available]
+    if invalid:
+        print(f"Skipping unknown speakers: {', '.join(invalid)}")
+
+    if not valid:
+        fallback = [name for name in ["EN-US", "EN-Default", "EN-AU"] if name in available]
+        valid = fallback or list(sorted(available.keys()))[:3]
+
+    output_dir = (
+        Path(args.output_dir).expanduser().resolve() if args.output_dir else (project_dir / "output" / "voice_ab")
+    )
+
+    config = PipelineConfig(
+        prompt="voice-ab",
+        project_dir=project_dir,
+        minutes=1,
+        width=1280,
+        height=720,
+        fps=30,
+        script_engine="template",
+        ollama_model="qwen2.5:14b",
+        require_ollama=False,
+        tts_engine="melo",
+        caption_engine="heuristic",
+        caption_style="engagement",
+        burn_subtitles=True,
+        caption_words_min=2,
+        caption_words_max=5,
+        caption_max_chars=32,
+        caption_min_seconds=0.7,
+        caption_max_seconds=2.4,
+        caption_font_scale=0.9,
+        caption_bottom_ratio=0.055,
+        duration_tolerance_ratio=0.25,
+        target_speech_wpm=145,
+        max_duration_adjust_passes=1,
+        strict_commercial_safe=True,
+        allow_system_tts=False,
+        pexels_api_key=None,
+        pixabay_api_key=None,
+        voice_profile=args.voice_profile,
+        voice_speed=max(0.5, min(2.0, float(args.voice_speed))),
+        melo_language=args.melo_language,
+        melo_speaker=valid[0],
+        max_scenes=40,
+        min_scene_seconds=5.0,
+        verbose=bool(args.verbose),
+    )
+
+    pipeline = VideoPipeline(config)
+    report = pipeline.generate_voice_ab_samples(
+        text=source_text,
+        speakers=valid,
+        output_dir=output_dir,
+        sample_words=max(40, int(args.sample_words)),
+    )
+
+    print("\nVoice A/B samples generated:\n")
+    print(f"- output_dir: {report['output_dir']}")
+    print(f"- compare_mix: {report['compare_mix']}")
+    print(f"- report_file: {report['report_file']}")
+    print("- samples:")
+    for item in report.get("samples", []):
+        print(f"  - {item['speaker']}: {item['file']} ({item['duration_seconds']}s)")
     return 0
 
 
@@ -225,6 +462,10 @@ def main() -> int:
             return run_command(args)
         if args.command == "inspect":
             return inspect_command(args)
+        if args.command == "voices":
+            return voices_command(args)
+        if args.command == "voice-ab":
+            return voice_ab_command(args)
     except Exception as exc:  # noqa: BLE001
         print(f"Error: {exc}", file=sys.stderr)
         return 2

@@ -81,6 +81,23 @@ If no key is available, the renderer still works using generated placeholder vis
 
 ## Run
 
+Single-terminal pattern (starts Ollama in background and auto-stops it after completion):
+
+```bash
+source .venv/bin/activate
+set -a; source .env; set +a
+
+OLLAMA_PID=""
+if ! pgrep -f "ollama serve" >/dev/null; then
+  ollama serve >/tmp/ollama.log 2>&1 &
+  OLLAMA_PID=$!
+  sleep 2
+fi
+trap '[ -n "$OLLAMA_PID" ] && kill "$OLLAMA_PID"' EXIT
+```
+
+Then run:
+
 ```bash
 local-video-mvp run \
   --prompt "Explain how diffusion models work for beginners" \
@@ -90,11 +107,23 @@ local-video-mvp run \
   --script-engine ollama \
   --ollama-model qwen2.5:14b \
   --tts-engine melo \
+  --voice-profile calm-documentary \
   --caption-engine faster-whisper \
   --caption-style engagement \
+  --caption-font-scale 0.9 \
+  --caption-bottom-ratio 0.055 \
   --burn-subtitles \
+  --duration-tolerance 0.25 \
   --strict-commercial-safe
 ```
+
+Duration control defaults to a +/-25% tolerance around requested minutes.
+If generated narration is too short, the pipeline auto-expands script content and retries synthesis.
+
+Voice pacing defaults to `calm-documentary`. You can switch later with:
+
+- `--voice-profile balanced`
+- `--voice-profile energetic-explainer`
 
 If you use `--script-engine ollama`, make sure Ollama server is running:
 
@@ -115,6 +144,28 @@ local-video-mvp run \
   --allow-system-tts
 ```
 
+List available local Melo voices:
+
+```bash
+local-video-mvp voices --melo-language EN
+```
+
+Generate A/B voice samples from your existing project script:
+
+```bash
+local-video-mvp voice-ab \
+  --project-dir ./projects/diffusion-v1 \
+  --speakers EN-US EN-Default EN-AU \
+  --sample-words 130 \
+  --voice-profile calm-documentary
+```
+
+Outputs are written under `output/voice_ab/`, including:
+
+- individual speaker WAV files
+- `ab_compare.wav` (single file for quick back-to-back listening)
+- `voice_ab_report.json`
+
 ## Inspect logs after a run
 
 Every run writes:
@@ -122,6 +173,8 @@ Every run writes:
 - `run.log` (line-by-line stage logs)
 - `run_report.json` (status, timings, warnings, outputs)
 - `captions.ass` (styled subtitle file used for burn-in)
+
+`run_report.json` also includes `caption_stats`, `duration_stats`, and `pacing_stats` for quick quality checks.
 
 Inspect quickly:
 

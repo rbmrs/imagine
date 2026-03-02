@@ -27,6 +27,8 @@ class VideoPipeline:
         self.stage_times: dict[str, float] = {}
         self.warnings: list[str] = []
         self.caption_stats: dict[str, Any] = {}
+        self.duration_stats: dict[str, Any] = {}
+        self.pacing_stats: dict[str, Any] = {}
         self.used_template_fallback = False
         self._ollama_ready = False
         self._started_at: dt.datetime | None = None
@@ -43,19 +45,81 @@ class VideoPipeline:
             self._write_text(self.paths["prompt"], self.config.prompt.strip() + "\n")
 
             plan = self._run_stage("script_plan", "Stage 1/7: Generating script plan", self._generate_script_plan)
+            self._initialize_duration_stats(plan)
+            plan = self._run_stage(
+                "duration_preflight",
+                "Stage 1.1/7: Aligning script length with target duration",
+                lambda: self._ensure_minimum_script_length(plan),
+            )
             self._write_json(self.paths["script"], plan.to_dict())
 
-            narration_text = self._clean_narration_text(plan.narration_text())
-            self._write_text(self.paths["narration_txt"], narration_text + "\n")
+            adjust_passes = 0
+            audio_duration = 0.0
+            while True:
+                narration_text = self._clean_narration_text(plan.narration_text())
+                self._write_text(self.paths["narration_txt"], narration_text + "\n")
 
-            def voice_stage() -> None:
-                self._synthesize_narration(narration_text, self.paths["narration_raw"])
-                self._normalize_audio(self.paths["narration_raw"], self.paths["narration_wav"])
+                def voice_stage() -> None:
+                    self._synthesize_narration(narration_text, self.paths["narration_raw"])
+                    self._normalize_audio(self.paths["narration_raw"], self.paths["narration_wav"])
 
-            self._run_stage("narration", "Stage 2/7: Synthesizing narration audio", voice_stage)
+                stage_key = "narration" if adjust_passes == 0 else f"narration_pass_{adjust_passes + 1}"
+                stage_label = "Stage 2/7: Synthesizing narration audio"
+                if adjust_passes > 0:
+                    stage_label = f"Stage 2/7: Re-synthesizing narration audio (pass {adjust_passes + 1})"
+                self._run_stage(stage_key, stage_label, voice_stage)
 
-            audio_duration = self._media_duration(self.paths["narration_wav"])
-            self._rebalance_scene_durations(plan, audio_duration)
+                audio_duration = self._media_duration(self.paths["narration_wav"])
+                self._rebalance_scene_durations(plan, audio_duration)
+                self._update_duration_post_tts(plan, audio_duration, adjust_passes)
+                self._update_pacing_post_tts(narration_text, audio_duration, adjust_passes)
+
+                if self._duration_within_tolerance(audio_duration):
+                    break
+
+                if (
+                    self._duration_too_short(audio_duration)
+                    and adjust_passes < self.config.max_duration_adjust_passes
+                ):
+                    adjust_passes += 1
+                    self._warn(
+                        f"Narration duration is {audio_duration:.1f}s, below tolerance floor. "
+                        f"Expanding script and retrying (pass {adjust_passes})."
+                    )
+                    plan = self._run_stage(
+                        f"duration_adjust_{adjust_passes}",
+                        f"Stage 2/7: Expanding script for duration (pass {adjust_passes})",
+                        lambda: self._expand_short_script(plan, audio_duration),
+                    )
+                    self._write_json(self.paths["script"], plan.to_dict())
+                    continue
+
+                if (
+                    self._duration_too_long(audio_duration)
+                    and adjust_passes < self.config.max_duration_adjust_passes
+                ):
+                    adjust_passes += 1
+                    self._warn(
+                        f"Narration duration is {audio_duration:.1f}s, above tolerance ceiling. "
+                        f"Compressing script and retrying (pass {adjust_passes})."
+                    )
+                    plan = self._run_stage(
+                        f"duration_adjust_{adjust_passes}",
+                        f"Stage 2/7: Compressing script for duration (pass {adjust_passes})",
+                        lambda: self._compress_long_script(plan, audio_duration),
+                    )
+                    self._write_json(self.paths["script"], plan.to_dict())
+                    continue
+
+                requested = self.duration_stats.get("requested_seconds", self.config.target_seconds())
+                delta = audio_duration - float(requested)
+                delta_pct = (delta / float(requested) * 100.0) if requested else 0.0
+                self._warn(
+                    "Narration duration is outside tolerance but no more adjustment passes remain. "
+                    f"Proceeding with {audio_duration:.1f}s ({delta_pct:+.1f}%)."
+                )
+                break
+
             self._write_json(self.paths["script"], plan.to_dict())
 
             rights = self._run_stage("assets", "Stage 3/7: Resolving visual assets", lambda: self._resolve_assets(plan))
@@ -317,6 +381,329 @@ class VideoPipeline:
 
         return ScriptPlan(title=title, summary=summary, scenes=scenes)
 
+    def _duration_bounds(self) -> tuple[float, float, float]:
+        target_seconds = float(self.config.target_seconds())
+        tolerance = max(0.0, float(self.config.duration_tolerance_ratio))
+        min_seconds = max(1.0, target_seconds * (1.0 - tolerance))
+        max_seconds = max(min_seconds, target_seconds * (1.0 + tolerance))
+        return target_seconds, min_seconds, max_seconds
+
+    def _word_count_plan(self, plan: ScriptPlan) -> int:
+        total = 0
+        for scene in plan.scenes:
+            total += len(re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", scene.voiceover or ""))
+        return total
+
+    def _estimate_seconds_from_words(self, words: int) -> float:
+        wpm = max(1, int(self.config.target_speech_wpm))
+        return (float(words) / float(wpm)) * 60.0
+
+    def _initialize_duration_stats(self, plan: ScriptPlan) -> None:
+        target_seconds, min_seconds, max_seconds = self._duration_bounds()
+        words = self._word_count_plan(plan)
+        self.duration_stats = {
+            "requested_seconds": round(target_seconds, 3),
+            "min_seconds": round(min_seconds, 3),
+            "max_seconds": round(max_seconds, 3),
+            "tolerance_ratio": round(float(self.config.duration_tolerance_ratio), 4),
+            "target_wpm": int(self.config.target_speech_wpm),
+            "initial_word_count": words,
+            "estimated_seconds_pre_tts": round(self._estimate_seconds_from_words(words), 3),
+            "preflight_adjustments": 0,
+            "post_tts_adjustments": 0,
+        }
+
+    def _ensure_minimum_script_length(self, plan: ScriptPlan) -> ScriptPlan:
+        target_seconds, min_seconds, _ = self._duration_bounds()
+        current_words = self._word_count_plan(plan)
+        min_words = int(math.ceil((min_seconds / 60.0) * max(1, self.config.target_speech_wpm)))
+        target_words = int(math.ceil((target_seconds / 60.0) * max(1, self.config.target_speech_wpm)))
+
+        if current_words >= min_words:
+            self.duration_stats["word_count_after_preflight"] = current_words
+            self.duration_stats["estimated_seconds_after_preflight"] = round(
+                self._estimate_seconds_from_words(current_words),
+                3,
+            )
+            return plan
+
+        self._warn(
+            f"Script is short ({current_words} words) for requested duration. "
+            f"Expanding to roughly {target_words} words."
+        )
+        expanded = self._expand_plan_to_target_words(plan, target_words)
+        final_words = self._word_count_plan(expanded)
+        self.duration_stats["preflight_adjustments"] = int(self.duration_stats.get("preflight_adjustments", 0)) + 1
+        self.duration_stats["word_count_after_preflight"] = final_words
+        self.duration_stats["estimated_seconds_after_preflight"] = round(
+            self._estimate_seconds_from_words(final_words),
+            3,
+        )
+        return expanded
+
+    def _expand_short_script(self, plan: ScriptPlan, audio_duration: float) -> ScriptPlan:
+        requested_seconds, min_seconds, _ = self._duration_bounds()
+        current_words = self._word_count_plan(plan)
+
+        if audio_duration <= 0.1:
+            target_words = int(math.ceil((requested_seconds / 60.0) * max(1, self.config.target_speech_wpm)))
+        else:
+            scale = requested_seconds / max(1.0, audio_duration)
+            target_words = int(math.ceil(current_words * max(1.12, scale * 0.93)))
+
+        floor_words = int(math.ceil((min_seconds / 60.0) * max(1, self.config.target_speech_wpm)))
+        target_words = max(target_words, floor_words)
+        target_words = min(target_words, 3200)
+
+        expanded = self._expand_plan_to_target_words(plan, target_words)
+        self.duration_stats["post_tts_adjustments"] = int(self.duration_stats.get("post_tts_adjustments", 0)) + 1
+        return expanded
+
+    def _compress_long_script(self, plan: ScriptPlan, audio_duration: float) -> ScriptPlan:
+        requested_seconds, _, max_seconds = self._duration_bounds()
+        current_words = self._word_count_plan(plan)
+
+        if audio_duration <= 0.1:
+            target_words = int(math.ceil((requested_seconds / 60.0) * max(1, self.config.target_speech_wpm)))
+        else:
+            scale = requested_seconds / max(1.0, audio_duration)
+            target_words = int(math.ceil(current_words * min(0.96, scale * 1.08)))
+
+        ceiling_words = int(math.ceil((max_seconds / 60.0) * max(1, self.config.target_speech_wpm)))
+        floor_words = max(110, len(plan.scenes) * 8)
+        target_words = max(floor_words, min(target_words, ceiling_words))
+
+        compressed = self._compress_plan_to_target_words(plan, target_words)
+        self.duration_stats["post_tts_adjustments"] = int(self.duration_stats.get("post_tts_adjustments", 0)) + 1
+        return compressed
+
+    def _expand_plan_to_target_words(self, plan: ScriptPlan, target_words: int) -> ScriptPlan:
+        current_words = self._word_count_plan(plan)
+        if current_words >= target_words:
+            return plan
+
+        if self.config.script_engine == "ollama" and self._ollama_ready:
+            expanded = self._expand_script_plan_ollama(plan, target_words)
+            if expanded is not None and self._word_count_plan(expanded) > current_words:
+                return expanded
+            self._warn("Ollama script expansion underperformed; using local expansion fallback.")
+
+        return self._expand_script_plan_template(plan, target_words)
+
+    def _compress_plan_to_target_words(self, plan: ScriptPlan, target_words: int) -> ScriptPlan:
+        current_words = self._word_count_plan(plan)
+        if current_words <= target_words:
+            return plan
+
+        if self.config.script_engine == "ollama" and self._ollama_ready:
+            compressed = self._compress_script_plan_ollama(plan, target_words)
+            if compressed is not None and self._word_count_plan(compressed) < current_words:
+                return compressed
+            self._warn("Ollama script compression underperformed; using local compression fallback.")
+
+        return self._compress_script_plan_template(plan, target_words)
+
+    def _expand_script_plan_ollama(self, plan: ScriptPlan, target_words: int) -> ScriptPlan | None:
+        current_words = self._word_count_plan(plan)
+        scene_target = min(self.config.max_scenes, max(len(plan.scenes), int(target_words / 28)))
+        current_json = json.dumps(plan.to_dict(), ensure_ascii=True)
+        prompt = textwrap.dedent(
+            f"""
+            You are expanding an existing faceless explainer script.
+            Return JSON only. Do not include markdown.
+
+            Current total words: {current_words}
+            Target total words: at least {target_words}
+            Keep style educational, practical, and coherent.
+            Keep topic: {self.config.prompt}
+            Scene count target: around {scene_target}
+
+            Input JSON:
+            {current_json}
+
+            Output schema:
+            {{
+              "title": "string",
+              "summary": "string",
+              "scenes": [
+                {{
+                  "heading": "short heading",
+                  "voiceover": "2-4 sentences",
+                  "search_terms": ["keyword1", "keyword2", "keyword3"]
+                }}
+              ]
+            }}
+            """
+        ).strip()
+
+        result = self._run_command(["ollama", "run", self.config.ollama_model, prompt], timeout=900, check=False)
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            if stderr:
+                self._warn(f"Ollama expansion error: {stderr}")
+            return None
+
+        parsed = self._extract_json_object(result.stdout)
+        if parsed is None:
+            return None
+        return self._normalize_script_plan(parsed)
+
+    def _compress_script_plan_ollama(self, plan: ScriptPlan, target_words: int) -> ScriptPlan | None:
+        current_words = self._word_count_plan(plan)
+        scene_target = min(self.config.max_scenes, max(8, len(plan.scenes)))
+        current_json = json.dumps(plan.to_dict(), ensure_ascii=True)
+        prompt = textwrap.dedent(
+            f"""
+            You are compressing an existing faceless explainer script.
+            Return JSON only. Do not include markdown.
+
+            Current total words: {current_words}
+            Target total words: around {target_words}
+            Keep the same core meaning and topic: {self.config.prompt}
+            Keep scene count around {scene_target}, and keep sections coherent.
+            Use concise language and remove redundancy.
+
+            Input JSON:
+            {current_json}
+
+            Output schema:
+            {{
+              "title": "string",
+              "summary": "string",
+              "scenes": [
+                {{
+                  "heading": "short heading",
+                  "voiceover": "1-2 sentences",
+                  "search_terms": ["keyword1", "keyword2", "keyword3"]
+                }}
+              ]
+            }}
+            """
+        ).strip()
+
+        result = self._run_command(["ollama", "run", self.config.ollama_model, prompt], timeout=900, check=False)
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            if stderr:
+                self._warn(f"Ollama compression error: {stderr}")
+            return None
+
+        parsed = self._extract_json_object(result.stdout)
+        if parsed is None:
+            return None
+        return self._normalize_script_plan(parsed)
+
+    def _expand_script_plan_template(self, plan: ScriptPlan, target_words: int) -> ScriptPlan:
+        templates = [
+            "In practical terms, this means teams should test assumptions early and validate outcomes with real measurements before scaling.",
+            "A helpful way to evaluate this step is to compare expected benefits, trade-offs, and operational constraints in a simple checklist.",
+            "When applied carefully, this idea improves reliability and makes future maintenance easier for both beginners and advanced teams.",
+            "To make this actionable, focus on one measurable improvement at a time and verify results before moving to the next decision.",
+        ]
+
+        expanded_scenes: list[dict[str, Any]] = []
+        for idx, scene in enumerate(plan.scenes):
+            voiceover = scene.voiceover.strip()
+            if voiceover and voiceover[-1] not in ".!?":
+                voiceover += "."
+            voiceover = (voiceover + " " + templates[idx % len(templates)]).strip()
+            expanded_scenes.append(
+                {
+                    "heading": scene.heading,
+                    "voiceover": voiceover,
+                    "search_terms": scene.search_terms[:4],
+                }
+            )
+
+        fallback_plan = {
+            "title": plan.title,
+            "summary": plan.summary,
+            "scenes": expanded_scenes,
+        }
+
+        normalized = self._normalize_script_plan(fallback_plan)
+        words = self._word_count_plan(normalized)
+        extra_index = 1
+        while words < target_words and len(normalized.scenes) < self.config.max_scenes:
+            heading = f"Additional Context {extra_index}"
+            voiceover = (
+                f"This additional segment reinforces {self.config.prompt} with a concrete scenario, "
+                "a practical constraint, and a clear recommendation for implementation choices."
+            )
+            expanded_scenes.append(
+                {
+                    "heading": heading,
+                    "voiceover": voiceover,
+                    "search_terms": self._default_search_terms(heading),
+                }
+            )
+            fallback_plan["scenes"] = expanded_scenes
+            normalized = self._normalize_script_plan(fallback_plan)
+            words = self._word_count_plan(normalized)
+            extra_index += 1
+
+        return normalized
+
+    def _compress_script_plan_template(self, plan: ScriptPlan, target_words: int) -> ScriptPlan:
+        def shorten_text(text: str, cap_words: int) -> str:
+            sentence = text.strip().split(".")[0].strip()
+            tokens = sentence.split()
+            if len(tokens) > cap_words:
+                sentence = " ".join(tokens[:cap_words]).rstrip(",;:-")
+            if sentence and sentence[-1] not in ".!?":
+                sentence += "."
+            return sentence
+
+        reduced_scenes: list[dict[str, Any]] = []
+        for scene in plan.scenes:
+            reduced_scenes.append(
+                {
+                    "heading": scene.heading,
+                    "voiceover": shorten_text(scene.voiceover, cap_words=18),
+                    "search_terms": scene.search_terms[:4],
+                }
+            )
+
+        compressed_plan = {
+            "title": plan.title,
+            "summary": plan.summary,
+            "scenes": reduced_scenes,
+        }
+        normalized = self._normalize_script_plan(compressed_plan)
+
+        while self._word_count_plan(normalized) > target_words and len(reduced_scenes) > 8:
+            drop_index = max(1, len(reduced_scenes) - 2)
+            reduced_scenes.pop(drop_index)
+            compressed_plan["scenes"] = reduced_scenes
+            normalized = self._normalize_script_plan(compressed_plan)
+
+        return normalized
+
+    def _duration_within_tolerance(self, actual_seconds: float) -> bool:
+        _, min_seconds, max_seconds = self._duration_bounds()
+        return min_seconds <= actual_seconds <= max_seconds
+
+    def _duration_too_short(self, actual_seconds: float) -> bool:
+        _, min_seconds, _ = self._duration_bounds()
+        return actual_seconds < min_seconds
+
+    def _duration_too_long(self, actual_seconds: float) -> bool:
+        _, _, max_seconds = self._duration_bounds()
+        return actual_seconds > max_seconds
+
+    def _update_duration_post_tts(self, plan: ScriptPlan, audio_duration: float, adjust_passes: int) -> None:
+        requested, min_seconds, max_seconds = self._duration_bounds()
+        words = self._word_count_plan(plan)
+        delta_seconds = audio_duration - requested
+        delta_percent = (delta_seconds / requested * 100.0) if requested else 0.0
+
+        self.duration_stats["word_count_final"] = words
+        self.duration_stats["audio_seconds"] = round(audio_duration, 3)
+        self.duration_stats["delta_seconds"] = round(delta_seconds, 3)
+        self.duration_stats["delta_percent"] = round(delta_percent, 3)
+        self.duration_stats["within_tolerance"] = bool(min_seconds <= audio_duration <= max_seconds)
+        self.duration_stats["post_tts_adjustments"] = adjust_passes
+
     def _default_search_terms(self, heading: str) -> list[str]:
         terms = [part.strip() for part in re.split(r"[^a-zA-Z0-9]+", heading) if part.strip()]
         out = []
@@ -336,19 +723,140 @@ class VideoPipeline:
         return dedup[:4]
 
     def _synthesize_narration(self, text: str, output_raw_wav: Path) -> None:
+        chunks = self._build_narration_chunks(text)
+        if not chunks:
+            raise RuntimeError("Narration text produced no speakable chunks")
+
         if self.config.tts_engine == "melo":
-            self._tts_with_melo(text, output_raw_wav)
+            self._tts_with_melo(chunks, output_raw_wav)
             return
 
         if self.config.tts_engine == "say":
             if self.config.strict_commercial_safe and not self.config.allow_system_tts:
                 raise RuntimeError("System TTS fallback is blocked in strict mode unless --allow-system-tts is set")
-            self._tts_with_say(text, output_raw_wav)
+            self._tts_with_say(chunks, output_raw_wav)
             return
 
         raise RuntimeError(f"Unsupported TTS engine: {self.config.tts_engine}")
 
-    def _tts_with_melo(self, text: str, output_raw_wav: Path) -> None:
+    def _voice_profile_settings(self) -> dict[str, float]:
+        profile = self.config.voice_profile
+        defaults: dict[str, dict[str, float]] = {
+            "calm-documentary": {
+                "speed_multiplier": 0.93,
+                "clause_pause": 0.14,
+                "sentence_pause": 0.34,
+                "paragraph_pause": 0.82,
+                "max_words_per_chunk": 18,
+            },
+            "balanced": {
+                "speed_multiplier": 1.0,
+                "clause_pause": 0.11,
+                "sentence_pause": 0.26,
+                "paragraph_pause": 0.65,
+                "max_words_per_chunk": 20,
+            },
+            "energetic-explainer": {
+                "speed_multiplier": 1.07,
+                "clause_pause": 0.07,
+                "sentence_pause": 0.17,
+                "paragraph_pause": 0.5,
+                "max_words_per_chunk": 24,
+            },
+        }
+        return defaults.get(profile, defaults["calm-documentary"])
+
+    def _build_narration_chunks(self, text: str) -> list[dict[str, Any]]:
+        settings = self._voice_profile_settings()
+        max_words = int(settings["max_words_per_chunk"])
+        paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+        chunks: list[dict[str, Any]] = []
+
+        for p_idx, paragraph in enumerate(paragraphs):
+            sentences = self._split_sentences(paragraph)
+            for s_idx, sentence in enumerate(sentences):
+                fragments = self._split_long_sentence(sentence, max_words=max_words)
+                for f_idx, fragment in enumerate(fragments):
+                    fragment_text = fragment.strip()
+                    if not fragment_text:
+                        continue
+
+                    pause = float(settings["clause_pause"])
+                    if f_idx == len(fragments) - 1:
+                        pause = float(settings["sentence_pause"])
+                    if s_idx == len(sentences) - 1 and f_idx == len(fragments) - 1 and p_idx < len(paragraphs) - 1:
+                        pause = float(settings["paragraph_pause"])
+
+                    chunks.append(
+                        {
+                            "text": fragment_text,
+                            "pause_after": pause,
+                        }
+                    )
+
+        if chunks:
+            chunks[-1]["pause_after"] = 0.0
+
+        effective_speed = max(0.5, min(2.0, float(self.config.voice_speed) * float(settings["speed_multiplier"])))
+        word_count = sum(self._word_count_text(str(item.get("text") or "")) for item in chunks)
+        pause_total = sum(float(item.get("pause_after") or 0.0) for item in chunks)
+        self.pacing_stats = {
+            "voice_profile": self.config.voice_profile,
+            "configured_voice_speed": round(float(self.config.voice_speed), 3),
+            "profile_speed_multiplier": round(float(settings["speed_multiplier"]), 3),
+            "effective_voice_speed": round(effective_speed, 3),
+            "planned_chunks": len(chunks),
+            "planned_words": word_count,
+            "planned_pause_seconds": round(pause_total, 3),
+        }
+        return chunks
+
+    def _split_sentences(self, paragraph: str) -> list[str]:
+        parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", paragraph.strip()) if part.strip()]
+        if not parts and paragraph.strip():
+            return [paragraph.strip()]
+        return parts
+
+    def _split_long_sentence(self, sentence: str, max_words: int) -> list[str]:
+        words = self._word_count_text(sentence)
+        if words <= max_words:
+            return [sentence.strip()]
+
+        candidates = [part.strip() for part in re.split(r"(?<=[,;:])\s+", sentence) if part.strip()]
+        if len(candidates) <= 1:
+            candidates = [sentence.strip()]
+
+        chunks: list[str] = []
+        current = ""
+        current_words = 0
+
+        for part in candidates:
+            part_words = self._word_count_text(part)
+            if part_words > max_words and not current:
+                tokens = part.split()
+                for i in range(0, len(tokens), max_words):
+                    chunk = " ".join(tokens[i : i + max_words]).strip()
+                    if chunk:
+                        chunks.append(chunk)
+                continue
+
+            if current and (current_words + part_words) > max_words:
+                chunks.append(current.strip())
+                current = part
+                current_words = part_words
+            else:
+                current = f"{current} {part}".strip() if current else part
+                current_words += part_words
+
+        if current:
+            chunks.append(current.strip())
+
+        return chunks or [sentence.strip()]
+
+    def _word_count_text(self, text: str) -> int:
+        return len(re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", text or ""))
+
+    def _tts_with_melo(self, chunks: list[dict[str, Any]], output_raw_wav: Path) -> None:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         try:
             from melo.api import TTS  # type: ignore
@@ -357,45 +865,264 @@ class VideoPipeline:
                 "MeloTTS not available. Install voice deps with: python -m pip install -e '.[voice]'"
             ) from exc
 
+        settings = self._voice_profile_settings()
+        effective_speed = max(0.5, min(2.0, float(self.config.voice_speed) * float(settings["speed_multiplier"])))
+        parts_dir = self.paths["tmp"] / "tts_parts"
+        parts_dir.mkdir(parents=True, exist_ok=True)
+        part_files: list[Path] = []
+
         try:
             tts = TTS(language=self.config.melo_language, device="auto")
             speaker_id = 0
             spk2id = {}
-            if hasattr(tts, "hps") and hasattr(tts.hps, "data") and hasattr(tts.hps.data, "spk2id"):
-                spk2id = dict(getattr(tts.hps.data, "spk2id") or {})
+            hps = getattr(tts, "hps", None)
+            hps_data = getattr(hps, "data", None)
+            if hps_data is not None and hasattr(hps_data, "spk2id"):
+                spk2id = dict(getattr(hps_data, "spk2id") or {})
 
             if self.config.melo_speaker in spk2id:
                 speaker_id = int(spk2id[self.config.melo_speaker])
             elif spk2id:
                 speaker_id = int(next(iter(spk2id.values())))
 
-            tts.tts_to_file(text, speaker_id, str(output_raw_wav), speed=float(self.config.voice_speed))
+            for idx, chunk in enumerate(chunks):
+                text = str(chunk.get("text") or "").strip()
+                if not text:
+                    continue
+
+                raw_path = parts_dir / f"chunk_{idx:04d}.raw.wav"
+                wav_path = parts_dir / f"chunk_{idx:04d}.wav"
+                tts.tts_to_file(text, speaker_id, str(raw_path), speed=effective_speed)
+                self._standardize_wav(raw_path, wav_path)
+                part_files.append(wav_path)
+
+                pause_seconds = float(chunk.get("pause_after") or 0.0)
+                if pause_seconds > 0.0:
+                    pause_path = parts_dir / f"pause_{idx:04d}.wav"
+                    self._generate_silence_wav(pause_path, pause_seconds)
+                    part_files.append(pause_path)
         except Exception as exc:
             raise RuntimeError(f"MeloTTS synthesis failed: {exc}") from exc
 
+        if not part_files:
+            raise RuntimeError("MeloTTS did not produce any audio parts")
+
+        self._concat_wav_parts(part_files, output_raw_wav)
         if not output_raw_wav.exists() or output_raw_wav.stat().st_size == 0:
             raise RuntimeError("MeloTTS did not produce audio output")
 
-    def _tts_with_say(self, text: str, output_raw_wav: Path) -> None:
-        temp_txt = self.paths["tmp"] / "say_input.txt"
-        temp_aiff = self.paths["tmp"] / "say_output.aiff"
-        self._write_text(temp_txt, text)
+    def _tts_with_say(self, chunks: list[dict[str, Any]], output_raw_wav: Path) -> None:
+        parts_dir = self.paths["tmp"] / "tts_parts"
+        parts_dir.mkdir(parents=True, exist_ok=True)
+        part_files: list[Path] = []
 
-        result = self._run_command(
-            ["say", "-f", str(temp_txt), "-o", str(temp_aiff)],
-            timeout=600,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"say command failed: {result.stderr.strip()}")
+        for idx, chunk in enumerate(chunks):
+            text = str(chunk.get("text") or "").strip()
+            if not text:
+                continue
 
+            temp_txt = parts_dir / f"say_{idx:04d}.txt"
+            temp_aiff = parts_dir / f"say_{idx:04d}.aiff"
+            temp_wav = parts_dir / f"say_{idx:04d}.wav"
+            self._write_text(temp_txt, text)
+
+            result = self._run_command(
+                ["say", "-f", str(temp_txt), "-o", str(temp_aiff)],
+                timeout=600,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"say command failed: {result.stderr.strip()}")
+
+            self._standardize_wav(temp_aiff, temp_wav)
+            part_files.append(temp_wav)
+
+            pause_seconds = float(chunk.get("pause_after") or 0.0)
+            if pause_seconds > 0.0:
+                pause_path = parts_dir / f"pause_{idx:04d}.wav"
+                self._generate_silence_wav(pause_path, pause_seconds)
+                part_files.append(pause_path)
+
+        if not part_files:
+            raise RuntimeError("System TTS did not produce any audio parts")
+
+        self._concat_wav_parts(part_files, output_raw_wav)
+
+    def _standardize_wav(self, input_audio: Path, output_wav: Path) -> None:
         convert = self._run_command(
-            ["ffmpeg", "-y", "-i", str(temp_aiff), "-ac", "1", "-ar", "24000", str(output_raw_wav)],
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(input_audio),
+                "-ac",
+                "1",
+                "-ar",
+                "24000",
+                "-c:a",
+                "pcm_s16le",
+                str(output_wav),
+            ],
             timeout=300,
             check=False,
         )
         if convert.returncode != 0:
-            raise RuntimeError(f"Failed to convert system TTS output: {convert.stderr.strip()}")
+            raise RuntimeError(f"Failed to standardize audio: {convert.stderr.strip()}")
+
+    def _generate_silence_wav(self, output_wav: Path, seconds: float) -> None:
+        duration = max(0.03, float(seconds))
+        command = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=24000:cl=mono",
+            "-t",
+            f"{duration:.3f}",
+            "-c:a",
+            "pcm_s16le",
+            str(output_wav),
+        ]
+        result = self._run_command(command, timeout=120, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to generate silence audio: {result.stderr.strip()}")
+
+    def _concat_wav_parts(self, part_files: list[Path], output_wav: Path) -> None:
+        if len(part_files) == 1:
+            shutil.copy2(part_files[0], output_wav)
+            return
+
+        concat_list = self.paths["tmp"] / "tts_parts" / "concat_audio.txt"
+        lines = [f"file '{path.resolve()}'" for path in part_files]
+        self._write_text(concat_list, "\n".join(lines) + "\n")
+
+        command = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_list),
+            "-ac",
+            "1",
+            "-ar",
+            "24000",
+            "-c:a",
+            "pcm_s16le",
+            str(output_wav),
+        ]
+        result = self._run_command(command, timeout=900, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to concatenate narration chunks: {result.stderr.strip()}")
+
+    def _select_voice_sample_excerpt(self, text: str, sample_words: int) -> str:
+        target = max(40, int(sample_words))
+        normalized = re.sub(r"\s+", " ", text or "").strip()
+        if not normalized:
+            return ""
+
+        sentences = self._split_sentences(normalized)
+        if not sentences:
+            return " ".join(normalized.split()[:target]).strip()
+
+        selected: list[str] = []
+        words = 0
+        for sentence in sentences:
+            clean = sentence.strip()
+            if not clean:
+                continue
+            selected.append(clean)
+            words += self._word_count_text(clean)
+            if words >= target:
+                break
+
+        excerpt = " ".join(selected).strip()
+        if not excerpt:
+            excerpt = " ".join(normalized.split()[:target]).strip()
+        return excerpt
+
+    def generate_voice_ab_samples(
+        self,
+        text: str,
+        speakers: list[str],
+        output_dir: Path,
+        sample_words: int = 130,
+    ) -> dict[str, Any]:
+        if self.config.tts_engine != "melo":
+            raise RuntimeError("Voice A/B samples currently support only Melo TTS")
+
+        self._require_binary("ffmpeg")
+        self._prepare_dirs()
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        excerpt = self._select_voice_sample_excerpt(text, sample_words)
+        if not excerpt:
+            raise RuntimeError("No text content available for voice sample generation")
+
+        unique_speakers: list[str] = []
+        seen: set[str] = set()
+        for speaker in speakers:
+            value = str(speaker).strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            unique_speakers.append(value)
+
+        if not unique_speakers:
+            raise RuntimeError("No valid speakers were provided")
+
+        original_speaker = self.config.melo_speaker
+        sample_entries: list[dict[str, Any]] = []
+        comparison_parts: list[Path] = []
+
+        try:
+            for idx, speaker in enumerate(unique_speakers, start=1):
+                self.config.melo_speaker = speaker
+                safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", speaker).strip("_") or f"speaker_{idx}"
+                raw_path = output_dir / f"{idx:02d}_{safe_name}.raw.wav"
+                final_path = output_dir / f"{idx:02d}_{safe_name}.wav"
+
+                self._synthesize_narration(excerpt, raw_path)
+                self._normalize_audio(raw_path, final_path)
+                duration = self._media_duration(final_path)
+
+                sample_entries.append(
+                    {
+                        "speaker": speaker,
+                        "file": str(final_path.resolve()),
+                        "duration_seconds": round(duration, 3),
+                    }
+                )
+
+                comparison_parts.append(final_path)
+                if idx < len(unique_speakers):
+                    gap_path = output_dir / f"gap_{idx:02d}.wav"
+                    self._generate_silence_wav(gap_path, 0.7)
+                    comparison_parts.append(gap_path)
+        finally:
+            self.config.melo_speaker = original_speaker
+
+        compare_mix = output_dir / "ab_compare.wav"
+        self._concat_wav_parts(comparison_parts, compare_mix)
+
+        report = {
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "voice_profile": self.config.voice_profile,
+            "voice_speed": self.config.voice_speed,
+            "melo_language": self.config.melo_language,
+            "sample_words": self._word_count_text(excerpt),
+            "sample_text": excerpt,
+            "compare_mix": str(compare_mix.resolve()),
+            "samples": sample_entries,
+            "output_dir": str(output_dir.resolve()),
+        }
+        report_path = output_dir / "voice_ab_report.json"
+        self._write_json(report_path, report)
+        report["report_file"] = str(report_path.resolve())
+        return report
 
     def _normalize_audio(self, input_wav: Path, output_wav: Path) -> None:
         result = self._run_command(
@@ -900,8 +1627,9 @@ class VideoPipeline:
         self._write_text(srt_path, "\n".join(lines))
 
     def _write_ass(self, ass_path: Path, captions: list[tuple[float, float, str]]) -> None:
-        font_size = max(26, int(self.config.height * (0.05 if self.config.caption_style == "engagement" else 0.042)))
-        margin_v = max(30, int(self.config.height * 0.075))
+        base_scale = 0.046 if self.config.caption_style == "engagement" else 0.04
+        font_size = max(22, int(self.config.height * base_scale * self.config.caption_font_scale))
+        margin_v = max(18, int(self.config.height * self.config.caption_bottom_ratio))
         outline = 2.6 if self.config.caption_style == "engagement" else 2.0
         shadow = 0.8 if self.config.caption_style == "engagement" else 0.5
 
@@ -1222,6 +1950,12 @@ class VideoPipeline:
                 "caption_engine": self.config.caption_engine,
                 "caption_style": self.config.caption_style,
                 "burn_subtitles": self.config.burn_subtitles,
+                "caption_font_scale": self.config.caption_font_scale,
+                "caption_bottom_ratio": self.config.caption_bottom_ratio,
+                "duration_tolerance_ratio": self.config.duration_tolerance_ratio,
+                "target_speech_wpm": self.config.target_speech_wpm,
+                "voice_profile": self.config.voice_profile,
+                "voice_speed": self.config.voice_speed,
                 "ollama_model": self.config.ollama_model,
             },
             "inputs": {
@@ -1261,15 +1995,31 @@ class VideoPipeline:
         self._log(f"{key} completed in {elapsed:.2f}s")
         return result
 
+    def _update_pacing_post_tts(self, narration_text: str, audio_duration: float, adjust_passes: int) -> None:
+        words = self._word_count_text(narration_text)
+        spoken_minutes = max(0.01, audio_duration / 60.0)
+        effective_wpm = float(words) / spoken_minutes
+        self.pacing_stats["final_words"] = words
+        self.pacing_stats["audio_seconds"] = round(audio_duration, 3)
+        self.pacing_stats["effective_wpm"] = round(effective_wpm, 2)
+        self.pacing_stats["adjustment_passes"] = adjust_passes
+
     def _ollama_server_ready(self) -> bool:
         result = self._run_command(["ollama", "list"], timeout=10, check=False)
         return result.returncode == 0
 
     def _clean_narration_text(self, text: str) -> str:
-        cleaned = re.sub(r"\s+", " ", text).strip()
-        cleaned = re.sub(r"\b([A-Za-z]{3,})(\s+\1\b)+", r"\1", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"([?!.,])\1+", r"\1", cleaned)
-        return cleaned
+        paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+        cleaned_parts: list[str] = []
+
+        for paragraph in paragraphs:
+            cleaned = re.sub(r"\s+", " ", paragraph).strip()
+            cleaned = re.sub(r"\b([A-Za-z]{3,})(\s+\1\b)+", r"\1", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"([?!.,])\1+", r"\1", cleaned)
+            if cleaned:
+                cleaned_parts.append(cleaned)
+
+        return "\n\n".join(cleaned_parts)
 
     def _base_clip_vf(self) -> str:
         w = str(self.config.width)
@@ -1278,26 +2028,9 @@ class VideoPipeline:
         return f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={fps}"
 
     def _clip_vf(self, heading: str, index: int) -> str:
-        base = self._base_clip_vf()
-        heading_clean = self._escape_drawtext((heading or "Explainer Segment")[:80])
-        scene_label = self._escape_drawtext(f"Scene {index + 1}")
-        heading_size = max(22, int(self.config.height * 0.038))
-        label_size = max(16, int(self.config.height * 0.024))
-        return (
-            f"{base},"
-            "drawbox=x=0:y=0:w=iw:h=ih*0.17:color=black@0.35:t=fill,"
-            f"drawtext=text='{scene_label}':fontcolor=white@0.85:fontsize={label_size}:x=40:y=40,"
-            f"drawtext=text='{heading_clean}':fontcolor=white:fontsize={heading_size}:x=(w-text_w)/2:y=h*0.08:"
-            "shadowcolor=black@0.9:shadowx=2:shadowy=2"
-        )
-
-    def _escape_drawtext(self, text: str) -> str:
-        value = text.replace("\\", r"\\")
-        value = value.replace(":", r"\:")
-        value = value.replace("'", r"\'")
-        value = value.replace(",", r"\,")
-        value = value.replace("%", r"\%")
-        return value
+        _ = heading
+        _ = index
+        return self._base_clip_vf()
 
     def _write_run_report(self, status: str, outputs: dict[str, str], error: str | None = None) -> None:
         started = self._started_at or dt.datetime.now(dt.timezone.utc)
@@ -1310,6 +2043,8 @@ class VideoPipeline:
             "stage_times": self.stage_times,
             "warnings": self.warnings,
             "caption_stats": self.caption_stats,
+            "duration_stats": self.duration_stats,
+            "pacing_stats": self.pacing_stats,
             "fallbacks": {
                 "used_template_script": self.used_template_fallback,
             },
