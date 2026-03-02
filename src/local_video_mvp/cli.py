@@ -55,6 +55,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Narration engine",
     )
     run.add_argument(
+        "--video-effects",
+        choices=["clean", "subtle-motion", "dynamic"],
+        default="clean",
+        help="Visual effects preset for rendered clips",
+    )
+    run.add_argument(
         "--voice-profile",
         choices=["calm-documentary", "balanced", "energetic-explainer"],
         default="calm-documentary",
@@ -195,6 +201,7 @@ def run_command(args: argparse.Namespace) -> int:
         allow_system_tts=bool(args.allow_system_tts),
         pexels_api_key=args.pexels_api_key,
         pixabay_api_key=args.pixabay_api_key,
+        video_effects=args.video_effects,
         voice_profile=args.voice_profile,
         voice_speed=max(0.5, min(2.0, float(args.voice_speed))),
         melo_language=args.melo_language,

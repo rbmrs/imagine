@@ -1914,12 +1914,12 @@ class VideoPipeline:
     def _render_single_clip(self, clip: TimelineClip, output_clip: Path, index: int) -> None:
         duration = max(0.3, clip.seconds)
         source = Path(clip.source_path) if clip.source_path else None
-        vf_primary = self._clip_vf(clip.heading, index)
         vf_fallback = self._base_clip_vf()
 
         if source and source.exists():
             ext = source.suffix.lower()
             if ext in {".mp4", ".mov", ".m4v", ".webm", ".mkv"}:
+                vf_primary = self._clip_vf(source_kind="video", index=index)
                 command = [
                     "ffmpeg",
                     "-y",
@@ -1945,6 +1945,7 @@ class VideoPipeline:
                 fallback = [*command]
                 fallback[fallback.index("-vf") + 1] = vf_fallback
             elif ext in {".jpg", ".jpeg", ".png", ".webp"}:
+                vf_primary = self._clip_vf(source_kind="image", index=index)
                 command = [
                     "ffmpeg",
                     "-y",
@@ -1970,9 +1971,11 @@ class VideoPipeline:
                 fallback = [*command]
                 fallback[fallback.index("-vf") + 1] = vf_fallback
             else:
+                vf_primary = self._clip_vf(source_kind="placeholder", index=index)
                 command = self._placeholder_clip_command(output_clip, duration, index, vf_primary)
                 fallback = self._placeholder_clip_command(output_clip, duration, index, vf_fallback)
         else:
+            vf_primary = self._clip_vf(source_kind="placeholder", index=index)
             command = self._placeholder_clip_command(output_clip, duration, index, vf_primary)
             fallback = self._placeholder_clip_command(output_clip, duration, index, vf_fallback)
 
@@ -2096,6 +2099,7 @@ class VideoPipeline:
                 "minutes": self.config.minutes,
                 "resolution": f"{self.config.width}x{self.config.height}",
                 "fps": self.config.fps,
+                "video_effects": self.config.video_effects,
                 "strict_commercial_safe": self.config.strict_commercial_safe,
                 "script_engine": self.config.script_engine,
                 "tts_engine": self.config.tts_engine,
@@ -2179,9 +2183,66 @@ class VideoPipeline:
         fps = str(self.config.fps)
         return f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={fps}"
 
-    def _clip_vf(self, heading: str, index: int) -> str:
-        _ = heading
+    def _clip_vf(self, source_kind: str, index: int) -> str:
         _ = index
+        preset = str(self.config.video_effects or "clean").strip().lower()
+        if preset not in {"clean", "subtle-motion", "dynamic"}:
+            preset = "clean"
+
+        if preset == "clean":
+            return self._base_clip_vf()
+
+        if source_kind == "image":
+            return self._image_effect_vf(preset)
+        return self._video_effect_vf(preset)
+
+    def _video_effect_vf(self, preset: str) -> str:
+        base = self._base_clip_vf()
+
+        if preset == "subtle-motion":
+            drift = (
+                "crop=iw*0.985:ih*0.985:"
+                "(iw-iw*0.985)/2+sin(t*0.45)*(iw*0.004):"
+                "(ih-ih*0.985)/2+cos(t*0.37)*(ih*0.004)"
+            )
+            polish = "eq=contrast=1.03:saturation=1.06:brightness=0.01"
+            return f"{drift},{base},{polish}"
+
+        if preset == "dynamic":
+            drift = (
+                "crop=iw*0.97:ih*0.97:"
+                "(iw-iw*0.97)/2+sin(t*0.9)*(iw*0.01):"
+                "(ih-ih*0.97)/2+cos(t*0.71)*(ih*0.01)"
+            )
+            polish = "eq=contrast=1.06:saturation=1.12:brightness=0.015,unsharp=5:5:0.5:5:5:0.0"
+            return f"{drift},{base},{polish}"
+
+        return base
+
+    def _image_effect_vf(self, preset: str) -> str:
+        w = self.config.width
+        h = self.config.height
+        fps = self.config.fps
+
+        if preset == "subtle-motion":
+            return (
+                "zoompan=z='min(zoom+0.00065,1.05)':"
+                "x='iw/2-(iw/zoom/2)':"
+                "y='ih/2-(ih/zoom/2)':"
+                f"d=1:s={w}x{h}:fps={fps},"
+                "eq=contrast=1.03:saturation=1.06:brightness=0.01"
+            )
+
+        if preset == "dynamic":
+            return (
+                "zoompan=z='min(zoom+0.0011,1.08)':"
+                "x='iw/2-(iw/zoom/2)':"
+                "y='ih/2-(ih/zoom/2)':"
+                f"d=1:s={w}x{h}:fps={fps},"
+                "eq=contrast=1.06:saturation=1.12:brightness=0.015,"
+                "unsharp=5:5:0.45:5:5:0.0"
+            )
+
         return self._base_clip_vf()
 
     def _write_run_report(self, status: str, outputs: dict[str, str], error: str | None = None) -> None:

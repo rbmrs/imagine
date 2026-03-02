@@ -107,6 +107,7 @@ local-video-mvp run \
   --script-engine ollama \
   --ollama-model qwen2.5:14b \
   --tts-engine melo \
+  --video-effects subtle-motion \
   --voice-profile calm-documentary \
   --caption-engine faster-whisper \
   --caption-style engagement \
@@ -126,6 +127,12 @@ Voice pacing defaults to `calm-documentary`. You can switch later with:
 - `--voice-profile energetic-explainer`
 
 Pause boundaries are automatically refined to avoid awkward breaks before tiny trailing words and after common function words.
+
+Video effects presets (long-form safe):
+
+- `--video-effects clean` (no extra effects)
+- `--video-effects subtle-motion` (light motion and color polish)
+- `--video-effects dynamic` (stronger motion/color treatment)
 
 If you use `--script-engine ollama`, make sure Ollama server is running:
 

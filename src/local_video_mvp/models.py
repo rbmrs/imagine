@@ -34,6 +34,7 @@ class PipelineConfig:
     allow_system_tts: bool = False
     pexels_api_key: str | None = None
     pixabay_api_key: str | None = None
+    video_effects: str = "clean"
     voice_profile: str = "calm-documentary"
     voice_speed: float = 1.0
     melo_language: str = "EN"
