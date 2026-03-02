@@ -61,6 +61,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Visual effects preset for rendered clips",
     )
     run.add_argument(
+        "--include-intro",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Render intro card before main content (default: true)",
+    )
+    run.add_argument(
+        "--include-outro",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Render outro card after main content (default: true)",
+    )
+    run.add_argument("--intro-seconds", type=float, default=2.8, help="Intro card duration in seconds")
+    run.add_argument("--outro-seconds", type=float, default=3.0, help="Outro card duration in seconds")
+    run.add_argument("--outro-text", default="Thanks for watching", help="Outro card text")
+    run.add_argument(
         "--voice-profile",
         choices=["calm-documentary", "balanced", "energetic-explainer"],
         default="calm-documentary",
@@ -172,6 +187,8 @@ def run_command(args: argparse.Namespace) -> int:
     caption_font_scale = max(0.65, min(1.4, float(args.caption_font_scale)))
     caption_bottom_ratio = max(0.02, min(0.2, float(args.caption_bottom_ratio)))
     duration_tolerance = max(0.05, min(0.6, float(args.duration_tolerance)))
+    intro_seconds = max(0.0, float(args.intro_seconds))
+    outro_seconds = max(0.0, float(args.outro_seconds))
 
     config = PipelineConfig(
         prompt=args.prompt.strip(),
@@ -202,6 +219,11 @@ def run_command(args: argparse.Namespace) -> int:
         pexels_api_key=args.pexels_api_key,
         pixabay_api_key=args.pixabay_api_key,
         video_effects=args.video_effects,
+        include_intro=bool(args.include_intro),
+        include_outro=bool(args.include_outro),
+        intro_seconds=intro_seconds,
+        outro_seconds=outro_seconds,
+        outro_text=str(args.outro_text).strip() or "Thanks for watching",
         voice_profile=args.voice_profile,
         voice_speed=max(0.5, min(2.0, float(args.voice_speed))),
         melo_language=args.melo_language,

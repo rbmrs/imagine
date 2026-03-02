@@ -35,6 +35,11 @@ class PipelineConfig:
     pexels_api_key: str | None = None
     pixabay_api_key: str | None = None
     video_effects: str = "clean"
+    include_intro: bool = True
+    include_outro: bool = True
+    intro_seconds: float = 2.8
+    outro_seconds: float = 3.0
+    outro_text: str = "Thanks for watching"
     voice_profile: str = "calm-documentary"
     voice_speed: float = 1.0
     melo_language: str = "EN"

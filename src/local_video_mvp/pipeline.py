@@ -174,6 +174,9 @@ class VideoPipeline:
                 "Stage 4/7: Building captions",
                 lambda: self._generate_captions(plan, self.paths["narration_wav"]),
             )
+            intro_shift = self._intro_bookend_seconds()
+            if intro_shift > 0.0:
+                captions = self._shift_captions(captions, intro_shift)
             self._write_srt(self.paths["captions"], captions)
             self._write_ass(self.paths["captions_ass"], captions)
 
@@ -740,9 +743,15 @@ class VideoPipeline:
         words = self._word_count_plan(plan)
         delta_seconds = audio_duration - requested
         delta_percent = (delta_seconds / requested * 100.0) if requested else 0.0
+        intro_seconds = self._intro_bookend_seconds()
+        outro_seconds = self._outro_bookend_seconds()
+        total_with_bookends = audio_duration + intro_seconds + outro_seconds
 
         self.duration_stats["word_count_final"] = words
         self.duration_stats["audio_seconds"] = round(audio_duration, 3)
+        self.duration_stats["intro_seconds"] = round(intro_seconds, 3)
+        self.duration_stats["outro_seconds"] = round(outro_seconds, 3)
+        self.duration_stats["audio_seconds_with_bookends"] = round(total_with_bookends, 3)
         self.duration_stats["delta_seconds"] = round(delta_seconds, 3)
         self.duration_stats["delta_percent"] = round(delta_percent, 3)
         self.duration_stats["within_tolerance"] = bool(min_seconds <= audio_duration <= max_seconds)
@@ -1121,15 +1130,16 @@ class VideoPipeline:
         if convert.returncode != 0:
             raise RuntimeError(f"Failed to standardize audio: {convert.stderr.strip()}")
 
-    def _generate_silence_wav(self, output_wav: Path, seconds: float) -> None:
+    def _generate_silence_wav(self, output_wav: Path, seconds: float, sample_rate: int = 24000) -> None:
         duration = max(0.03, float(seconds))
+        rate = max(8000, int(sample_rate))
         command = [
             "ffmpeg",
             "-y",
             "-f",
             "lavfi",
             "-i",
-            "anullsrc=r=24000:cl=mono",
+            f"anullsrc=r={rate}:cl=mono",
             "-t",
             f"{duration:.3f}",
             "-c:a",
@@ -1140,14 +1150,23 @@ class VideoPipeline:
         if result.returncode != 0:
             raise RuntimeError(f"Failed to generate silence audio: {result.stderr.strip()}")
 
-    def _concat_wav_parts(self, part_files: list[Path], output_wav: Path) -> None:
+    def _concat_wav_parts(
+        self,
+        part_files: list[Path],
+        output_wav: Path,
+        sample_rate: int = 24000,
+        concat_list_path: Path | None = None,
+    ) -> None:
         if len(part_files) == 1:
             shutil.copy2(part_files[0], output_wav)
             return
 
-        concat_list = self.paths["tmp"] / "tts_parts" / "concat_audio.txt"
+        concat_list = concat_list_path or (self.paths["tmp"] / "tts_parts" / "concat_audio.txt")
+        concat_list.parent.mkdir(parents=True, exist_ok=True)
         lines = [f"file '{path.resolve()}'" for path in part_files]
         self._write_text(concat_list, "\n".join(lines) + "\n")
+
+        rate = max(8000, int(sample_rate))
 
         command = [
             "ffmpeg",
@@ -1161,7 +1180,7 @@ class VideoPipeline:
             "-ac",
             "1",
             "-ar",
-            "24000",
+            str(rate),
             "-c:a",
             "pcm_s16le",
             str(output_wav),
@@ -1169,6 +1188,42 @@ class VideoPipeline:
         result = self._run_command(command, timeout=900, check=False)
         if result.returncode != 0:
             raise RuntimeError(f"Failed to concatenate narration chunks: {result.stderr.strip()}")
+
+    def _build_render_audio_track(
+        self,
+        narration_wav: Path,
+        output_audio: Path,
+        intro_seconds: float,
+        outro_seconds: float,
+    ) -> None:
+        lead = max(0.0, float(intro_seconds))
+        tail = max(0.0, float(outro_seconds))
+        if lead <= 0.0 and tail <= 0.0:
+            shutil.copy2(narration_wav, output_audio)
+            return
+
+        parts_dir = self.paths["tmp"] / "audio_bookends"
+        parts_dir.mkdir(parents=True, exist_ok=True)
+
+        part_files: list[Path] = []
+        if lead > 0.0:
+            lead_path = parts_dir / "intro_silence.wav"
+            self._generate_silence_wav(lead_path, lead, sample_rate=48000)
+            part_files.append(lead_path)
+
+        part_files.append(narration_wav)
+
+        if tail > 0.0:
+            tail_path = parts_dir / "outro_silence.wav"
+            self._generate_silence_wav(tail_path, tail, sample_rate=48000)
+            part_files.append(tail_path)
+
+        self._concat_wav_parts(
+            part_files=part_files,
+            output_wav=output_audio,
+            sample_rate=48000,
+            concat_list_path=parts_dir / "concat_bookends.txt",
+        )
 
     def _select_voice_sample_excerpt(self, text: str, sample_words: int) -> str:
         target = max(40, int(sample_words))
@@ -1817,9 +1872,48 @@ class VideoPipeline:
 
         self._write_text(ass_path, "\n".join(lines) + "\n")
 
+    def _intro_bookend_seconds(self) -> float:
+        if not self.config.include_intro:
+            return 0.0
+        return max(0.0, float(self.config.intro_seconds))
+
+    def _outro_bookend_seconds(self) -> float:
+        if not self.config.include_outro:
+            return 0.0
+        return max(0.0, float(self.config.outro_seconds))
+
+    def _shift_captions(
+        self,
+        captions: list[tuple[float, float, str]],
+        offset_seconds: float,
+    ) -> list[tuple[float, float, str]]:
+        if offset_seconds <= 0.0:
+            return captions
+        shifted: list[tuple[float, float, str]] = []
+        for start, end, text in captions:
+            shifted.append((start + offset_seconds, end + offset_seconds, text))
+        return shifted
+
     def _build_timeline(self, plan: ScriptPlan) -> list[TimelineClip]:
         clips: list[TimelineClip] = []
         cursor = 0.0
+
+        intro_seconds = self._intro_bookend_seconds()
+        if intro_seconds > 0.0:
+            start = cursor
+            end = cursor + intro_seconds
+            clips.append(
+                TimelineClip(
+                    scene_id="__intro",
+                    start=start,
+                    end=end,
+                    seconds=intro_seconds,
+                    source_path=None,
+                    heading=plan.title,
+                )
+            )
+            cursor = end
+
         for scene in plan.scenes:
             start = cursor
             end = cursor + scene.seconds
@@ -1834,11 +1928,35 @@ class VideoPipeline:
                 )
             )
             cursor = end
+
+        outro_seconds = self._outro_bookend_seconds()
+        if outro_seconds > 0.0:
+            start = cursor
+            end = cursor + outro_seconds
+            clips.append(
+                TimelineClip(
+                    scene_id="__outro",
+                    start=start,
+                    end=end,
+                    seconds=outro_seconds,
+                    source_path=None,
+                    heading=self.config.outro_text,
+                )
+            )
+
         return clips
 
     def _render_video(self, timeline: list[TimelineClip], narration_wav: Path, final_mp4: Path) -> None:
         render_dir = self.paths["tmp"] / "render"
         render_dir.mkdir(parents=True, exist_ok=True)
+
+        render_audio = render_dir / "narration_with_bookends.wav"
+        self._build_render_audio_track(
+            narration_wav=narration_wav,
+            output_audio=render_audio,
+            intro_seconds=self._intro_bookend_seconds(),
+            outro_seconds=self._outro_bookend_seconds(),
+        )
 
         clip_files: list[Path] = []
         for idx, clip in enumerate(timeline):
@@ -1886,7 +2004,7 @@ class VideoPipeline:
                 "-i",
                 str(visuals_mp4),
                 "-i",
-                str(narration_wav),
+                str(render_audio),
                 "-map",
                 "0:v:0",
                 "-map",
@@ -1913,6 +2031,20 @@ class VideoPipeline:
 
     def _render_single_clip(self, clip: TimelineClip, output_clip: Path, index: int) -> None:
         duration = max(0.3, clip.seconds)
+        if clip.scene_id == "__intro":
+            command = self._intro_clip_command(output_clip=output_clip, duration=duration, title=clip.heading)
+            result = self._run_command(command, timeout=900, check=False)
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to render intro clip: {result.stderr.strip()}")
+            return
+
+        if clip.scene_id == "__outro":
+            command = self._outro_clip_command(output_clip=output_clip, duration=duration, text=clip.heading)
+            result = self._run_command(command, timeout=900, check=False)
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to render outro clip: {result.stderr.strip()}")
+            return
+
         source = Path(clip.source_path) if clip.source_path else None
         vf_fallback = self._base_clip_vf()
 
@@ -1988,6 +2120,78 @@ class VideoPipeline:
             result = self._run_command(fallback, timeout=900, check=False)
         if result.returncode != 0:
             raise RuntimeError(f"Failed to render clip {clip.scene_id}: {result.stderr.strip()}")
+
+    def _intro_clip_command(self, output_clip: Path, duration: float, title: str) -> list[str]:
+        title_text = self._escape_drawtext_text(title or "Explainer")
+        subtitle_text = self._escape_drawtext_text("Generated locally")
+        fade = min(0.45, max(0.2, duration * 0.2))
+        fade_out_start = max(0.0, duration - fade)
+        return [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=#0f172a:s={self.config.width}x{self.config.height}:r={self.config.fps}",
+            "-t",
+            f"{duration:.3f}",
+            "-vf",
+            (
+                "drawbox=x=0:y=0:w=iw:h=ih:color=#0b1120@0.35:t=fill,"
+                "drawbox=x=0:y=ih*0.72:w=iw:h=ih*0.28:color=#111827@0.55:t=fill,"
+                f"drawtext=text='{title_text}':fontcolor=white:fontsize={max(42, int(self.config.height*0.072))}:"
+                "x=(w-text_w)/2:y=h*0.42:shadowcolor=black@0.85:shadowx=2:shadowy=2,"
+                f"drawtext=text='{subtitle_text}':fontcolor=white@0.85:fontsize={max(22, int(self.config.height*0.032))}:"
+                "x=(w-text_w)/2:y=h*0.58,"
+                f"fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f}"
+            ),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            str(output_clip),
+        ]
+
+    def _outro_clip_command(self, output_clip: Path, duration: float, text: str) -> list[str]:
+        outro_text = self._escape_drawtext_text(text or "Thanks for watching")
+        sub_text = self._escape_drawtext_text("See you in the next video")
+        fade = min(0.45, max(0.2, duration * 0.2))
+        fade_out_start = max(0.0, duration - fade)
+        return [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=#111827:s={self.config.width}x{self.config.height}:r={self.config.fps}",
+            "-t",
+            f"{duration:.3f}",
+            "-vf",
+            (
+                "drawbox=x=0:y=0:w=iw:h=ih:color=#0b1120@0.3:t=fill,"
+                "drawbox=x=iw*0.12:y=ih*0.28:w=iw*0.76:h=ih*0.44:color=#111827@0.62:t=fill,"
+                f"drawtext=text='{outro_text}':fontcolor=white:fontsize={max(38, int(self.config.height*0.062))}:"
+                "x=(w-text_w)/2:y=h*0.44:shadowcolor=black@0.85:shadowx=2:shadowy=2,"
+                f"drawtext=text='{sub_text}':fontcolor=white@0.82:fontsize={max(20, int(self.config.height*0.03))}:"
+                "x=(w-text_w)/2:y=h*0.58,"
+                f"fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f}"
+            ),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            str(output_clip),
+        ]
 
     def _placeholder_clip_command(self, output_clip: Path, duration: float, index: int, vf: str) -> list[str]:
         hue_shift = (index * 33) % 360
@@ -2100,6 +2304,11 @@ class VideoPipeline:
                 "resolution": f"{self.config.width}x{self.config.height}",
                 "fps": self.config.fps,
                 "video_effects": self.config.video_effects,
+                "include_intro": self.config.include_intro,
+                "include_outro": self.config.include_outro,
+                "intro_seconds": self.config.intro_seconds,
+                "outro_seconds": self.config.outro_seconds,
+                "outro_text": self.config.outro_text,
                 "strict_commercial_safe": self.config.strict_commercial_safe,
                 "script_engine": self.config.script_engine,
                 "tts_engine": self.config.tts_engine,
@@ -2381,6 +2590,15 @@ class VideoPipeline:
         value = text.replace("\\", r"\\")
         value = value.replace("{", r"\{")
         value = value.replace("}", r"\}")
+        return value
+
+    def _escape_drawtext_text(self, text: str) -> str:
+        value = (text or "").replace("\\", r"\\")
+        value = value.replace(":", r"\:")
+        value = value.replace("'", r"\'")
+        value = value.replace(",", r"\,")
+        value = value.replace("%", r"\%")
+        value = value.replace("\n", r"\n")
         return value
 
     def _log(self, message: str) -> None:

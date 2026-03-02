@@ -108,6 +108,11 @@ local-video-mvp run \
   --ollama-model qwen2.5:14b \
   --tts-engine melo \
   --video-effects subtle-motion \
+  --include-intro \
+  --include-outro \
+  --intro-seconds 2.8 \
+  --outro-seconds 3.0 \
+  --outro-text "Thanks for watching" \
   --voice-profile calm-documentary \
   --caption-engine faster-whisper \
   --caption-style engagement \
@@ -133,6 +138,14 @@ Video effects presets (long-form safe):
 - `--video-effects clean` (no extra effects)
 - `--video-effects subtle-motion` (light motion and color polish)
 - `--video-effects dynamic` (stronger motion/color treatment)
+
+Intro/outro options:
+
+- `--include-intro` / `--no-include-intro`
+- `--include-outro` / `--no-include-outro`
+- `--intro-seconds 2.8`
+- `--outro-seconds 3.0`
+- `--outro-text "Thanks for watching"`
 
 If you use `--script-engine ollama`, make sure Ollama server is running:
 
