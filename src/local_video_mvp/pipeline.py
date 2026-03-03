@@ -2122,8 +2122,14 @@ class VideoPipeline:
             raise RuntimeError(f"Failed to render clip {clip.scene_id}: {result.stderr.strip()}")
 
     def _intro_clip_command(self, output_clip: Path, duration: float, title: str) -> list[str]:
-        title_text = self._escape_drawtext_text(title or "Explainer")
-        subtitle_text = self._escape_drawtext_text("Generated locally")
+        title_file = output_clip.with_suffix(".intro_title.txt")
+        subtitle_file = output_clip.with_suffix(".intro_subtitle.txt")
+        self._write_text(title_file, (title or "Explainer").strip() + "\n")
+        self._write_text(subtitle_file, "Generated locally\n")
+
+        title_textfile = self._escape_drawtext_path(title_file)
+        subtitle_textfile = self._escape_drawtext_path(subtitle_file)
+
         fade = min(0.45, max(0.2, duration * 0.2))
         fade_out_start = max(0.0, duration - fade)
         return [
@@ -2139,9 +2145,9 @@ class VideoPipeline:
             (
                 "drawbox=x=0:y=0:w=iw:h=ih:color=#0b1120@0.35:t=fill,"
                 "drawbox=x=0:y=ih*0.72:w=iw:h=ih*0.28:color=#111827@0.55:t=fill,"
-                f"drawtext=text='{title_text}':fontcolor=white:fontsize={max(42, int(self.config.height*0.072))}:"
+                f"drawtext=textfile='{title_textfile}':fontcolor=white:fontsize={max(42, int(self.config.height*0.072))}:"
                 "x=(w-text_w)/2:y=h*0.42:shadowcolor=black@0.85:shadowx=2:shadowy=2,"
-                f"drawtext=text='{subtitle_text}':fontcolor=white@0.85:fontsize={max(22, int(self.config.height*0.032))}:"
+                f"drawtext=textfile='{subtitle_textfile}':fontcolor=white@0.85:fontsize={max(22, int(self.config.height*0.032))}:"
                 "x=(w-text_w)/2:y=h*0.58,"
                 f"fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f}"
             ),
@@ -2158,8 +2164,14 @@ class VideoPipeline:
         ]
 
     def _outro_clip_command(self, output_clip: Path, duration: float, text: str) -> list[str]:
-        outro_text = self._escape_drawtext_text(text or "Thanks for watching")
-        sub_text = self._escape_drawtext_text("See you in the next video")
+        outro_file = output_clip.with_suffix(".outro_title.txt")
+        subtitle_file = output_clip.with_suffix(".outro_subtitle.txt")
+        self._write_text(outro_file, (text or "Thanks for watching").strip() + "\n")
+        self._write_text(subtitle_file, "See you in the next video\n")
+
+        outro_textfile = self._escape_drawtext_path(outro_file)
+        sub_textfile = self._escape_drawtext_path(subtitle_file)
+
         fade = min(0.45, max(0.2, duration * 0.2))
         fade_out_start = max(0.0, duration - fade)
         return [
@@ -2175,9 +2187,9 @@ class VideoPipeline:
             (
                 "drawbox=x=0:y=0:w=iw:h=ih:color=#0b1120@0.3:t=fill,"
                 "drawbox=x=iw*0.12:y=ih*0.28:w=iw*0.76:h=ih*0.44:color=#111827@0.62:t=fill,"
-                f"drawtext=text='{outro_text}':fontcolor=white:fontsize={max(38, int(self.config.height*0.062))}:"
+                f"drawtext=textfile='{outro_textfile}':fontcolor=white:fontsize={max(38, int(self.config.height*0.062))}:"
                 "x=(w-text_w)/2:y=h*0.44:shadowcolor=black@0.85:shadowx=2:shadowy=2,"
-                f"drawtext=text='{sub_text}':fontcolor=white@0.82:fontsize={max(20, int(self.config.height*0.03))}:"
+                f"drawtext=textfile='{sub_textfile}':fontcolor=white@0.82:fontsize={max(20, int(self.config.height*0.03))}:"
                 "x=(w-text_w)/2:y=h*0.58,"
                 f"fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f}"
             ),
@@ -2592,13 +2604,12 @@ class VideoPipeline:
         value = value.replace("}", r"\}")
         return value
 
-    def _escape_drawtext_text(self, text: str) -> str:
-        value = (text or "").replace("\\", r"\\")
+    def _escape_drawtext_path(self, path: Path) -> str:
+        value = str(path.resolve()).replace("\\", r"\\")
         value = value.replace(":", r"\:")
         value = value.replace("'", r"\'")
         value = value.replace(",", r"\,")
         value = value.replace("%", r"\%")
-        value = value.replace("\n", r"\n")
         return value
 
     def _log(self, message: str) -> None:
