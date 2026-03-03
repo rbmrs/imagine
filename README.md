@@ -2,6 +2,8 @@
 
 Local-first MVP for generating long-form faceless explainer videos on macOS.
 
+New contributors should start with `PROJECT_ONBOARDING.md` for a quick project overview and workflow guide.
+
 This build targets your constraints:
 
 - Long-form videos (default 5 minutes for MVP iteration)
