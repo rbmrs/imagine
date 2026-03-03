@@ -2122,13 +2122,23 @@ class VideoPipeline:
             raise RuntimeError(f"Failed to render clip {clip.scene_id}: {result.stderr.strip()}")
 
     def _intro_clip_command(self, output_clip: Path, duration: float, title: str) -> list[str]:
+        style = self._normalized_bookend_style()
+        palette = self._bookend_palette(style=style, is_intro=True)
+        wrapped_title = self._wrap_bookend_text(title or "Explainer")
+        title_font = self._bookend_title_font_size(wrapped_title)
+
         title_file = output_clip.with_suffix(".intro_title.txt")
         subtitle_file = output_clip.with_suffix(".intro_subtitle.txt")
-        self._write_text(title_file, (title or "Explainer").strip() + "\n")
+        self._write_text(title_file, wrapped_title + "\n")
         self._write_text(subtitle_file, "Generated locally\n")
 
         title_textfile = self._escape_drawtext_path(title_file)
         subtitle_textfile = self._escape_drawtext_path(subtitle_file)
+
+        title_lines = max(1, len([line for line in wrapped_title.splitlines() if line.strip()]))
+        title_y = int(self.config.height * (0.34 if title_lines >= 3 else 0.37))
+        subtitle_y = int(self.config.height * 0.65)
+        subtitle_font = max(20, int(self.config.height * 0.031))
 
         fade = min(0.45, max(0.2, duration * 0.2))
         fade_out_start = max(0.0, duration - fade)
@@ -2138,17 +2148,18 @@ class VideoPipeline:
             "-f",
             "lavfi",
             "-i",
-            f"color=c=#0f172a:s={self.config.width}x{self.config.height}:r={self.config.fps}",
+            f"color=c={palette['base']}:s={self.config.width}x{self.config.height}:r={self.config.fps}",
             "-t",
             f"{duration:.3f}",
             "-vf",
             (
-                "drawbox=x=0:y=0:w=iw:h=ih:color=#0b1120@0.35:t=fill,"
-                "drawbox=x=0:y=ih*0.72:w=iw:h=ih*0.28:color=#111827@0.55:t=fill,"
-                f"drawtext=textfile='{title_textfile}':fontcolor=white:fontsize={max(42, int(self.config.height*0.072))}:"
-                "x=(w-text_w)/2:y=h*0.42:shadowcolor=black@0.85:shadowx=2:shadowy=2,"
-                f"drawtext=textfile='{subtitle_textfile}':fontcolor=white@0.85:fontsize={max(22, int(self.config.height*0.032))}:"
-                "x=(w-text_w)/2:y=h*0.58,"
+                f"drawbox=x=0:y=0:w=iw:h=ih:color={palette['overlay']}:t=fill,"
+                f"drawbox=x=iw*0.11:y=ih*0.22:w=iw*0.78:h=ih*0.56:color={palette['panel']}:t=fill,"
+                f"drawbox=x=iw*0.16:y=ih*0.245:w=iw*0.68:h=2:color={palette['accent']}:t=fill,"
+                f"drawtext=textfile='{title_textfile}':fontcolor={palette['title_color']}:fontsize={title_font}:"
+                f"x=(w-text_w)/2:y={title_y}:line_spacing=10:shadowcolor=black@0.9:shadowx=2:shadowy=2,"
+                f"drawtext=textfile='{subtitle_textfile}':fontcolor={palette['subtitle_color']}:fontsize={subtitle_font}:"
+                f"x=(w-text_w)/2:y={subtitle_y},"
                 f"fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f}"
             ),
             "-an",
@@ -2164,13 +2175,23 @@ class VideoPipeline:
         ]
 
     def _outro_clip_command(self, output_clip: Path, duration: float, text: str) -> list[str]:
+        style = self._normalized_bookend_style()
+        palette = self._bookend_palette(style=style, is_intro=False)
+        wrapped_title = self._wrap_bookend_text(text or "Thanks for watching")
+        title_font = self._bookend_title_font_size(wrapped_title)
+
         outro_file = output_clip.with_suffix(".outro_title.txt")
         subtitle_file = output_clip.with_suffix(".outro_subtitle.txt")
-        self._write_text(outro_file, (text or "Thanks for watching").strip() + "\n")
+        self._write_text(outro_file, wrapped_title + "\n")
         self._write_text(subtitle_file, "See you in the next video\n")
 
         outro_textfile = self._escape_drawtext_path(outro_file)
         sub_textfile = self._escape_drawtext_path(subtitle_file)
+
+        title_lines = max(1, len([line for line in wrapped_title.splitlines() if line.strip()]))
+        title_y = int(self.config.height * (0.40 if title_lines >= 3 else 0.43))
+        subtitle_y = int(self.config.height * 0.63)
+        subtitle_font = max(20, int(self.config.height * 0.03))
 
         fade = min(0.45, max(0.2, duration * 0.2))
         fade_out_start = max(0.0, duration - fade)
@@ -2180,17 +2201,18 @@ class VideoPipeline:
             "-f",
             "lavfi",
             "-i",
-            f"color=c=#111827:s={self.config.width}x{self.config.height}:r={self.config.fps}",
+            f"color=c={palette['base']}:s={self.config.width}x{self.config.height}:r={self.config.fps}",
             "-t",
             f"{duration:.3f}",
             "-vf",
             (
-                "drawbox=x=0:y=0:w=iw:h=ih:color=#0b1120@0.3:t=fill,"
-                "drawbox=x=iw*0.12:y=ih*0.28:w=iw*0.76:h=ih*0.44:color=#111827@0.62:t=fill,"
-                f"drawtext=textfile='{outro_textfile}':fontcolor=white:fontsize={max(38, int(self.config.height*0.062))}:"
-                "x=(w-text_w)/2:y=h*0.44:shadowcolor=black@0.85:shadowx=2:shadowy=2,"
-                f"drawtext=textfile='{sub_textfile}':fontcolor=white@0.82:fontsize={max(20, int(self.config.height*0.03))}:"
-                "x=(w-text_w)/2:y=h*0.58,"
+                f"drawbox=x=0:y=0:w=iw:h=ih:color={palette['overlay']}:t=fill,"
+                f"drawbox=x=iw*0.10:y=ih*0.26:w=iw*0.80:h=ih*0.50:color={palette['panel']}:t=fill,"
+                f"drawbox=x=iw*0.16:y=ih*0.735:w=iw*0.68:h=2:color={palette['accent']}:t=fill,"
+                f"drawtext=textfile='{outro_textfile}':fontcolor={palette['title_color']}:fontsize={title_font}:"
+                f"x=(w-text_w)/2:y={title_y}:line_spacing=10:shadowcolor=black@0.9:shadowx=2:shadowy=2,"
+                f"drawtext=textfile='{sub_textfile}':fontcolor={palette['subtitle_color']}:fontsize={subtitle_font}:"
+                f"x=(w-text_w)/2:y={subtitle_y},"
                 f"fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f}"
             ),
             "-an",
@@ -2204,6 +2226,93 @@ class VideoPipeline:
             "yuv420p",
             str(output_clip),
         ]
+
+    def _normalized_bookend_style(self) -> str:
+        style = str(self.config.bookend_style or "minimal-clean").strip().lower()
+        if style not in {"minimal-clean", "cinematic-subtle"}:
+            return "minimal-clean"
+        return style
+
+    def _bookend_palette(self, style: str, is_intro: bool) -> dict[str, str]:
+        if style == "cinematic-subtle":
+            if is_intro:
+                return {
+                    "base": "#0b1220",
+                    "overlay": "#0b1020@0.42",
+                    "panel": "#111a2a@0.66",
+                    "accent": "#7dd3fc@0.75",
+                    "title_color": "white",
+                    "subtitle_color": "white@0.85",
+                }
+            return {
+                "base": "#0a1322",
+                "overlay": "#0a1120@0.40",
+                "panel": "#101b2a@0.64",
+                "accent": "#93c5fd@0.72",
+                "title_color": "white",
+                "subtitle_color": "white@0.82",
+            }
+
+        if is_intro:
+            return {
+                "base": "#132033",
+                "overlay": "#0f172a@0.32",
+                "panel": "#111827@0.58",
+                "accent": "#60a5fa@0.70",
+                "title_color": "white",
+                "subtitle_color": "white@0.84",
+            }
+        return {
+            "base": "#151c2b",
+            "overlay": "#0f172a@0.30",
+            "panel": "#111827@0.58",
+            "accent": "#93c5fd@0.66",
+            "title_color": "white",
+            "subtitle_color": "white@0.82",
+        }
+
+    def _wrap_bookend_text(self, text: str) -> str:
+        normalized = re.sub(r"\s+", " ", (text or "").strip())
+        if not normalized:
+            return "Explainer"
+
+        max_chars = max(18, min(48, int(self.config.width / 32)))
+        words = normalized.split(" ")
+        lines: list[str] = []
+        current = ""
+
+        for word in words:
+            candidate = f"{current} {word}".strip() if current else word
+            if len(candidate) <= max_chars:
+                current = candidate
+                continue
+            if current:
+                lines.append(current)
+                current = word
+            else:
+                lines.append(word[:max_chars])
+                current = word[max_chars:]
+
+        if current:
+            lines.append(current)
+
+        if len(lines) > 4:
+            merged = lines[:3]
+            merged.append(" ".join(lines[3:]))
+            lines = merged
+
+        return "\n".join(line.strip() for line in lines if line.strip())
+
+    def _bookend_title_font_size(self, wrapped_text: str) -> int:
+        lines = [line for line in wrapped_text.splitlines() if line.strip()]
+        longest = max((len(line) for line in lines), default=12)
+        line_count = max(1, len(lines))
+
+        base = int(self.config.height * 0.066)
+        width_fit = int((self.config.width * 0.82) / max(1.0, longest * 0.58))
+        line_penalty = 1.0 - max(0, line_count - 2) * 0.10
+        final = int(min(base, width_fit) * max(0.68, line_penalty))
+        return max(24, min(64, final))
 
     def _placeholder_clip_command(self, output_clip: Path, duration: float, index: int, vf: str) -> list[str]:
         hue_shift = (index * 33) % 360
@@ -2321,6 +2430,7 @@ class VideoPipeline:
                 "intro_seconds": self.config.intro_seconds,
                 "outro_seconds": self.config.outro_seconds,
                 "outro_text": self.config.outro_text,
+                "bookend_style": self.config.bookend_style,
                 "strict_commercial_safe": self.config.strict_commercial_safe,
                 "script_engine": self.config.script_engine,
                 "tts_engine": self.config.tts_engine,

@@ -40,6 +40,7 @@ class PipelineConfig:
     intro_seconds: float = 2.8
     outro_seconds: float = 3.0
     outro_text: str = "Thanks for watching"
+    bookend_style: str = "minimal-clean"
     voice_profile: str = "calm-documentary"
     voice_speed: float = 1.0
     melo_language: str = "EN"

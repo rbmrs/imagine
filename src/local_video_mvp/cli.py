@@ -76,6 +76,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--outro-seconds", type=float, default=3.0, help="Outro card duration in seconds")
     run.add_argument("--outro-text", default="Thanks for watching", help="Outro card text")
     run.add_argument(
+        "--bookend-style",
+        choices=["minimal-clean", "cinematic-subtle"],
+        default="minimal-clean",
+        help="Visual style preset for intro/outro cards",
+    )
+    run.add_argument(
         "--voice-profile",
         choices=["calm-documentary", "balanced", "energetic-explainer"],
         default="calm-documentary",
@@ -224,6 +230,7 @@ def run_command(args: argparse.Namespace) -> int:
         intro_seconds=intro_seconds,
         outro_seconds=outro_seconds,
         outro_text=str(args.outro_text).strip() or "Thanks for watching",
+        bookend_style=args.bookend_style,
         voice_profile=args.voice_profile,
         voice_speed=max(0.5, min(2.0, float(args.voice_speed))),
         melo_language=args.melo_language,

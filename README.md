@@ -113,6 +113,7 @@ local-video-mvp run \
   --intro-seconds 2.8 \
   --outro-seconds 3.0 \
   --outro-text "Thanks for watching" \
+  --bookend-style minimal-clean \
   --voice-profile calm-documentary \
   --caption-engine faster-whisper \
   --caption-style engagement \
@@ -146,6 +147,7 @@ Intro/outro options:
 - `--intro-seconds 2.8`
 - `--outro-seconds 3.0`
 - `--outro-text "Thanks for watching"`
+- `--bookend-style minimal-clean` (default) or `--bookend-style cinematic-subtle`
 
 If you use `--script-engine ollama`, make sure Ollama server is running:
 
