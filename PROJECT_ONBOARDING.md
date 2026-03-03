@@ -110,9 +110,23 @@ Generate voice A/B samples:
 local-video-mvp voice-ab --project-dir ./projects/<project-id> --speakers EN-US EN-Default EN-AU
 ```
 
+Launch the terminal UI (experimental):
+
+```bash
+local-video-mvp tui --prompt "Your topic" --project-dir ./projects/demo --minutes 5
+```
+
+TUI shortcut focus for now:
+
+- `R` runs the preferred full pipeline profile from this onboarding guide.
+- `I` runs `inspect` for the selected project.
+- `P`/`D`/`M` edit prompt, project dir, and minutes.
+
 ## Recommended local run pattern
 
 Use one terminal with automatic Ollama lifecycle and venv cleanup:
+
+Team note: this is the preferred execution pattern for this project.
 
 ```bash
 source .venv/bin/activate

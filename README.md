@@ -192,6 +192,28 @@ Outputs are written under `output/voice_ab/`, including:
 - `ab_compare.wav` (single file for quick back-to-back listening)
 - `voice_ab_report.json`
 
+## TUI quick start (experimental)
+
+You can launch a terminal UI and trigger the onboarding run profile with a single key.
+
+```bash
+local-video-mvp tui \
+  --prompt "Your topic" \
+  --project-dir ./projects/demo \
+  --minutes 5
+```
+
+Key bindings:
+
+- `R`: run the full pipeline using the preferred profile (`ollama`, `melo`, `faster-whisper`, strict mode)
+- `I`: run inspect for the current project dir
+- `P`: edit prompt
+- `D`: edit project directory
+- `M`: edit minutes
+- `Q`: quit (stops active run first)
+
+If Ollama is not already running, the TUI tries to start `ollama serve` automatically and stops it on exit when it was started by the TUI.
+
 ## Inspect logs after a run
 
 Every run writes:

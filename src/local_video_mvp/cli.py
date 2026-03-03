@@ -181,6 +181,11 @@ def build_parser() -> argparse.ArgumentParser:
     voice_ab.add_argument("--output-dir", help="Optional custom output directory")
     voice_ab.add_argument("--verbose", action="store_true", help="Verbose logs")
 
+    tui = subparsers.add_parser("tui", help="Open terminal UI for common workflows")
+    tui.add_argument("--prompt", default="Your topic", help="Initial prompt shown in the TUI")
+    tui.add_argument("--project-dir", default="./projects/demo", help="Initial project directory")
+    tui.add_argument("--minutes", type=int, default=5, help="Initial target duration in minutes")
+
     return parser
 
 
@@ -489,6 +494,15 @@ def voice_ab_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def tui_command(args: argparse.Namespace) -> int:
+    from .tui import run_tui
+
+    prompt = str(args.prompt).strip() or "Your topic"
+    project_dir = Path(args.project_dir).expanduser().resolve()
+    minutes = max(1, int(args.minutes))
+    return run_tui(prompt=prompt, project_dir=project_dir, minutes=minutes)
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -502,6 +516,8 @@ def main() -> int:
             return voices_command(args)
         if args.command == "voice-ab":
             return voice_ab_command(args)
+        if args.command == "tui":
+            return tui_command(args)
     except Exception as exc:  # noqa: BLE001
         print(f"Error: {exc}", file=sys.stderr)
         return 2
