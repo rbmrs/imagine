@@ -197,10 +197,19 @@ Outputs are written under `output/voice_ab/`, including:
 You can launch a terminal UI and trigger the onboarding run profile with a single key.
 
 ```bash
-local-video-mvp tui \
-  --prompt "Your topic" \
-  --project-dir ./projects/demo \
-  --minutes 5
+imagine
+```
+
+`imagine` opens the TUI with default values:
+
+- prompt: `Your topic`
+- project directory: `./projects/demo`
+- minutes: `5`
+
+If you want custom startup values, you can still use:
+
+```bash
+local-video-mvp tui --prompt "Your topic" --project-dir ./projects/demo --minutes 5
 ```
 
 Key bindings:

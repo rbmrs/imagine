@@ -18,6 +18,7 @@ captions = ["faster-whisper>=1.1.0"]
 
 [project.scripts]
 local-video-mvp = "local_video_mvp.cli:main"
+imagine = "local_video_mvp.cli:imagine_entry"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

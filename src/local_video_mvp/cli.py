@@ -503,6 +503,16 @@ def tui_command(args: argparse.Namespace) -> int:
     return run_tui(prompt=prompt, project_dir=project_dir, minutes=minutes)
 
 
+def imagine_entry() -> int:
+    from .tui import run_tui
+
+    return run_tui(
+        prompt="Your topic",
+        project_dir=Path("./projects/demo").expanduser().resolve(),
+        minutes=5,
+    )
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()

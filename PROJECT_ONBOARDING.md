@@ -113,8 +113,10 @@ local-video-mvp voice-ab --project-dir ./projects/<project-id> --speakers EN-US 
 Launch the terminal UI (experimental):
 
 ```bash
-local-video-mvp tui --prompt "Your topic" --project-dir ./projects/demo --minutes 5
+imagine
 ```
+
+`imagine` opens the TUI with default startup values. Use `local-video-mvp tui ...` for custom startup values.
 
 TUI shortcut focus for now:
 
