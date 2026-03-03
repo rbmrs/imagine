@@ -202,9 +202,9 @@ imagine
 
 `imagine` opens the TUI with default values:
 
-- prompt: `Your topic`
-- project directory: `./projects/demo`
-- minutes: `5`
+- prompt: `Autonomous cars`
+- project directory: `~/Downloads/imagine`
+- minutes: `2`
 
 If you want custom startup values, you can still use:
 
@@ -219,6 +219,9 @@ Key bindings:
 - `P`: edit prompt
 - `D`: edit project directory
 - `M`: edit minutes
+- `J`/`K` or Arrow keys: scroll logs
+- `F`: toggle log follow mode
+- `G`: jump to latest logs
 - `Q`: quit (stops active run first)
 
 If Ollama is not already running, the TUI tries to start `ollama serve` automatically and stops it on exit when it was started by the TUI.

@@ -118,11 +118,18 @@ imagine
 
 `imagine` opens the TUI with default startup values. Use `local-video-mvp tui ...` for custom startup values.
 
+Default startup values:
+
+- prompt: `Autonomous cars`
+- project directory: `~/Downloads/imagine`
+- minutes: `2`
+
 TUI shortcut focus for now:
 
 - `R` runs the preferred full pipeline profile from this onboarding guide.
 - `I` runs `inspect` for the selected project.
 - `P`/`D`/`M` edit prompt, project dir, and minutes.
+- `J`/`K` (or arrow keys) scroll logs, `F` toggles follow mode, `G` jumps to latest.
 
 TUI logs are always written to `~/.imagine/logs/`:
 

@@ -182,9 +182,13 @@ def build_parser() -> argparse.ArgumentParser:
     voice_ab.add_argument("--verbose", action="store_true", help="Verbose logs")
 
     tui = subparsers.add_parser("tui", help="Open terminal UI for common workflows")
-    tui.add_argument("--prompt", default="Your topic", help="Initial prompt shown in the TUI")
-    tui.add_argument("--project-dir", default="./projects/demo", help="Initial project directory")
-    tui.add_argument("--minutes", type=int, default=5, help="Initial target duration in minutes")
+    tui.add_argument("--prompt", default="Autonomous cars", help="Initial prompt shown in the TUI")
+    tui.add_argument(
+        "--project-dir",
+        default=str((Path.home() / "Downloads" / "imagine").resolve()),
+        help="Initial project directory",
+    )
+    tui.add_argument("--minutes", type=int, default=2, help="Initial target duration in minutes")
 
     return parser
 
@@ -507,9 +511,9 @@ def imagine_entry() -> int:
     from .tui import run_tui
 
     return run_tui(
-        prompt="Your topic",
-        project_dir=Path("./projects/demo").expanduser().resolve(),
-        minutes=5,
+        prompt="Autonomous cars",
+        project_dir=(Path.home() / "Downloads" / "imagine").resolve(),
+        minutes=2,
     )
 
 
