@@ -121,8 +121,13 @@ imagine
 Default startup values:
 
 - prompt: `Autonomous cars`
-- project directory: `~/Downloads/imagine`
+- project directory: `~/.imagine/projects/autonomous-cars`
 - minutes: `2`
+
+Default storage behavior:
+
+- project artifacts and reports stay under `~/.imagine/projects/autonomous-cars`
+- TUI exports final video to `~/Downloads/autonomous-cars.mp4`
 
 TUI shortcut focus for now:
 

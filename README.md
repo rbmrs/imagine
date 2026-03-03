@@ -203,8 +203,13 @@ imagine
 `imagine` opens the TUI with default values:
 
 - prompt: `Autonomous cars`
-- project directory: `~/Downloads/imagine`
+- project directory: `~/.imagine/projects/autonomous-cars`
 - minutes: `2`
+
+Storage behavior with TUI defaults:
+
+- full project artifacts/logs/reports stay under `~/.imagine/projects/autonomous-cars`
+- after a successful run, TUI exports only the final MP4 to `~/Downloads/autonomous-cars.mp4`
 
 If you want custom startup values, you can still use:
 

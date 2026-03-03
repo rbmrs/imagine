@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import curses
 import datetime as dt
+import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -24,6 +26,8 @@ class TuiConfig:
 
 class LocalVideoMvpTui:
     SPINNER_FRAMES = ["-", "\\", "|", "/"]
+    STAGE_LINE_RE = re.compile(r"\[local-video-mvp\]\s+Stage\s+(\d+(?:\.\d+)?)/(\d+):\s+(.+)")
+    STAGE_COMPLETE_RE = re.compile(r"\[local-video-mvp\]\s+([A-Za-z0-9_]+)\s+completed in\s+([0-9]+(?:\.[0-9]+)?)s")
 
     def __init__(self, config: TuiConfig) -> None:
         self.config = config
@@ -40,6 +44,11 @@ class LocalVideoMvpTui:
         self._log_scroll = 0
         self._run_started_at: float | None = None
         self._last_elapsed_seconds: float | None = None
+        self._workflow_kind: str | None = None
+        self._stage_label: str | None = None
+        self._stage_index: float | None = None
+        self._stage_total: int | None = None
+        self._prior_total_seconds: float | None = None
 
         self._worker: threading.Thread | None = None
         self._active_process: subprocess.Popen[str] | None = None
@@ -55,6 +64,7 @@ class LocalVideoMvpTui:
         self._color_pairs: dict[str, int] = {}
 
         self._open_session_log()
+        self._refresh_prior_total_seconds()
         self._append_log(f"Session log: {self._session_log_path}")
 
     def run(self) -> int:
@@ -192,7 +202,7 @@ class LocalVideoMvpTui:
             return
 
         self._jump_to_latest_logs()
-        self._mark_command_start()
+        self._mark_command_start(workflow_kind="run")
         self._set_running(True)
         self._set_status("Starting run workflow...")
         self._worker = threading.Thread(target=self._run_workflow, daemon=True)
@@ -204,7 +214,7 @@ class LocalVideoMvpTui:
             return
 
         self._jump_to_latest_logs()
-        self._mark_command_start()
+        self._mark_command_start(workflow_kind="inspect")
         self._set_running(True)
         self._set_status("Inspecting project...")
         self._worker = threading.Thread(target=self._inspect_workflow, daemon=True)
@@ -218,8 +228,15 @@ class LocalVideoMvpTui:
 
             if run_code == 0:
                 self._set_status("Run succeeded. Inspecting outputs...")
-                self._run_and_stream(self._build_inspect_command(), label="inspect")
-                self._set_status("Run complete.")
+                inspect_code = self._run_and_stream(self._build_inspect_command(), label="inspect")
+                exported_mp4 = self._export_final_mp4_to_downloads()
+
+                if inspect_code == 0 and exported_mp4 is not None:
+                    self._set_status(f"Run complete. MP4 exported to {exported_mp4.name}.")
+                elif inspect_code == 0:
+                    self._set_status("Run complete. MP4 export skipped.")
+                else:
+                    self._set_status(f"Run succeeded, inspect failed with exit code {inspect_code}.")
             else:
                 self._set_status(f"Run failed with exit code {run_code}.")
         except Exception as exc:  # noqa: BLE001
@@ -267,8 +284,13 @@ class LocalVideoMvpTui:
                     line = raw_line.rstrip("\n")
                     if line:
                         self._append_log(line)
+                        self._update_status_from_log_line(line)
             process.wait()
             self._append_log(f"[{label}] exited with code {process.returncode}")
+
+            if label == "run" and int(process.returncode or 0) == 0:
+                self._refresh_prior_total_seconds()
+
             return int(process.returncode or 0)
         finally:
             self._set_active_process(None)
@@ -374,8 +396,8 @@ class LocalVideoMvpTui:
         self._draw_box(8, 0, 5, width, title=" Runtime ", attr=self._attr("accent"))
         state_text, state_attr = self._state_display()
         self._safe_addstr(9, 2, f"State  : {state_text}", width, attr=state_attr)
-        self._safe_addstr(10, 2, f"Status : {self._trim_tail(self._get_status(), width - 14)}", width)
-        self._safe_addstr(11, 2, f"Log    : {self._trim_middle(str(self._latest_log_path), width - 14)}", width)
+        self._safe_addstr(10, 2, f"Phase  : {self._trim_tail(self._progress_phase_text(), width - 14)}", width)
+        self._safe_addstr(11, 2, f"Status : {self._trim_tail(self._get_status(), width - 14)}", width)
 
         logs_top = 13
         logs_height = max(3, height - logs_top - 1)
@@ -404,12 +426,13 @@ class LocalVideoMvpTui:
         self._safe_addstr(5, 0, f"Minutes: {self.config.minutes}", width)
         state_text, state_attr = self._state_display()
         self._safe_addstr(7, 0, f"{state_text}", width, attr=state_attr)
-        self._safe_addstr(8, 0, self._trim_tail(self._get_status(), width), width)
+        self._safe_addstr(8, 0, self._trim_tail(self._progress_phase_text(), width), width)
+        self._safe_addstr(9, 0, self._trim_tail(self._get_status(), width), width)
 
         logs = self._get_logs()
-        log_rows = max(1, height - 10)
+        log_rows = max(1, height - 11)
         for idx, line in enumerate(logs[-log_rows:]):
-            self._safe_addstr(10 + idx, 0, self._trim_tail(line, width), width, attr=self._log_line_attr(line))
+            self._safe_addstr(11 + idx, 0, self._trim_tail(line, width), width, attr=self._log_line_attr(line))
 
     def _state_display(self) -> tuple[str, int]:
         running = self._is_running()
@@ -417,7 +440,10 @@ class LocalVideoMvpTui:
 
         if running:
             frame = self._spinner_frame()
-            return f"{frame} RUNNING  {elapsed:.1f}s", self._attr("ok", bold=True)
+            progress = self._estimate_progress_percent(elapsed)
+            eta_seconds = self._estimate_eta_seconds(elapsed, progress)
+            eta_text = self._format_eta(eta_seconds)
+            return f"{frame} RUNNING  {elapsed:.1f}s  {progress:5.1f}% ETA {eta_text}", self._attr("ok", bold=True)
 
         if self._last_elapsed_seconds is not None:
             return f"IDLE  last run {self._last_elapsed_seconds:.1f}s", self._attr("muted")
@@ -509,6 +535,129 @@ class LocalVideoMvpTui:
         index = int(time.monotonic() * 8) % len(self.SPINNER_FRAMES)
         return self.SPINNER_FRAMES[index]
 
+    def _progress_phase_text(self) -> str:
+        with self._lock:
+            stage_index = self._stage_index
+            stage_total = self._stage_total
+            stage_label = self._stage_label
+            workflow_kind = self._workflow_kind
+
+        if workflow_kind != "run":
+            return "Inspect workflow" if workflow_kind == "inspect" else "Waiting for run"
+
+        if stage_index is None or stage_total is None or stage_total <= 0:
+            return "Starting run..."
+
+        if float(stage_index).is_integer():
+            stage_idx_text = str(int(stage_index))
+        else:
+            stage_idx_text = f"{stage_index:.1f}"
+
+        if stage_label:
+            return f"Stage {stage_idx_text}/{stage_total}: {stage_label}"
+        return f"Stage {stage_idx_text}/{stage_total}"
+
+    def _estimate_progress_percent(self, elapsed_seconds: float) -> float:
+        with self._lock:
+            stage_index = self._stage_index
+            stage_total = self._stage_total
+            prior_total = self._prior_total_seconds
+
+        stage_percent: float | None = None
+        if stage_index is not None and stage_total and stage_total > 0:
+            stage_percent = ((max(1.0, stage_index) - 1.0) / float(stage_total)) * 100.0
+            stage_percent = max(0.0, min(99.0, stage_percent))
+
+        time_percent: float | None = None
+        if prior_total is not None and prior_total > 1.0:
+            time_percent = max(0.0, min(99.0, (elapsed_seconds / prior_total) * 100.0))
+
+        if stage_percent is not None and time_percent is not None:
+            return max(stage_percent, time_percent)
+        if time_percent is not None:
+            return time_percent
+        if stage_percent is not None:
+            return stage_percent
+        return 0.0
+
+    def _estimate_eta_seconds(self, elapsed_seconds: float, progress_percent: float) -> float | None:
+        with self._lock:
+            prior_total = self._prior_total_seconds
+
+        if prior_total is not None:
+            return max(0.0, prior_total - elapsed_seconds)
+        return None
+
+    def _format_eta(self, eta_seconds: float | None) -> str:
+        if eta_seconds is None:
+            return "--:--"
+        minutes = int(eta_seconds // 60)
+        seconds = int(eta_seconds % 60)
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def _update_status_from_log_line(self, line: str) -> None:
+        stage_match = self.STAGE_LINE_RE.search(line)
+        if stage_match:
+            stage_index = float(stage_match.group(1))
+            stage_total = int(stage_match.group(2))
+            stage_label = stage_match.group(3).strip()
+            with self._lock:
+                self._stage_index = stage_index
+                self._stage_total = stage_total
+                self._stage_label = stage_label
+            self._set_status(f"Stage {stage_match.group(1)}/{stage_total}: {stage_label}")
+            return
+
+        complete_match = self.STAGE_COMPLETE_RE.search(line)
+        if complete_match:
+            stage_name = complete_match.group(1)
+            stage_seconds = complete_match.group(2)
+            self._set_status(f"{stage_name} completed in {stage_seconds}s")
+            return
+
+        if line.startswith("[local-video-mvp]"):
+            message = line.split("]", maxsplit=1)[-1].strip()
+            if message:
+                self._set_status(message)
+
+    def _refresh_prior_total_seconds(self) -> None:
+        report_path = self.config.project_dir / "run_report.json"
+        prior_total: float | None = None
+
+        if report_path.exists():
+            try:
+                payload = json.loads(report_path.read_text(encoding="utf-8"))
+                raw_total = payload.get("total_seconds")
+                if isinstance(raw_total, (int, float)) and float(raw_total) > 0:
+                    prior_total = float(raw_total)
+            except Exception:
+                prior_total = None
+
+        with self._lock:
+            self._prior_total_seconds = prior_total
+
+    def _slugify(self, value: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "-", value.strip().lower())
+        slug = slug.strip("-")
+        return slug or "imagine"
+
+    def _downloads_export_mp4_path(self) -> Path:
+        downloads_dir = (Path.home() / "Downloads").resolve()
+        project_name = self._slugify(self.config.project_dir.name)
+        return downloads_dir / f"{project_name}.mp4"
+
+    def _export_final_mp4_to_downloads(self) -> Path | None:
+        source_mp4 = self.config.project_dir / "output" / "final.mp4"
+        if not source_mp4.exists():
+            self._append_log(f"WARN: final.mp4 not found at {source_mp4}")
+            return None
+
+        target_mp4 = self._downloads_export_mp4_path()
+        target_mp4.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_mp4, target_mp4)
+        self._append_log(f"Exported final MP4 to {target_mp4}")
+        return target_mp4
+
     def _elapsed_seconds(self) -> float:
         with self._lock:
             started = self._run_started_at
@@ -516,16 +665,25 @@ class LocalVideoMvpTui:
             return 0.0
         return max(0.0, time.monotonic() - started)
 
-    def _mark_command_start(self) -> None:
+    def _mark_command_start(self, workflow_kind: str) -> None:
+        self._refresh_prior_total_seconds()
         with self._lock:
             self._run_started_at = time.monotonic()
             self._last_elapsed_seconds = None
+            self._workflow_kind = workflow_kind
+            self._stage_label = None
+            self._stage_index = None
+            self._stage_total = None
 
     def _mark_command_stop(self) -> None:
         with self._lock:
             if self._run_started_at is not None:
                 self._last_elapsed_seconds = max(0.0, time.monotonic() - self._run_started_at)
             self._run_started_at = None
+            self._workflow_kind = None
+            self._stage_label = None
+            self._stage_index = None
+            self._stage_total = None
 
     def _adjust_log_scroll(self, delta: int) -> None:
         with self._lock:
@@ -563,6 +721,7 @@ class LocalVideoMvpTui:
         value = self._prompt_input("Project dir", str(self.config.project_dir))
         if value:
             self.config.project_dir = Path(value).expanduser().resolve()
+            self._refresh_prior_total_seconds()
             self._set_status("Project directory updated.")
 
     def _edit_minutes(self) -> None:
