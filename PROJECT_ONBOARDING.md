@@ -133,8 +133,17 @@ TUI shortcut focus for now:
 
 - `R` runs the preferred full pipeline profile from this onboarding guide.
 - `I` runs `inspect` for the selected project.
+- `A` refreshes stock-asset preflight status.
 - `P`/`D`/`M` edit prompt, project dir, and minutes.
 - `J`/`K` (or arrow keys) scroll logs, `F` toggles follow mode, `G` jumps to latest.
+
+TUI stock key discovery order:
+
+1. process env (`PEXELS_API_KEY`, `PIXABAY_API_KEY`)
+2. repo `.env`
+3. `~/.config/imagine/stock_api_keys.json` (or `IMAGINE_STOCK_KEYS_FILE`)
+
+If no stock keys are found, runtime panel will indicate placeholders-only mode before the run starts.
 
 TUI logs are always written to `~/.imagine/logs/`:
 

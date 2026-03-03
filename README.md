@@ -221,6 +221,7 @@ Key bindings:
 
 - `R`: run the full pipeline using the preferred profile (`ollama`, `melo`, `faster-whisper`, strict mode)
 - `I`: run inspect for the current project dir
+- `A`: refresh and show stock-asset preflight status
 - `P`: edit prompt
 - `D`: edit project directory
 - `M`: edit minutes
@@ -230,6 +231,23 @@ Key bindings:
 - `Q`: quit (stops active run first)
 
 If Ollama is not already running, the TUI tries to start `ollama serve` automatically and stops it on exit when it was started by the TUI.
+
+Stock asset keys are auto-discovered by TUI (in this order):
+
+1. current process env (`PEXELS_API_KEY`, `PIXABAY_API_KEY`)
+2. repo `.env`
+3. `~/.config/imagine/stock_api_keys.json` (or `IMAGINE_STOCK_KEYS_FILE`)
+
+Example key file:
+
+```json
+{
+  "PEXELS_API_KEY": "your_pexels_key",
+  "PIXABAY_API_KEY": "your_pixabay_key"
+}
+```
+
+If no stock keys are found, placeholders are expected and clearly shown in the TUI runtime panel.
 
 TUI logs are written to a standard location:
 

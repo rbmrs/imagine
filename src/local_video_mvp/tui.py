@@ -26,6 +26,7 @@ class TuiConfig:
 
 class LocalVideoMvpTui:
     SPINNER_FRAMES = ["-", "\\", "|", "/"]
+    STOCK_ENV_KEYS = ("PEXELS_API_KEY", "PIXABAY_API_KEY")
     STAGE_LINE_RE = re.compile(r"\[local-video-mvp\]\s+Stage\s+(\d+(?:\.\d+)?)/(\d+):\s+(.+)")
     STAGE_COMPLETE_RE = re.compile(r"\[local-video-mvp\]\s+([A-Za-z0-9_]+)\s+completed in\s+([0-9]+(?:\.[0-9]+)?)s")
 
@@ -50,6 +51,10 @@ class LocalVideoMvpTui:
         self._stage_total: int | None = None
         self._prior_total_seconds: float | None = None
 
+        self._stock_api_keys: dict[str, str] = {}
+        self._stock_key_sources: dict[str, str] = {}
+        self._stock_key_warnings: list[str] = []
+
         self._worker: threading.Thread | None = None
         self._active_process: subprocess.Popen[str] | None = None
 
@@ -65,6 +70,7 @@ class LocalVideoMvpTui:
 
         self._open_session_log()
         self._refresh_prior_total_seconds()
+        self._refresh_stock_key_cache()
         self._append_log(f"Session log: {self._session_log_path}")
 
     def run(self) -> int:
@@ -180,6 +186,11 @@ class LocalVideoMvpTui:
             self._edit_minutes()
             return
 
+        if char in {"a", "A"}:
+            self._refresh_stock_key_cache()
+            self._set_status(self._asset_preflight_message())
+            return
+
         if char in {"f", "F"}:
             self._toggle_follow_mode()
             return
@@ -202,6 +213,7 @@ class LocalVideoMvpTui:
             return
 
         self._jump_to_latest_logs()
+        self._refresh_stock_key_cache()
         self._mark_command_start(workflow_kind="run")
         self._set_running(True)
         self._set_status("Starting run workflow...")
@@ -223,6 +235,11 @@ class LocalVideoMvpTui:
     def _run_workflow(self) -> None:
         try:
             self._append_log("Using preferred profile. Press R to run again after completion.")
+            self._append_log(self._asset_preflight_message())
+            if self._stock_key_sources:
+                self._append_log(f"Stock key sources: {self._stock_key_sources}")
+            for warning in self._stock_key_warnings:
+                self._append_log(f"WARN: {warning}")
             self._ensure_ollama_running()
             run_code = self._run_and_stream(self._build_run_command(), label="run")
 
@@ -266,6 +283,11 @@ class LocalVideoMvpTui:
         repo_src = str(self._repo_root / "src")
         current_pythonpath = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = f"{repo_src}:{current_pythonpath}" if current_pythonpath else repo_src
+
+        if label == "run":
+            for key, value in self._stock_api_keys.items():
+                if key not in env and value:
+                    env[key] = value
 
         process = subprocess.Popen(
             command,
@@ -384,7 +406,7 @@ class LocalVideoMvpTui:
         title = f" Imagine TUI {spinner} "
         self._safe_addstr(0, 0, title, width, attr=self._attr("title", bold=True))
 
-        hint = "R Run  I Inspect  P Prompt  D Project  M Minutes  J/K Scroll  F Follow  G Latest  Q Quit"
+        hint = "R Run  I Inspect  A Assets  P Prompt  D Project  M Minutes  J/K Scroll  F Follow  G Latest  Q Quit"
         self._safe_addstr(1, 0, hint, width, attr=self._attr("muted"))
         self._safe_hline(2, width)
 
@@ -393,13 +415,15 @@ class LocalVideoMvpTui:
         self._safe_addstr(5, 2, f"Project: {self._trim_middle(str(self.config.project_dir), width - 14)}", width)
         self._safe_addstr(6, 2, f"Minutes: {self.config.minutes}", width)
 
-        self._draw_box(8, 0, 5, width, title=" Runtime ", attr=self._attr("accent"))
+        self._draw_box(8, 0, 6, width, title=" Runtime ", attr=self._attr("accent"))
         state_text, state_attr = self._state_display()
         self._safe_addstr(9, 2, f"State  : {state_text}", width, attr=state_attr)
         self._safe_addstr(10, 2, f"Phase  : {self._trim_tail(self._progress_phase_text(), width - 14)}", width)
-        self._safe_addstr(11, 2, f"Status : {self._trim_tail(self._get_status(), width - 14)}", width)
+        assets_text, assets_attr = self._asset_status_display()
+        self._safe_addstr(11, 2, f"Assets : {self._trim_tail(assets_text, width - 14)}", width, attr=assets_attr)
+        self._safe_addstr(12, 2, f"Status : {self._trim_tail(self._get_status(), width - 14)}", width)
 
-        logs_top = 13
+        logs_top = 14
         logs_height = max(3, height - logs_top - 1)
         self._draw_box(logs_top, 0, logs_height, width, title=" Logs ", attr=self._attr("accent"))
 
@@ -420,19 +444,21 @@ class LocalVideoMvpTui:
 
     def _draw_compact(self, height: int, width: int) -> None:
         self._safe_addstr(0, 0, "Imagine TUI", width, attr=self._attr("title", bold=True))
-        self._safe_addstr(1, 0, "R Run  I Inspect  Q Quit", width, attr=self._attr("muted"))
+        self._safe_addstr(1, 0, "R Run  I Inspect  A Assets  Q Quit", width, attr=self._attr("muted"))
         self._safe_addstr(3, 0, f"Prompt: {self._trim_tail(self.config.prompt, width - 8)}", width)
         self._safe_addstr(4, 0, f"Project: {self._trim_middle(str(self.config.project_dir), width - 9)}", width)
         self._safe_addstr(5, 0, f"Minutes: {self.config.minutes}", width)
         state_text, state_attr = self._state_display()
         self._safe_addstr(7, 0, f"{state_text}", width, attr=state_attr)
         self._safe_addstr(8, 0, self._trim_tail(self._progress_phase_text(), width), width)
-        self._safe_addstr(9, 0, self._trim_tail(self._get_status(), width), width)
+        assets_text, assets_attr = self._asset_status_display()
+        self._safe_addstr(9, 0, self._trim_tail(assets_text, width), width, attr=assets_attr)
+        self._safe_addstr(10, 0, self._trim_tail(self._get_status(), width), width)
 
         logs = self._get_logs()
-        log_rows = max(1, height - 11)
+        log_rows = max(1, height - 12)
         for idx, line in enumerate(logs[-log_rows:]):
-            self._safe_addstr(11 + idx, 0, self._trim_tail(line, width), width, attr=self._log_line_attr(line))
+            self._safe_addstr(12 + idx, 0, self._trim_tail(line, width), width, attr=self._log_line_attr(line))
 
     def _state_display(self) -> tuple[str, int]:
         running = self._is_running()
@@ -556,6 +582,126 @@ class LocalVideoMvpTui:
         if stage_label:
             return f"Stage {stage_idx_text}/{stage_total}: {stage_label}"
         return f"Stage {stage_idx_text}/{stage_total}"
+
+    def _asset_status_display(self) -> tuple[str, int]:
+        with self._lock:
+            has_pexels = bool(self._stock_api_keys.get("PEXELS_API_KEY"))
+            has_pixabay = bool(self._stock_api_keys.get("PIXABAY_API_KEY"))
+
+        if has_pexels and has_pixabay:
+            return "stock ready (pexels + pixabay)", self._attr("ok", bold=True)
+        if has_pexels:
+            return "stock limited (pexels only)", self._attr("warn", bold=True)
+        if has_pixabay:
+            return "stock limited (pixabay only)", self._attr("warn", bold=True)
+        return "placeholders only (no stock keys)", self._attr("warn", bold=True)
+
+    def _asset_preflight_message(self) -> str:
+        with self._lock:
+            has_pexels = bool(self._stock_api_keys.get("PEXELS_API_KEY"))
+            has_pixabay = bool(self._stock_api_keys.get("PIXABAY_API_KEY"))
+
+        if has_pexels and has_pixabay:
+            return "Preflight: stock keys detected (Pexels + Pixabay). Placeholders only if searches/downloads fail."
+        if has_pexels:
+            return "Preflight: only Pexels key detected. Some scenes may still use placeholders."
+        if has_pixabay:
+            return "Preflight: only Pixabay key detected. Some scenes may still use placeholders."
+        return "Preflight: no stock API keys detected (PEXELS_API_KEY / PIXABAY_API_KEY). Run will use placeholders."
+
+    def _refresh_stock_key_cache(self) -> None:
+        dotenv_keys, dotenv_warnings = self._read_repo_dotenv_keys()
+        user_keys, user_warnings = self._read_user_stock_keys()
+
+        resolved: dict[str, str] = {}
+        sources: dict[str, str] = {}
+        warnings: list[str] = []
+
+        warnings.extend(dotenv_warnings)
+        warnings.extend(user_warnings)
+
+        for key in self.STOCK_ENV_KEYS:
+            process_value = (os.environ.get(key) or "").strip()
+            dotenv_value = (dotenv_keys.get(key) or "").strip()
+            user_value = (user_keys.get(key) or "").strip()
+
+            if process_value:
+                resolved[key] = process_value
+                sources[key] = "process_env"
+                continue
+            if dotenv_value:
+                resolved[key] = dotenv_value
+                sources[key] = "repo_.env"
+                continue
+            if user_value:
+                resolved[key] = user_value
+                sources[key] = "user_config"
+
+        with self._lock:
+            self._stock_api_keys = resolved
+            self._stock_key_sources = sources
+            self._stock_key_warnings = warnings
+
+    def _read_repo_dotenv_keys(self) -> tuple[dict[str, str], list[str]]:
+        dotenv_path = self._repo_root / ".env"
+        values: dict[str, str] = {}
+        warnings: list[str] = []
+
+        if not dotenv_path.exists():
+            return values, warnings
+
+        try:
+            for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export ") :].strip()
+                if "=" not in line:
+                    continue
+
+                raw_key, raw_value = line.split("=", maxsplit=1)
+                key = raw_key.strip()
+                if key not in self.STOCK_ENV_KEYS:
+                    continue
+
+                value = raw_value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                    value = value[1:-1]
+                else:
+                    value = value.split(" #", maxsplit=1)[0].strip()
+
+                if value:
+                    values[key] = value
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"Could not parse .env for stock keys: {exc}")
+
+        return values, warnings
+
+    def _read_user_stock_keys(self) -> tuple[dict[str, str], list[str]]:
+        config_raw = os.environ.get("IMAGINE_STOCK_KEYS_FILE", "~/.config/imagine/stock_api_keys.json")
+        config_path = Path(config_raw).expanduser().resolve()
+
+        values: dict[str, str] = {}
+        warnings: list[str] = []
+
+        if not config_path.exists():
+            return values, warnings
+
+        try:
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                warnings.append(f"Stock key file is not a JSON object: {config_path}")
+                return values, warnings
+
+            for key in self.STOCK_ENV_KEYS:
+                raw_value = payload.get(key)
+                if isinstance(raw_value, str) and raw_value.strip():
+                    values[key] = raw_value.strip()
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"Could not parse stock key file {config_path}: {exc}")
+
+        return values, warnings
 
     def _estimate_progress_percent(self, elapsed_seconds: float) -> float:
         with self._lock:
