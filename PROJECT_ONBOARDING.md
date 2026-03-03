@@ -124,6 +124,11 @@ TUI shortcut focus for now:
 - `I` runs `inspect` for the selected project.
 - `P`/`D`/`M` edit prompt, project dir, and minutes.
 
+TUI logs are always written to `~/.imagine/logs/`:
+
+- `latest.log` (pointer to latest session)
+- `tui-YYYYMMDD-HHMMSS.log` (session file)
+
 ## Recommended local run pattern
 
 Use one terminal with automatic Ollama lifecycle and venv cleanup:

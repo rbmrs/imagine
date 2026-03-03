@@ -223,6 +223,13 @@ Key bindings:
 
 If Ollama is not already running, the TUI tries to start `ollama serve` automatically and stops it on exit when it was started by the TUI.
 
+TUI logs are written to a standard location:
+
+- `~/.imagine/logs/latest.log` (pointer to latest session)
+- `~/.imagine/logs/tui-YYYYMMDD-HHMMSS.log` (session file)
+
+You can override the log directory with `IMAGINE_TUI_LOG_DIR`.
+
 ## Inspect logs after a run
 
 Every run writes:

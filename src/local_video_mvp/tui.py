@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import curses
+import datetime as dt
+import os
 import shlex
 import shutil
 import subprocess
@@ -37,6 +39,11 @@ class LocalVideoMvpTui:
         self._started_ollama = False
         self._ollama_process: subprocess.Popen[str] | None = None
         self._ollama_log_handle: TextIO | None = None
+
+        self._session_log_handle: TextIO | None = None
+        self._session_log_path, self._latest_log_path = self._init_session_log_paths()
+        self._open_session_log()
+        self._append_log(f"Session log: {self._session_log_path}")
 
     def run(self) -> int:
         try:
@@ -263,6 +270,7 @@ class LocalVideoMvpTui:
         status = self._get_status()
         self._safe_addstr(7, 0, f"State: {'RUNNING' if running else 'IDLE'}", width)
         self._safe_addstr(8, 0, f"Status: {status}", width)
+        self._safe_addstr(9, 0, f"Log file: {self._latest_log_path}", width)
 
         self._safe_addstr(10, 0, "Logs:", width)
         logs = self._get_logs()
@@ -399,9 +407,46 @@ class LocalVideoMvpTui:
             self._ollama_log_handle.close()
             self._ollama_log_handle = None
 
+        if self._session_log_handle is not None:
+            self._session_log_handle.close()
+            self._session_log_handle = None
+
     def _append_log(self, line: str) -> None:
         with self._lock:
             self._logs.append(line)
+
+        if self._session_log_handle is not None:
+            timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
+            try:
+                self._session_log_handle.write(f"{timestamp} {line}\n")
+                self._session_log_handle.flush()
+            except Exception:
+                pass
+
+    def _init_session_log_paths(self) -> tuple[Path, Path]:
+        root_raw = os.environ.get("IMAGINE_TUI_LOG_DIR")
+        if root_raw:
+            root = Path(root_raw).expanduser().resolve()
+        else:
+            root = (Path.home() / ".imagine" / "logs").resolve()
+
+        root.mkdir(parents=True, exist_ok=True)
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+        session_path = root / f"tui-{stamp}.log"
+        latest_path = root / "latest.log"
+        return session_path, latest_path
+
+    def _open_session_log(self) -> None:
+        self._session_log_handle = self._session_log_path.open("a", encoding="utf-8")
+        try:
+            if self._latest_log_path.exists() or self._latest_log_path.is_symlink():
+                self._latest_log_path.unlink()
+            self._latest_log_path.symlink_to(self._session_log_path.name)
+        except Exception:
+            try:
+                self._latest_log_path.write_text(str(self._session_log_path) + "\n", encoding="utf-8")
+            except Exception:
+                pass
 
     def _get_logs(self) -> list[str]:
         with self._lock:
