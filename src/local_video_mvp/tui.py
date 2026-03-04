@@ -1163,41 +1163,80 @@ class LocalVideoMvpTui:
 
         stdscr = self._stdscr
         height, width = stdscr.getmaxyx()
-        prompt = f"{label} [{current_value}] > "
-        prompt_display = self._trim_tail(prompt, max(1, width - 1))
 
-        stdscr.nodelay(False)
-        stdscr.timeout(-1)
-        curses.echo()
+        modal_width = min(max(58, len(label) + 18), max(22, width - 2))
+        modal_height = 8
+        if modal_width < 22 or height < modal_height + 1:
+            return None
+
+        top = max(0, (height - modal_height) // 2)
+        left = max(0, (width - modal_width) // 2)
+
+        win = curses.newwin(modal_height, modal_width, top, left)
+        win.keypad(True)
+        win.nodelay(False)
+        win.timeout(-1)
+
+        user_input = ""
+        max_input_len = 512
+
         try:
             curses.curs_set(1)
         except curses.error:
             pass
 
-        raw = b""
         try:
-            stdscr.move(height - 1, 0)
-            stdscr.clrtoeol()
-            self._safe_addstr(height - 1, 0, prompt_display, width, attr=self._attr("accent", bold=True))
-            stdscr.refresh()
+            while True:
+                self._draw()
+                win.erase()
+                try:
+                    win.box()
+                except curses.error:
+                    pass
 
-            input_col = min(len(prompt_display), max(0, width - 2))
-            raw = stdscr.getstr(height - 1, input_col, max(1, width - input_col - 1))
-        except curses.error:
-            raw = b""
+                title_text = self._trim_tail(f" {label} ", max(1, modal_width - 4))
+                current_line = self._trim_tail(f"Current: {current_value}", modal_width - 4)
+                input_prefix = "New: "
+
+                if user_input:
+                    shown_input = self._trim_tail(user_input, modal_width - len(input_prefix) - 4)
+                else:
+                    shown_input = "(keep current)"
+
+                help_text = "Enter apply | Esc keep | Backspace delete"
+
+                try:
+                    win.addstr(0, 2, title_text, self._attr("accent", bold=True))
+                    win.addstr(2, 2, current_line)
+                    win.addstr(4, 2, input_prefix, self._attr("accent", bold=True))
+                    win.addstr(4, 2 + len(input_prefix), shown_input)
+                    win.addstr(modal_height - 1, 2, self._trim_tail(help_text, modal_width - 4), self._attr("muted"))
+                    cursor_col = min(modal_width - 2, 2 + len(input_prefix) + len(shown_input))
+                    win.move(4, max(2 + len(input_prefix), cursor_col))
+                except curses.error:
+                    pass
+
+                win.refresh()
+                key = win.getch()
+
+                if key == 27:
+                    return None
+                if key in (10, 13, curses.KEY_ENTER):
+                    value = user_input.strip()
+                    if not value:
+                        return None
+                    return value
+                if key in (curses.KEY_BACKSPACE, 127, 8):
+                    if user_input:
+                        user_input = user_input[:-1]
+                    continue
+                if 32 <= key <= 126 and len(user_input) < max_input_len:
+                    user_input += chr(key)
         finally:
-            curses.noecho()
-            stdscr.nodelay(True)
-            stdscr.timeout(120)
             try:
                 curses.curs_set(0)
             except curses.error:
                 pass
-
-        value = raw.decode("utf-8", errors="ignore").strip()
-        if not value:
-            return None
-        return value
 
     def _select_from_list(self, label: str, options: list[str], current_value: str) -> str | None:
         if self._stdscr is None:
@@ -1242,7 +1281,7 @@ class LocalVideoMvpTui:
                 pass
 
             title_text = self._trim_tail(f" {label} ", max(1, modal_width - 4))
-            help_text = "Enter select | Esc keep"
+            help_text = "Enter apply | Esc keep"
             try:
                 win.addstr(0, 2, title_text, self._attr("accent", bold=True))
                 win.addstr(modal_height - 1, 2, self._trim_tail(help_text, modal_width - 4), self._attr("muted"))
