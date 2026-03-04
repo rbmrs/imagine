@@ -66,6 +66,8 @@ class LocalVideoMvpTui:
         self._pending_export_path: Path | None = None
         self._pending_unique_asset_prompt: dict[str, Any] | None = None
         self._pending_clip_review_prompt: dict[str, Any] | None = None
+        self._pending_stage_transition_prompt: dict[str, Any] | None = None
+        self._hitl_stage = "draft"
 
         self._stock_api_keys: dict[str, str] = {}
         self._stock_key_sources: dict[str, str] = {}
@@ -116,6 +118,7 @@ class LocalVideoMvpTui:
             if not self._is_running():
                 self._maybe_prompt_unique_asset_shortfall()
                 self._maybe_prompt_clip_review()
+                self._maybe_prompt_stage_transition()
 
             key = stdscr.getch()
             if key == -1:
@@ -194,11 +197,19 @@ class LocalVideoMvpTui:
         if not self._passes_asset_hard_guard_precheck():
             return
 
-        workspace = self._prepare_run_workspace()
+        if self._active_project_dir is None or self._hitl_stage == "done":
+            workspace = self._prepare_run_workspace()
+            self._hitl_stage = "draft"
+            with self._lock:
+                self._pending_unique_asset_prompt = None
+                self._pending_clip_review_prompt = None
+                self._pending_stage_transition_prompt = None
+        else:
+            workspace = self._active_project_dir
 
         self._mark_command_start(workflow_kind="run")
         self._set_running(True)
-        self._set_status(f"Starting run workflow: {workspace.name}")
+        self._set_status(f"Starting {self._hitl_stage} stage: {workspace.name}")
         self._worker = threading.Thread(target=self._run_workflow, daemon=True)
         self._worker.start()
 
@@ -215,45 +226,90 @@ class LocalVideoMvpTui:
 
     def _run_workflow(self) -> None:
         try:
-            self._append_log("Using preferred profile. Press R to run again after completion.")
+            stage = self._hitl_stage
+            self._append_log("Using preferred profile. Press R to advance workflow.")
+            self._append_log(f"HITL stage: {stage}")
             self._append_log(self._asset_preflight_message())
             if self._stock_key_sources:
                 self._append_log(f"Stock key sources: {self._stock_key_sources}")
             for warning in self._stock_key_warnings:
                 self._append_log(f"WARN: {warning}")
-            self._ensure_ollama_running()
-            run_code = self._run_and_stream(self._build_run_command(), label="run")
 
-            if run_code == 0:
-                placeholder_count = self._count_placeholder_scenes()
-                if placeholder_count > 0:
-                    self._append_log(
-                        f"ERROR: Hard guard violation: {placeholder_count} placeholder scenes detected after run."
-                    )
-                    self._set_status("Hard guard violation: placeholders detected. Run rejected.")
-                    return
+            if stage == "draft":
+                self._ensure_ollama_running()
 
-                self._set_status("Run succeeded. Inspecting outputs...")
+            run_code = self._run_and_stream(self._build_run_command(workflow_stage=stage), label="run")
+
+            if run_code != 0:
+                queued_unique_prompt = self._queue_unique_asset_prompt_from_run_report()
+                if queued_unique_prompt:
+                    self._set_status("Run paused: broaden asset keywords to unlock more unique clips.")
+                else:
+                    self._set_status(f"{stage.title()} stage failed with exit code {run_code}.")
+                return
+
+            if stage == "draft":
+                self._queue_stage_transition_prompt(
+                    next_stage="review",
+                    title="Draft Complete",
+                    body="Draft is ready. Apply review checkpoint now?",
+                )
+                self._set_status("Draft complete. Review checkpoint pending.")
+                return
+
+            if stage == "review":
+                self._queue_stage_transition_prompt(
+                    next_stage="preview",
+                    title="Review Complete",
+                    body="Review approved. Generate preview now?",
+                )
+                self._set_status("Review complete. Preview checkpoint pending.")
+                return
+
+            if stage == "preview":
+                self._set_status("Preview complete. Inspecting outputs...")
                 inspect_code = self._run_and_stream(self._build_inspect_command(), label="inspect")
-                exported_mp4 = self._export_final_mp4_to_downloads()
                 if self._active_project_dir is not None:
                     clip_catalog = self._active_project_dir / "review" / "clip_catalog.json"
                     if clip_catalog.exists():
                         self._append_log(f"Clip catalog: {clip_catalog}")
                         self._queue_clip_review_prompt(self._active_project_dir)
 
+                if inspect_code == 0:
+                    self._set_status("Preview complete. Review clips before finalizing.")
+                else:
+                    self._set_status(f"Preview complete, inspect failed with exit code {inspect_code}.")
+
+                self._queue_stage_transition_prompt(
+                    next_stage="finalize",
+                    title="Preview Ready",
+                    body="Preview looks good? Finalize full output now?",
+                )
+                return
+
+            if stage == "finalize":
+                placeholder_count = self._count_placeholder_scenes()
+                if placeholder_count > 0:
+                    self._append_log(
+                        f"ERROR: Hard guard violation: {placeholder_count} placeholder scenes detected after finalize."
+                    )
+                    self._set_status("Hard guard violation: placeholders detected. Finalize rejected.")
+                    return
+
+                self._set_status("Finalize complete. Inspecting outputs...")
+                inspect_code = self._run_and_stream(self._build_inspect_command(), label="inspect")
+                exported_mp4 = self._export_final_mp4_to_downloads()
+                self._hitl_stage = "done"
+
                 if inspect_code == 0 and exported_mp4 is not None:
-                    self._set_status(f"Run complete. MP4 exported to {exported_mp4.name}.")
+                    self._set_status(f"Finalize complete. MP4 exported to {exported_mp4.name}.")
                 elif inspect_code == 0:
-                    self._set_status("Run complete. MP4 export skipped.")
+                    self._set_status("Finalize complete. MP4 export skipped.")
                 else:
-                    self._set_status(f"Run succeeded, inspect failed with exit code {inspect_code}.")
-            else:
-                queued_unique_prompt = self._queue_unique_asset_prompt_from_run_report()
-                if queued_unique_prompt:
-                    self._set_status("Run paused: broaden asset keywords to unlock more unique clips.")
-                else:
-                    self._set_status(f"Run failed with exit code {run_code}.")
+                    self._set_status(f"Finalize succeeded, inspect failed with exit code {inspect_code}.")
+                return
+
+            self._set_status(f"Unknown workflow stage: {stage}")
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"ERROR: {exc}")
             self._set_status("Run failed before completion.")
@@ -315,10 +371,12 @@ class LocalVideoMvpTui:
         finally:
             self._set_active_process(None)
 
-    def _build_run_command(self) -> list[str]:
+    def _build_run_command(self, workflow_stage: str | None = None) -> list[str]:
         project_dir = self._active_project_dir
         if project_dir is None:
             project_dir = self._prepare_run_workspace()
+
+        stage = str(workflow_stage or self._hitl_stage).strip().lower() or "full"
 
         command = [
             sys.executable,
@@ -327,17 +385,14 @@ class LocalVideoMvpTui:
             "run",
             "--prompt",
             self.config.prompt,
+            "--workflow-stage",
+            stage,
             "--project-dir",
             str(project_dir),
             "--minutes",
             str(self.config.minutes),
             "--resolution",
             "1280x720",
-            "--script-engine",
-            "ollama",
-            "--ollama-model",
-            "qwen2.5:14b",
-            "--require-ollama",
             "--tts-engine",
             "melo",
             "--melo-language",
@@ -364,6 +419,19 @@ class LocalVideoMvpTui:
             "--require-external-assets",
             "--verbose",
         ]
+
+        if stage in {"full", "draft"}:
+            command.extend(
+                [
+                    "--script-engine",
+                    "ollama",
+                    "--ollama-model",
+                    "qwen2.5:14b",
+                    "--require-ollama",
+                ]
+            )
+        else:
+            command.extend(["--script-engine", "template"])
 
         if self.config.asset_keywords:
             command.extend(["--asset-keywords", ", ".join(self.config.asset_keywords)])
@@ -424,7 +492,7 @@ class LocalVideoMvpTui:
         title = f" Imagine TUI {spinner} "
         self._safe_addstr(0, 0, title, width, attr=self._attr("title", bold=True))
 
-        hint = "R Run  E Edit  C Clean  Q Quit"
+        hint = "R Next  E Edit  C Clean  Q Quit"
         self._safe_addstr(1, 0, hint, width, attr=self._attr("muted"))
         self._safe_hline(2, width)
 
@@ -477,7 +545,7 @@ class LocalVideoMvpTui:
 
     def _draw_compact(self, height: int, width: int) -> None:
         self._safe_addstr(0, 0, "Imagine TUI", width, attr=self._attr("title", bold=True))
-        self._safe_addstr(1, 0, "R Run  E Edit  C Clean  Q Quit", width, attr=self._attr("muted"))
+        self._safe_addstr(1, 0, "R Next  E Edit  C Clean  Q Quit", width, attr=self._attr("muted"))
         self._safe_addstr(3, 0, f"Prompt: {self._trim_tail(self.config.prompt, width - 8)}", width)
         self._safe_addstr(4, 0, f"Minutes: {self.config.minutes}", width)
         self._safe_addstr(
@@ -596,10 +664,10 @@ class LocalVideoMvpTui:
                 return "Inspect workflow"
             if workflow_kind == "replace":
                 return "Clip replacement workflow"
-            return "Waiting for run"
+            return f"HITL ready: {self._hitl_stage}"
 
         if stage_index is None or stage_total is None or stage_total <= 0:
-            return "Starting run..."
+            return f"Starting {self._hitl_stage} stage..."
 
         if float(stage_index).is_integer():
             stage_idx_text = str(int(stage_index))
@@ -1046,6 +1114,14 @@ class LocalVideoMvpTui:
                 "project_dir": str(project_dir),
             }
 
+    def _queue_stage_transition_prompt(self, *, next_stage: str, title: str, body: str) -> None:
+        with self._lock:
+            self._pending_stage_transition_prompt = {
+                "next_stage": str(next_stage).strip().lower(),
+                "title": title,
+                "body": body,
+            }
+
     def _maybe_prompt_clip_review(self) -> None:
         with self._lock:
             pending = self._pending_clip_review_prompt
@@ -1095,6 +1171,34 @@ class LocalVideoMvpTui:
                 self._append_log(f"Replacement keywords set: {', '.join(self.config.asset_keywords)}")
 
         self._start_replace_clips_workflow(project_dir, chosen_names)
+
+    def _maybe_prompt_stage_transition(self) -> None:
+        with self._lock:
+            pending = self._pending_stage_transition_prompt
+            self._pending_stage_transition_prompt = None
+
+        if not isinstance(pending, dict):
+            return
+
+        if self._is_running():
+            with self._lock:
+                self._pending_stage_transition_prompt = pending
+            return
+
+        next_stage = str(pending.get("next_stage") or "").strip().lower()
+        if not next_stage:
+            return
+
+        title = str(pending.get("title") or "Continue")
+        body = str(pending.get("body") or "Continue to next stage now?")
+        should_continue = self._prompt_yes_no(title=title, body=body, default_yes=False)
+
+        self._hitl_stage = next_stage
+        if should_continue:
+            self._start_run_workflow()
+            return
+
+        self._set_status(f"{next_stage.title()} stage ready. Press R when you are ready.")
 
     def _load_clip_catalog_entries(self, project_dir: Path) -> list[dict[str, str]]:
         clip_catalog_path = project_dir / "review" / "clip_catalog.json"

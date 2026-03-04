@@ -235,12 +235,12 @@ local-video-mvp tui \
 
 Key bindings:
 
-- `R`: run the full pipeline using the preferred profile (`ollama`, `melo`, `faster-whisper`, strict mode)
+- `R`: advance HITL workflow stage (`draft -> review -> preview -> finalize`) for the active workspace
 - `E`: edit parameters (`prompt`, `asset keywords`, `minutes`, `voice speed`) and choose from lists for language/speaker/profile
 - `C`: clean old auto-managed workspaces (mark with Space, delete with Enter)
 - `Q`: quit (stops active run first)
 
-After a successful run, the TUI can open a floating clip-review modal from `review/clip_catalog.json` so you can mark mismatched clip names and replace only those visuals.
+The TUI uses floating checkpoint modals between stages so you can approve/review before continuing. After preview, it can open clip review from `review/clip_catalog.json` so you can replace mismatched visuals before finalize.
 
 Current MVP voice picker scope:
 
@@ -309,6 +309,22 @@ local-video-mvp replace-clips \
   --asset-keywords "autonomous vehicles, sensors, traffic"
 ```
 
+Run staged workflow from CLI (same `run` command, different stage):
+
+```bash
+# 1) draft (script + narration)
+local-video-mvp run --workflow-stage draft --prompt "Your topic" --project-dir ./projects/demo
+
+# 2) review (approve current script.json, or pass reviewed JSON)
+local-video-mvp run --workflow-stage review --prompt "Your topic" --project-dir ./projects/demo
+
+# 3) preview (renders review/preview.mp4)
+local-video-mvp run --workflow-stage preview --prompt "Your topic" --project-dir ./projects/demo
+
+# 4) finalize (renders output/final.mp4)
+local-video-mvp run --workflow-stage finalize --prompt "Your topic" --project-dir ./projects/demo
+```
+
 If stock API keys are missing, the report warns that placeholder visuals were used.
 
 ## Output structure
@@ -324,7 +340,10 @@ projects/<project>/
   captions.ass
   timeline.json
   review/
+    script_approved.json
     clip_catalog.json
+    preview.mp4
+    preview.srt
   rights_manifest.json
   assets/
     cache/

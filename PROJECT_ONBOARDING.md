@@ -133,12 +133,12 @@ Default storage behavior:
 
 TUI shortcut focus for now:
 
-- `R` runs the preferred full pipeline profile from this onboarding guide.
+- `R` advances staged HITL flow for current workspace (`draft -> review -> preview -> finalize`).
 - `E` edits prompt/asset-keywords/duration/speed and uses list pickers for language/speaker/profile.
 - `C` opens workspace cleanup, where you mark folders and press Enter to delete.
 - `Q` exits the TUI.
 
-After successful generation, TUI can open a clip-review modal so you can select clip names from `review/clip_catalog.json` and replace only those visuals.
+Checkpoint modals appear between stages so you can approve/review before continuing. After preview, TUI can open clip review so you can replace selected clip names from `review/clip_catalog.json` before finalize.
 
 Current voice picker scope:
 
@@ -188,6 +188,7 @@ if ! pgrep -f "ollama serve" >/dev/null; then
 fi
 
 local-video-mvp run \
+  --workflow-stage draft \
   --prompt "Your topic" \
   --asset-keywords "cars, roads" \
   --project-dir ./projects/demo \
@@ -208,6 +209,21 @@ local-video-mvp run \
   --strict-commercial-safe \
   --verbose
 
+local-video-mvp run \
+  --workflow-stage review \
+  --prompt "Your topic" \
+  --project-dir ./projects/demo
+
+local-video-mvp run \
+  --workflow-stage preview \
+  --prompt "Your topic" \
+  --project-dir ./projects/demo
+
+local-video-mvp run \
+  --workflow-stage finalize \
+  --prompt "Your topic" \
+  --project-dir ./projects/demo
+
 local-video-mvp inspect --project-dir ./projects/demo
 
 local-video-mvp replace-clips \
@@ -226,7 +242,9 @@ Important files in each project run:
 
 - `run.log` - step-by-step execution logs
 - `run_report.json` - status, timings, warnings, outputs, metrics
+- `review/script_approved.json` - approved script snapshot used by preview/finalize stages
 - `review/clip_catalog.json` - human-readable clip names + source metadata for quick review
+- `review/preview.mp4` / `review/preview.srt` - preview artifacts before finalization
 - `rights_manifest.json` - provenance and config snapshot
 - `timeline.json` - final clip structure
 
@@ -240,9 +258,9 @@ If a run fails, start with:
 
 Current state: core MVP + subtitle/pacing/duration/effects/bookend improvements are in place.
 
-Next planned milestone:
+Current active milestone:
 
-- Human-in-the-loop workflow (`draft -> review -> preview -> finalize`) so users can edit script/pacing before final render.
+- Human-in-the-loop workflow (`draft -> review -> preview -> finalize`) with floating checkpoint modals and clip replacement loop before finalize.
 
 ## Contribution notes
 
