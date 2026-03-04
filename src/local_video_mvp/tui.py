@@ -64,6 +64,7 @@ class LocalVideoMvpTui:
         self._prior_total_seconds: float | None = None
         self._active_project_dir: Path | None = None
         self._pending_export_path: Path | None = None
+        self._pending_unique_asset_prompt: dict[str, Any] | None = None
 
         self._stock_api_keys: dict[str, str] = {}
         self._stock_key_sources: dict[str, str] = {}
@@ -110,6 +111,9 @@ class LocalVideoMvpTui:
             self._draw()
             if self._exit_requested and not self._is_running():
                 break
+
+            if not self._is_running():
+                self._maybe_prompt_unique_asset_shortfall()
 
             key = stdscr.getch()
             if key == -1:
@@ -230,6 +234,10 @@ class LocalVideoMvpTui:
                 self._set_status("Run succeeded. Inspecting outputs...")
                 inspect_code = self._run_and_stream(self._build_inspect_command(), label="inspect")
                 exported_mp4 = self._export_final_mp4_to_downloads()
+                if self._active_project_dir is not None:
+                    clip_catalog = self._active_project_dir / "review" / "clip_catalog.json"
+                    if clip_catalog.exists():
+                        self._append_log(f"Clip catalog: {clip_catalog}")
 
                 if inspect_code == 0 and exported_mp4 is not None:
                     self._set_status(f"Run complete. MP4 exported to {exported_mp4.name}.")
@@ -238,7 +246,11 @@ class LocalVideoMvpTui:
                 else:
                     self._set_status(f"Run succeeded, inspect failed with exit code {inspect_code}.")
             else:
-                self._set_status(f"Run failed with exit code {run_code}.")
+                queued_unique_prompt = self._queue_unique_asset_prompt_from_run_report()
+                if queued_unique_prompt:
+                    self._set_status("Run paused: broaden asset keywords to unlock more unique clips.")
+                else:
+                    self._set_status(f"Run failed with exit code {run_code}.")
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"ERROR: {exc}")
             self._set_status("Run failed before completion.")
@@ -927,6 +939,99 @@ class LocalVideoMvpTui:
                 placeholders += 1
 
         return placeholders
+
+    def _queue_unique_asset_prompt_from_run_report(self) -> bool:
+        project_dir = self._active_project_dir
+        if project_dir is None:
+            return False
+
+        report_path = project_dir / "run_report.json"
+        if not report_path.exists():
+            return False
+
+        try:
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"WARN: Could not parse run_report for uniqueness prompt: {exc}")
+            return False
+
+        asset_stats = payload.get("asset_stats")
+        if not isinstance(asset_stats, dict):
+            return False
+
+        try:
+            shortfall_count = int(asset_stats.get("unique_shortfall_count") or 0)
+        except Exception:
+            shortfall_count = 0
+
+        if shortfall_count <= 0:
+            return False
+
+        clip_names_raw = asset_stats.get("unique_shortfall_clip_names")
+        if isinstance(clip_names_raw, list):
+            clip_names = [str(item).strip() for item in clip_names_raw if str(item).strip()]
+        else:
+            clip_names = []
+
+        scene_ids_raw = asset_stats.get("unique_shortfall_scene_ids")
+        if isinstance(scene_ids_raw, list):
+            scene_ids = [str(item).strip() for item in scene_ids_raw if str(item).strip()]
+        else:
+            scene_ids = []
+
+        with self._lock:
+            self._pending_unique_asset_prompt = {
+                "shortfall_count": shortfall_count,
+                "clip_names": clip_names,
+                "scene_ids": scene_ids,
+            }
+
+        self._append_log(
+            "WARN: Unique external clips were insufficient for this run. "
+            "Please broaden asset keywords and retry."
+        )
+        if clip_names:
+            self._append_log(f"Affected clip names: {', '.join(clip_names[:12])}")
+        return True
+
+    def _maybe_prompt_unique_asset_shortfall(self) -> None:
+        with self._lock:
+            pending = self._pending_unique_asset_prompt
+            self._pending_unique_asset_prompt = None
+
+        if not isinstance(pending, dict):
+            return
+
+        shortfall_count = int(pending.get("shortfall_count") or 0)
+        clip_names = [str(item).strip() for item in pending.get("clip_names") or [] if str(item).strip()]
+
+        if shortfall_count > 0:
+            self._set_status(
+                f"Need more unique assets ({shortfall_count} clip(s) unresolved). "
+                "Please broaden keywords."
+            )
+
+        default_keywords = ", ".join(self.config.asset_keywords)
+        updated_keywords = self._prompt_input(
+            "Asset keywords (broaden for unique clips)",
+            default_keywords,
+        )
+
+        if updated_keywords is None:
+            self._set_status("Unique clip shortage remains. Press E to edit keywords, then R to retry.")
+            return
+
+        parsed = [part.strip() for part in re.split(r"[,;\n]+", updated_keywords) if part.strip()]
+        normalized = self._normalize_asset_keywords(parsed)
+        if not normalized:
+            self._set_status("No new keywords provided. Press E to edit and R to retry.")
+            return
+
+        self.config.asset_keywords = normalized
+        self._append_log(f"Updated asset keywords after uniqueness block: {', '.join(self.config.asset_keywords)}")
+        if clip_names:
+            self._append_log(f"Retrying may replace these unresolved clips: {', '.join(clip_names[:12])}")
+        self._set_status("Keywords updated. Press R to retry generation.")
 
     def _elapsed_seconds(self) -> float:
         with self._lock:

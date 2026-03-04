@@ -153,6 +153,7 @@ Hard guard behavior (no placeholders allowed):
 
 - if no stock keys are found, run is blocked before start
 - if any scene resolves to placeholder, run is rejected
+- if unique clips are exhausted, run is paused before render and TUI asks for broader keywords
 
 TUI logs are always written to `~/.imagine/logs/`:
 
@@ -218,6 +219,7 @@ Important files in each project run:
 
 - `run.log` - step-by-step execution logs
 - `run_report.json` - status, timings, warnings, outputs, metrics
+- `review/clip_catalog.json` - human-readable clip names + source metadata for quick review
 - `rights_manifest.json` - provenance and config snapshot
 - `timeline.json` - final clip structure
 

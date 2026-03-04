@@ -141,6 +141,7 @@ Asset relevance control:
 
 - `--asset-keywords "cars, roads"` constrains footage search to those terms
 - when keywords are set, stock queries always include them
+- scene clips are assigned uniquely per run (no repeated stock clip across scenes)
 
 Video effects presets (long-form safe):
 
@@ -265,6 +266,7 @@ TUI enforces a hard guard against placeholders:
 
 - if no stock keys are found, `R` is blocked before the run starts
 - if any scene still resolves to a placeholder, the run is rejected
+- if unique clips run out, the run pauses before render and prompts you to broaden asset keywords
 
 For CLI runs outside TUI, you can enforce the same rule with:
 
@@ -286,6 +288,7 @@ Every run writes:
 - `run.log` (line-by-line stage logs)
 - `run_report.json` (status, timings, warnings, outputs)
 - `captions.ass` (styled subtitle file used for burn-in)
+- `review/clip_catalog.json` (human-readable clip names + source metadata for review)
 
 `run_report.json` also includes `caption_stats`, `duration_stats`, and `pacing_stats` for quick quality checks.
 
@@ -309,6 +312,8 @@ projects/<project>/
   captions.srt
   captions.ass
   timeline.json
+  review/
+    clip_catalog.json
   rights_manifest.json
   assets/
     cache/
