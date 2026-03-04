@@ -34,6 +34,7 @@ class PipelineConfig:
     allow_system_tts: bool = False
     pexels_api_key: str | None = None
     pixabay_api_key: str | None = None
+    require_external_assets: bool = False
     video_effects: str = "clean"
     include_intro: bool = True
     include_outro: bool = True

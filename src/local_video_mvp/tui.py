@@ -41,8 +41,6 @@ class LocalVideoMvpTui:
         self._running = False
         self._exit_requested = False
 
-        self._follow_logs = True
-        self._log_scroll = 0
         self._run_started_at: float | None = None
         self._last_elapsed_seconds: float | None = None
         self._workflow_kind: str | None = None
@@ -140,19 +138,6 @@ class LocalVideoMvpTui:
         if key == curses.KEY_RESIZE:
             return
 
-        if key in {curses.KEY_UP}:
-            self._adjust_log_scroll(1)
-            return
-        if key in {curses.KEY_DOWN}:
-            self._adjust_log_scroll(-1)
-            return
-        if key in {curses.KEY_PPAGE}:
-            self._adjust_log_scroll(10)
-            return
-        if key in {curses.KEY_NPAGE}:
-            self._adjust_log_scroll(-10)
-            return
-
         if not (0 <= key <= 255):
             return
 
@@ -170,50 +155,15 @@ class LocalVideoMvpTui:
             self._start_run_workflow()
             return
 
-        if char in {"i", "I"}:
-            self._start_inspect_workflow()
-            return
-
-        if char in {"p", "P"}:
-            self._edit_prompt()
-            return
-
-        if char in {"d", "D"}:
-            self._edit_project_dir()
-            return
-
-        if char in {"m", "M"}:
-            self._edit_minutes()
-            return
-
-        if char in {"a", "A"}:
-            self._refresh_stock_key_cache()
-            self._set_status(self._asset_preflight_message())
-            return
-
-        if char in {"f", "F"}:
-            self._toggle_follow_mode()
-            return
-
-        if char in {"g", "G"}:
-            self._jump_to_latest_logs()
-            return
-
-        if char in {"k", "K"}:
-            self._adjust_log_scroll(1)
-            return
-
-        if char in {"j", "J"}:
-            self._adjust_log_scroll(-1)
-            return
-
     def _start_run_workflow(self) -> None:
         if self._is_running():
             self._set_status("A command is already running.")
             return
 
-        self._jump_to_latest_logs()
         self._refresh_stock_key_cache()
+        if not self._passes_asset_hard_guard_precheck():
+            return
+
         self._mark_command_start(workflow_kind="run")
         self._set_running(True)
         self._set_status("Starting run workflow...")
@@ -225,7 +175,6 @@ class LocalVideoMvpTui:
             self._set_status("A command is already running.")
             return
 
-        self._jump_to_latest_logs()
         self._mark_command_start(workflow_kind="inspect")
         self._set_running(True)
         self._set_status("Inspecting project...")
@@ -244,6 +193,14 @@ class LocalVideoMvpTui:
             run_code = self._run_and_stream(self._build_run_command(), label="run")
 
             if run_code == 0:
+                placeholder_count = self._count_placeholder_scenes()
+                if placeholder_count > 0:
+                    self._append_log(
+                        f"ERROR: Hard guard violation: {placeholder_count} placeholder scenes detected after run."
+                    )
+                    self._set_status("Hard guard violation: placeholders detected. Run rejected.")
+                    return
+
                 self._set_status("Run succeeded. Inspecting outputs...")
                 inspect_code = self._run_and_stream(self._build_inspect_command(), label="inspect")
                 exported_mp4 = self._export_final_mp4_to_downloads()
@@ -353,6 +310,7 @@ class LocalVideoMvpTui:
             "--duration-tolerance",
             "0.25",
             "--strict-commercial-safe",
+            "--require-external-assets",
             "--verbose",
         ]
 
@@ -406,7 +364,7 @@ class LocalVideoMvpTui:
         title = f" Imagine TUI {spinner} "
         self._safe_addstr(0, 0, title, width, attr=self._attr("title", bold=True))
 
-        hint = "R Run  I Inspect  A Assets  P Prompt  D Project  M Minutes  J/K Scroll  F Follow  G Latest  Q Quit"
+        hint = "R Run  Q Quit"
         self._safe_addstr(1, 0, hint, width, attr=self._attr("muted"))
         self._safe_hline(2, width)
 
@@ -444,7 +402,7 @@ class LocalVideoMvpTui:
 
     def _draw_compact(self, height: int, width: int) -> None:
         self._safe_addstr(0, 0, "Imagine TUI", width, attr=self._attr("title", bold=True))
-        self._safe_addstr(1, 0, "R Run  I Inspect  A Assets  Q Quit", width, attr=self._attr("muted"))
+        self._safe_addstr(1, 0, "R Run  Q Quit", width, attr=self._attr("muted"))
         self._safe_addstr(3, 0, f"Prompt: {self._trim_tail(self.config.prompt, width - 8)}", width)
         self._safe_addstr(4, 0, f"Project: {self._trim_middle(str(self.config.project_dir), width - 9)}", width)
         self._safe_addstr(5, 0, f"Minutes: {self.config.minutes}", width)
@@ -477,14 +435,7 @@ class LocalVideoMvpTui:
         return "IDLE", self._attr("muted")
 
     def _footer_text(self, total_logs: int) -> str:
-        with self._lock:
-            follow = self._follow_logs
-            scroll = self._log_scroll
-        if follow:
-            mode = "follow"
-        else:
-            mode = f"scroll +{scroll}"
-        return f"Logs: {total_logs} | Mode: {mode} | File: {self._latest_log_path}"
+        return f"Logs: {total_logs} | File: {self._latest_log_path}"
 
     def _draw_box(self, top: int, left: int, box_height: int, box_width: int, title: str, attr: int = 0) -> None:
         if self._stdscr is None:
@@ -524,24 +475,9 @@ class LocalVideoMvpTui:
     def _visible_logs(self, logs: list[str], rows: int) -> list[str]:
         total = len(logs)
         if total <= rows:
-            with self._lock:
-                self._log_scroll = 0
-                self._follow_logs = True
             return logs
 
-        with self._lock:
-            follow = self._follow_logs
-            scroll = self._log_scroll
-
-        max_scroll = max(0, total - rows)
-        if follow:
-            scroll = 0
-        if scroll > max_scroll:
-            scroll = max_scroll
-            with self._lock:
-                self._log_scroll = scroll
-
-        start = max(0, total - rows - scroll)
+        start = max(0, total - rows)
         end = min(total, start + rows)
         return logs[start:end]
 
@@ -607,7 +543,22 @@ class LocalVideoMvpTui:
             return "Preflight: only Pexels key detected. Some scenes may still use placeholders."
         if has_pixabay:
             return "Preflight: only Pixabay key detected. Some scenes may still use placeholders."
-        return "Preflight: no stock API keys detected (PEXELS_API_KEY / PIXABAY_API_KEY). Run will use placeholders."
+        return "Preflight: no stock API keys detected (PEXELS_API_KEY / PIXABAY_API_KEY). Hard guard blocks this run."
+
+    def _passes_asset_hard_guard_precheck(self) -> bool:
+        with self._lock:
+            has_pexels = bool(self._stock_api_keys.get("PEXELS_API_KEY"))
+            has_pixabay = bool(self._stock_api_keys.get("PIXABAY_API_KEY"))
+
+        if has_pexels or has_pixabay:
+            return True
+
+        self._append_log("ERROR: Hard guard blocked run: no stock API keys were found.")
+        self._append_log(
+            "Set PEXELS_API_KEY and/or PIXABAY_API_KEY in env, repo .env, or ~/.config/imagine/stock_api_keys.json"
+        )
+        self._set_status("Hard guard: missing stock API keys. Run blocked.")
+        return False
 
     def _refresh_stock_key_cache(self) -> None:
         dotenv_keys, dotenv_warnings = self._read_repo_dotenv_keys()
@@ -804,6 +755,35 @@ class LocalVideoMvpTui:
         self._append_log(f"Exported final MP4 to {target_mp4}")
         return target_mp4
 
+    def _count_placeholder_scenes(self) -> int:
+        timeline_path = self.config.project_dir / "timeline.json"
+        if not timeline_path.exists():
+            return 0
+
+        try:
+            payload = json.loads(timeline_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"WARN: Could not parse timeline for placeholder check: {exc}")
+            return 0
+
+        clips = payload.get("clips")
+        if not isinstance(clips, list):
+            return 0
+
+        placeholders = 0
+        for clip in clips:
+            if not isinstance(clip, dict):
+                continue
+            scene_id = str(clip.get("scene_id") or "")
+            if scene_id in {"__intro", "__outro"}:
+                continue
+
+            source_path = clip.get("source_path")
+            if not source_path:
+                placeholders += 1
+
+        return placeholders
+
     def _elapsed_seconds(self) -> float:
         with self._lock:
             started = self._run_started_at
@@ -830,113 +810,6 @@ class LocalVideoMvpTui:
             self._stage_label = None
             self._stage_index = None
             self._stage_total = None
-
-    def _adjust_log_scroll(self, delta: int) -> None:
-        with self._lock:
-            self._log_scroll = max(0, self._log_scroll + delta)
-            self._follow_logs = self._log_scroll == 0
-
-    def _toggle_follow_mode(self) -> None:
-        with self._lock:
-            self._follow_logs = not self._follow_logs
-            if self._follow_logs:
-                self._log_scroll = 0
-        self._set_status("Follow mode on." if self._follow_logs else "Follow mode off (manual scroll).")
-
-    def _jump_to_latest_logs(self) -> None:
-        with self._lock:
-            self._follow_logs = True
-            self._log_scroll = 0
-        self._set_status("Jumped to latest logs.")
-
-    def _edit_prompt(self) -> None:
-        if self._is_running():
-            self._set_status("Cannot edit fields while command is running.")
-            return
-
-        value = self._prompt_input("Prompt", self.config.prompt)
-        if value:
-            self.config.prompt = value
-            self._set_status("Prompt updated.")
-
-    def _edit_project_dir(self) -> None:
-        if self._is_running():
-            self._set_status("Cannot edit fields while command is running.")
-            return
-
-        value = self._prompt_input("Project dir", str(self.config.project_dir))
-        if value:
-            self.config.project_dir = Path(value).expanduser().resolve()
-            self._refresh_prior_total_seconds()
-            self._set_status("Project directory updated.")
-
-    def _edit_minutes(self) -> None:
-        if self._is_running():
-            self._set_status("Cannot edit fields while command is running.")
-            return
-
-        value = self._prompt_input("Minutes", str(self.config.minutes))
-        if not value:
-            return
-
-        try:
-            minutes = int(value)
-        except ValueError:
-            self._set_status("Minutes must be an integer.")
-            return
-
-        if minutes <= 0:
-            self._set_status("Minutes must be greater than zero.")
-            return
-
-        self.config.minutes = minutes
-        self._set_status("Minutes updated.")
-
-    def _prompt_input(self, label: str, current_value: str) -> str | None:
-        if self._stdscr is None:
-            return None
-
-        stdscr = self._stdscr
-        height, width = stdscr.getmaxyx()
-        modal_h = 7
-        modal_w = min(max(54, len(current_value) + 20), max(20, width - 4))
-        top = max(0, (height - modal_h) // 2)
-        left = max(0, (width - modal_w) // 2)
-
-        win = curses.newwin(modal_h, modal_w, top, left)
-        win.keypad(True)
-        win.nodelay(False)
-        win.timeout(-1)
-
-        self._draw_box(top, left, modal_h, modal_w, title=f" {label} ", attr=self._attr("accent"))
-        self._safe_addstr(top + 2, left + 2, f"Current: {self._trim_tail(current_value, modal_w - 12)}", width)
-        self._safe_addstr(top + 4, left + 2, "> ", width, attr=self._attr("title", bold=True))
-        stdscr.refresh()
-
-        curses.echo()
-        try:
-            curses.curs_set(1)
-        except curses.error:
-            pass
-
-        raw = b""
-        try:
-            raw = win.getstr(4, 4, max(1, modal_w - 6))
-        except curses.error:
-            raw = b""
-        finally:
-            curses.noecho()
-            try:
-                curses.curs_set(0)
-            except curses.error:
-                pass
-            stdscr.nodelay(True)
-            stdscr.timeout(120)
-
-        value = raw.decode("utf-8", errors="ignore").strip()
-        if not value:
-            return None
-        return value
 
     def _trim_tail(self, text: str, limit: int) -> str:
         if limit <= 0:
@@ -1011,8 +884,6 @@ class LocalVideoMvpTui:
     def _append_log(self, line: str) -> None:
         with self._lock:
             self._logs.append(line)
-            if self._follow_logs:
-                self._log_scroll = 0
 
         if self._session_log_handle is not None:
             timestamp = dt.datetime.now(dt.timezone.utc).isoformat()

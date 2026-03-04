@@ -1395,7 +1395,10 @@ class VideoPipeline:
         ]
 
         if not any(key for _, key in provider_order):
-            self._warn("No stock API keys configured (PEXELS_API_KEY / PIXABAY_API_KEY). Using generated placeholders.")
+            message = "No stock API keys configured (PEXELS_API_KEY / PIXABAY_API_KEY)."
+            if self.config.require_external_assets:
+                raise RuntimeError(message + " --require-external-assets is enabled.")
+            self._warn(message + " Using generated placeholders.")
 
         for scene in plan.scenes:
             query = self._query_for_scene(scene)
@@ -1461,6 +1464,13 @@ class VideoPipeline:
                 f"{download_failures} asset downloads failed (network or provider timeout). "
                 "Placeholders were used for affected scenes."
             )
+
+        if self.config.require_external_assets and placeholder_scenes > 0:
+            raise RuntimeError(
+                f"{placeholder_scenes} scenes could not resolve an external stock asset while "
+                "--require-external-assets is enabled."
+            )
+
         if placeholder_scenes > 0 and rights:
             self._warn(f"{placeholder_scenes} scenes used placeholder visuals because no stock asset was resolved.")
 

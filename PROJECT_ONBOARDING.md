@@ -132,10 +132,7 @@ Default storage behavior:
 TUI shortcut focus for now:
 
 - `R` runs the preferred full pipeline profile from this onboarding guide.
-- `I` runs `inspect` for the selected project.
-- `A` refreshes stock-asset preflight status.
-- `P`/`D`/`M` edit prompt, project dir, and minutes.
-- `J`/`K` (or arrow keys) scroll logs, `F` toggles follow mode, `G` jumps to latest.
+- `Q` exits the TUI.
 
 TUI stock key discovery order:
 
@@ -143,7 +140,10 @@ TUI stock key discovery order:
 2. repo `.env`
 3. `~/.config/imagine/stock_api_keys.json` (or `IMAGINE_STOCK_KEYS_FILE`)
 
-If no stock keys are found, runtime panel will indicate placeholders-only mode before the run starts.
+Hard guard behavior (no placeholders allowed):
+
+- if no stock keys are found, run is blocked before start
+- if any scene resolves to placeholder, run is rejected
 
 TUI logs are always written to `~/.imagine/logs/`:
 

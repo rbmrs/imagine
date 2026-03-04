@@ -150,6 +150,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     run.add_argument("--pexels-api-key", default=os.environ.get("PEXELS_API_KEY"), help="Pexels API key")
     run.add_argument("--pixabay-api-key", default=os.environ.get("PIXABAY_API_KEY"), help="Pixabay API key")
+    run.add_argument(
+        "--require-external-assets",
+        action="store_true",
+        help="Fail the run if any scene cannot resolve to an external stock asset",
+    )
     run.add_argument("--max-scenes", type=int, default=40, help="Max number of scenes")
     run.add_argument("--min-scene-seconds", type=float, default=5.0, help="Minimum seconds per scene")
     run.add_argument("--verbose", action="store_true", help="Verbose pipeline logs")
@@ -233,6 +238,7 @@ def run_command(args: argparse.Namespace) -> int:
         allow_system_tts=bool(args.allow_system_tts),
         pexels_api_key=args.pexels_api_key,
         pixabay_api_key=args.pixabay_api_key,
+        require_external_assets=bool(args.require_external_assets),
         video_effects=args.video_effects,
         include_intro=bool(args.include_intro),
         include_outro=bool(args.include_outro),

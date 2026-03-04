@@ -220,14 +220,6 @@ local-video-mvp tui --prompt "Your topic" --project-dir ./projects/demo --minute
 Key bindings:
 
 - `R`: run the full pipeline using the preferred profile (`ollama`, `melo`, `faster-whisper`, strict mode)
-- `I`: run inspect for the current project dir
-- `A`: refresh and show stock-asset preflight status
-- `P`: edit prompt
-- `D`: edit project directory
-- `M`: edit minutes
-- `J`/`K` or Arrow keys: scroll logs
-- `F`: toggle log follow mode
-- `G`: jump to latest logs
 - `Q`: quit (stops active run first)
 
 If Ollama is not already running, the TUI tries to start `ollama serve` automatically and stops it on exit when it was started by the TUI.
@@ -247,7 +239,16 @@ Example key file:
 }
 ```
 
-If no stock keys are found, placeholders are expected and clearly shown in the TUI runtime panel.
+TUI enforces a hard guard against placeholders:
+
+- if no stock keys are found, `R` is blocked before the run starts
+- if any scene still resolves to a placeholder, the run is rejected
+
+For CLI runs outside TUI, you can enforce the same rule with:
+
+```bash
+local-video-mvp run --require-external-assets ...
+```
 
 TUI logs are written to a standard location:
 
