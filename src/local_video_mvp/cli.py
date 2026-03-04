@@ -6,6 +6,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 from .models import PipelineConfig
 from .pipeline import VideoPipeline
@@ -37,6 +38,55 @@ def _parse_asset_keywords(raw: str) -> list[str]:
         out.append(part)
 
     return out[:8]
+
+
+def _parse_clip_names(raw_items: list[str]) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        for part in re.split(r"[,;\n]+", str(raw)):
+            value = part.strip().lower()
+            if not value:
+                continue
+            if value in seen:
+                continue
+            seen.add(value)
+            names.append(value)
+    return names
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _coerce_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _coerce_str(value: Any, default: str) -> str:
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned:
+            return cleaned
+    return default
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -182,6 +232,29 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--min-scene-seconds", type=float, default=5.0, help="Minimum seconds per scene")
     run.add_argument("--verbose", action="store_true", help="Verbose pipeline logs")
 
+    replace = subparsers.add_parser("replace-clips", help="Replace selected scene clips and re-render outputs")
+    replace.add_argument("--project-dir", required=True, help="Existing project directory")
+    replace.add_argument(
+        "--clip-names",
+        nargs="+",
+        required=True,
+        help="Clip names (or scene ids) to replace; supports comma-separated values",
+    )
+    replace.add_argument(
+        "--asset-keywords",
+        default="",
+        help="Optional comma-separated replacement keywords (defaults to previous run keywords)",
+    )
+    replace.add_argument("--pexels-api-key", default=os.environ.get("PEXELS_API_KEY"), help="Pexels API key")
+    replace.add_argument("--pixabay-api-key", default=os.environ.get("PIXABAY_API_KEY"), help="Pixabay API key")
+    replace.add_argument(
+        "--require-external-assets",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fail replacement if any selected scene cannot resolve external stock assets",
+    )
+    replace.add_argument("--verbose", action="store_true", help="Verbose pipeline logs")
+
     inspect = subparsers.add_parser("inspect", help="Inspect latest run logs/report")
     inspect.add_argument("--project-dir", required=True, help="Project directory to inspect")
 
@@ -297,6 +370,95 @@ def run_command(args: argparse.Namespace) -> int:
     outputs = pipeline.run()
 
     print("\nPipeline completed successfully:\n")
+    for key in (
+        "project_dir",
+        "script",
+        "timeline",
+        "clip_catalog",
+        "narration",
+        "captions",
+        "captions_ass",
+        "final_mp4",
+        "final_srt",
+        "manifest",
+        "run_log",
+        "run_report",
+    ):
+        print(f"- {key}: {outputs[key]}")
+    return 0
+
+
+def replace_clips_command(args: argparse.Namespace) -> int:
+    project_dir = Path(args.project_dir).expanduser().resolve()
+    if not project_dir.exists():
+        raise RuntimeError(f"Project directory not found: {project_dir}")
+
+    clip_names = _parse_clip_names(list(args.clip_names))
+    if not clip_names:
+        raise RuntimeError("No clip names were provided. Use --clip-names with one or more entries.")
+
+    manifest_config: dict[str, object] = {}
+    manifest_path = project_dir / "rights_manifest.json"
+    if manifest_path.exists():
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and isinstance(payload.get("config"), dict):
+                manifest_config = dict(payload["config"])
+        except Exception:
+            manifest_config = {}
+
+    prompt_path = project_dir / "prompt.txt"
+    prompt = project_dir.name
+    if prompt_path.exists():
+        raw_prompt = prompt_path.read_text(encoding="utf-8").strip()
+        if raw_prompt:
+            prompt = raw_prompt
+
+    keywords = _parse_asset_keywords(str(args.asset_keywords))
+    if not keywords:
+        raw_keywords = manifest_config.get("asset_keywords")
+        if isinstance(raw_keywords, list):
+            keywords = _parse_asset_keywords(",".join(str(item) for item in raw_keywords if str(item).strip()))
+
+    resolution = str(manifest_config.get("resolution") or "1280x720")
+    try:
+        width, height = _parse_resolution(resolution)
+    except Exception:
+        width, height = (1280, 720)
+
+    config = PipelineConfig(
+        prompt=prompt,
+        project_dir=project_dir,
+        asset_keywords=keywords,
+        minutes=max(1, _coerce_int(manifest_config.get("minutes"), 1)),
+        width=width,
+        height=height,
+        fps=max(1, _coerce_int(manifest_config.get("fps"), 30)),
+        script_engine="template",
+        ollama_model="qwen2.5:14b",
+        require_ollama=False,
+        tts_engine="melo",
+        caption_engine=_coerce_str(manifest_config.get("caption_engine"), "heuristic"),
+        caption_style=_coerce_str(manifest_config.get("caption_style"), "engagement"),
+        burn_subtitles=_coerce_bool(manifest_config.get("burn_subtitles"), True),
+        strict_commercial_safe=_coerce_bool(manifest_config.get("strict_commercial_safe"), True),
+        pexels_api_key=args.pexels_api_key,
+        pixabay_api_key=args.pixabay_api_key,
+        require_external_assets=bool(args.require_external_assets),
+        video_effects=_coerce_str(manifest_config.get("video_effects"), "clean"),
+        include_intro=_coerce_bool(manifest_config.get("include_intro"), True),
+        include_outro=_coerce_bool(manifest_config.get("include_outro"), True),
+        intro_seconds=max(0.0, _coerce_float(manifest_config.get("intro_seconds"), 0.0)),
+        outro_seconds=max(0.0, _coerce_float(manifest_config.get("outro_seconds"), 0.0)),
+        outro_text=_coerce_str(manifest_config.get("outro_text"), "Thanks for watching"),
+        bookend_style=_coerce_str(manifest_config.get("bookend_style"), "minimal-clean"),
+        verbose=bool(args.verbose),
+    )
+
+    pipeline = VideoPipeline(config)
+    outputs = pipeline.replace_clips_by_name(clip_names)
+
+    print("\nClip replacement completed successfully:\n")
     for key in (
         "project_dir",
         "script",
@@ -594,6 +756,8 @@ def main() -> int:
     try:
         if args.command == "run":
             return run_command(args)
+        if args.command == "replace-clips":
+            return replace_clips_command(args)
         if args.command == "inspect":
             return inspect_command(args)
         if args.command == "voices":

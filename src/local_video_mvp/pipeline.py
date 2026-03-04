@@ -88,7 +88,17 @@ class VideoPipeline:
         self._started_at: dt.datetime | None = None
         self._finished_at: dt.datetime | None = None
 
+    def _reset_run_state(self) -> None:
+        self.stage_times = {}
+        self.warnings = []
+        self.caption_stats = {}
+        self.duration_stats = {}
+        self.pacing_stats = {}
+        self.asset_stats = {}
+        self.used_template_fallback = False
+
     def run(self) -> dict[str, str]:
+        self._reset_run_state()
         self._started_at = dt.datetime.now(dt.timezone.utc)
         self._prepare_dirs()
         self._log("Preparing project directories")
@@ -210,6 +220,132 @@ class VideoPipeline:
             self._run_stage("render", "Stage 6/7: Rendering final video", render_stage)
 
             manifest = self._run_stage("manifest", "Stage 7/7: Writing rights manifest", lambda: self._build_manifest(plan, rights))
+            self._write_json(self.paths["manifest"], manifest)
+
+            outputs = {
+                "project_dir": str(self.config.project_dir.resolve()),
+                "script": str(self.paths["script"].resolve()),
+                "timeline": str(self.paths["timeline"].resolve()),
+                "clip_catalog": str(self.paths["clip_catalog"].resolve()),
+                "narration": str(self.paths["narration_wav"].resolve()),
+                "captions": str(self.paths["captions"].resolve()),
+                "captions_ass": str(self.paths["captions_ass"].resolve()),
+                "final_mp4": str(self.paths["final_mp4"].resolve()),
+                "final_srt": str(self.paths["final_srt"].resolve()),
+                "manifest": str(self.paths["manifest"].resolve()),
+                "run_log": str(self.paths["run_log"].resolve()),
+                "run_report": str(self.paths["run_report"].resolve()),
+            }
+
+            self._finished_at = dt.datetime.now(dt.timezone.utc)
+            self._write_run_report(status="success", outputs=outputs)
+            self._log("Done")
+            return outputs
+        except Exception as exc:
+            self._finished_at = dt.datetime.now(dt.timezone.utc)
+            self._log_with_level(f"Pipeline failed: {exc}", level="ERROR")
+            self._write_run_report(status="failed", outputs=outputs, error=str(exc))
+            raise
+
+    def replace_clips_by_name(self, clip_names: list[str]) -> dict[str, str]:
+        self._reset_run_state()
+        self._started_at = dt.datetime.now(dt.timezone.utc)
+        self._prepare_dirs()
+        self._log("Preparing project directories")
+
+        outputs: dict[str, str] = {}
+        try:
+            self._require_binary("ffmpeg")
+            self._require_binary("ffprobe")
+
+            plan = self._run_stage(
+                "load_script",
+                "Stage 1/5: Loading existing script",
+                self._load_existing_script_plan,
+            )
+
+            requested_names = {str(name).strip().lower() for name in clip_names if str(name).strip()}
+            if not requested_names:
+                raise RuntimeError("No clip names were provided for replacement.")
+
+            target_scenes: list[Scene] = []
+            for scene in plan.scenes:
+                if scene.clip_name.strip().lower() in requested_names or scene.scene_id.strip().lower() in requested_names:
+                    target_scenes.append(scene)
+
+            if not target_scenes:
+                raise RuntimeError("None of the requested clip names were found in script.json.")
+
+            existing_rights = self._load_existing_rights()
+            target_scene_ids = {scene.scene_id for scene in target_scenes}
+            keep_rights = [right for right in existing_rights if right.scene_id not in target_scene_ids]
+
+            used_asset_keys = {self._asset_uniqueness_key_from_right(right) for right in keep_rights}
+            rejected_keys = {self._asset_uniqueness_key_from_right(right) for right in existing_rights}
+            used_asset_keys.update(rejected_keys)
+
+            for scene in target_scenes:
+                scene.asset_path = None
+                scene.asset_provider = None
+
+            self._log(
+                "Replacing clips: "
+                + ", ".join(scene.clip_name for scene in target_scenes)
+            )
+
+            replacement_rights = self._run_stage(
+                "assets",
+                "Stage 2/5: Resolving replacement assets",
+                lambda: self._resolve_assets(
+                    plan,
+                    scenes=target_scenes,
+                    preused_asset_keys=used_asset_keys,
+                ),
+            )
+
+            rights_by_scene: dict[str, AssetRight] = {right.scene_id: right for right in keep_rights}
+            for right in replacement_rights:
+                rights_by_scene[right.scene_id] = right
+            merged_rights = [rights_by_scene[scene.scene_id] for scene in plan.scenes if scene.scene_id in rights_by_scene]
+
+            self._write_json(self.paths["script"], plan.to_dict())
+            self._prepare_bookend_backgrounds(plan)
+            self._write_clip_catalog(plan, merged_rights)
+
+            narration_wav = self.paths["narration_wav"]
+            if not narration_wav.exists():
+                raise RuntimeError(
+                    f"Missing narration audio: {narration_wav}. Run full generation first before replacing clips."
+                )
+
+            captions_srt = self.paths["captions"]
+            if not captions_srt.exists():
+                raise RuntimeError(
+                    f"Missing captions file: {captions_srt}. Run full generation first before replacing clips."
+                )
+
+            timeline = self._run_stage("timeline", "Stage 3/5: Rebuilding timeline", lambda: self._build_timeline(plan))
+            self._write_json(
+                self.paths["timeline"],
+                {
+                    "title": plan.title,
+                    "summary": plan.summary,
+                    "clips": [clip.to_dict() for clip in timeline],
+                    "total_seconds": round(sum(clip.seconds for clip in timeline), 3),
+                },
+            )
+
+            def render_stage() -> None:
+                self._render_video(timeline, narration_wav, self.paths["final_mp4"])
+                shutil.copy2(captions_srt, self.paths["final_srt"])
+
+            self._run_stage("render", "Stage 4/5: Rendering updated video", render_stage)
+
+            manifest = self._run_stage(
+                "manifest",
+                "Stage 5/5: Writing rights manifest",
+                lambda: self._build_manifest(plan, merged_rights),
+            )
             self._write_json(self.paths["manifest"], manifest)
 
             outputs = {
@@ -471,6 +607,137 @@ class VideoPipeline:
 
         used.add(candidate)
         return candidate
+
+    def _load_existing_script_plan(self) -> ScriptPlan:
+        script_path = self.paths["script"]
+        if not script_path.exists():
+            raise RuntimeError(f"script.json not found at {script_path}")
+
+        payload = json.loads(script_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise RuntimeError("script.json is invalid: expected top-level JSON object")
+
+        title = str(payload.get("title") or f"Explainer: {self.config.prompt}").strip()
+        summary = str(payload.get("summary") or "").strip() or f"Long-form explainer on {self.config.prompt}."
+
+        raw_scenes = payload.get("scenes")
+        if not isinstance(raw_scenes, list) or not raw_scenes:
+            raise RuntimeError("script.json has no scenes to review")
+
+        scenes: list[Scene] = []
+        used_clip_names: set[str] = set()
+        for idx, item in enumerate(raw_scenes):
+            if not isinstance(item, dict):
+                continue
+
+            scene_id = str(item.get("scene_id") or f"scene_{idx + 1:03d}").strip()
+            if not scene_id:
+                scene_id = f"scene_{idx + 1:03d}"
+
+            heading = str(item.get("heading") or f"Scene {idx + 1}").strip()
+            voiceover = str(item.get("voiceover") or "").strip()
+
+            raw_terms = item.get("search_terms")
+            if isinstance(raw_terms, list):
+                search_terms = [str(term).strip() for term in raw_terms if str(term).strip()]
+            else:
+                search_terms = []
+            if not search_terms:
+                search_terms = self._default_search_terms(heading)
+
+            try:
+                seconds = float(item.get("seconds") or 0.0)
+            except Exception:
+                seconds = 0.0
+            seconds = max(0.2, seconds)
+
+            clip_name_raw = str(item.get("clip_name") or "").strip().lower()
+            if not clip_name_raw:
+                clip_name = self._build_scene_clip_name(idx=idx, heading=heading, used=used_clip_names)
+            else:
+                clip_name = clip_name_raw
+                suffix = 2
+                while clip_name in used_clip_names:
+                    clip_name = f"{clip_name_raw}-{suffix}"
+                    suffix += 1
+                used_clip_names.add(clip_name)
+
+            asset_path_raw = str(item.get("asset_path") or "").strip()
+            asset_provider_raw = str(item.get("asset_provider") or "").strip()
+
+            scenes.append(
+                Scene(
+                    scene_id=scene_id,
+                    clip_name=clip_name,
+                    heading=heading,
+                    voiceover=voiceover,
+                    search_terms=search_terms[:4],
+                    seconds=seconds,
+                    asset_path=asset_path_raw or None,
+                    asset_provider=asset_provider_raw or None,
+                )
+            )
+
+        if not scenes:
+            raise RuntimeError("script.json has no valid scenes to process")
+
+        return ScriptPlan(title=title, summary=summary, scenes=scenes)
+
+    def _load_existing_rights(self) -> list[AssetRight]:
+        manifest_path = self.paths["manifest"]
+        if not manifest_path.exists():
+            return []
+
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            self._warn(f"Could not parse existing rights manifest: {exc}")
+            return []
+
+        assets = payload.get("assets") if isinstance(payload, dict) else None
+        if not isinstance(assets, list):
+            return []
+
+        rights: list[AssetRight] = []
+        for item in assets:
+            if not isinstance(item, dict):
+                continue
+
+            scene_id = str(item.get("scene_id") or "").strip()
+            source_platform = str(item.get("source_platform") or "").strip()
+            source_url = str(item.get("source_url") or "").strip()
+            local_path = str(item.get("local_path") or "").strip()
+            sha256 = str(item.get("sha256") or "").strip()
+            downloaded_at = str(item.get("downloaded_at") or "").strip()
+            if not (scene_id and source_platform and source_url and local_path and sha256):
+                continue
+
+            restriction_flags_raw = item.get("restriction_flags")
+            if isinstance(restriction_flags_raw, list):
+                restriction_flags = [str(flag) for flag in restriction_flags_raw]
+            else:
+                restriction_flags = []
+
+            rights.append(
+                AssetRight(
+                    scene_id=scene_id,
+                    source_platform=source_platform,
+                    source_asset_id=(str(item.get("source_asset_id") or "").strip() or None),
+                    source_url=source_url,
+                    creator_name=(str(item.get("creator_name") or "").strip() or None),
+                    creator_profile_url=(str(item.get("creator_profile_url") or "").strip() or None),
+                    license_name=(str(item.get("license_name") or "").strip() or None),
+                    license_url=(str(item.get("license_url") or "").strip() or None),
+                    downloaded_at=downloaded_at,
+                    local_path=local_path,
+                    sha256=sha256,
+                    restriction_flags=restriction_flags,
+                    attribution_required=bool(item.get("attribution_required", False)),
+                    attribution_text=(str(item.get("attribution_text") or "").strip() or None),
+                )
+            )
+
+        return rights
 
     def _duration_bounds(self) -> tuple[float, float, float]:
         target_seconds = float(self.config.target_seconds())
@@ -1427,7 +1694,13 @@ class VideoPipeline:
             for scene in plan.scenes:
                 scene.seconds *= scale
 
-    def _resolve_assets(self, plan: ScriptPlan) -> list[AssetRight]:
+    def _resolve_assets(
+        self,
+        plan: ScriptPlan,
+        *,
+        scenes: list[Scene] | None = None,
+        preused_asset_keys: set[str] | None = None,
+    ) -> list[AssetRight]:
         rights: list[AssetRight] = []
         query_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
         download_failures = 0
@@ -1436,7 +1709,8 @@ class VideoPipeline:
         unique_shortfall_scene_ids: list[str] = []
         unique_shortfall_clip_names: list[str] = []
         unresolved_scene_ids: list[str] = []
-        used_asset_keys: set[str] = set()
+        used_asset_keys: set[str] = set(preused_asset_keys or set())
+        target_scenes = list(scenes) if scenes is not None else list(plan.scenes)
 
         provider_order = [
             ("pexels", self.config.pexels_api_key),
@@ -1452,7 +1726,7 @@ class VideoPipeline:
         if self.config.asset_keywords:
             self._log(f"Asset keyword constraint enabled: {', '.join(self.config.asset_keywords)}")
 
-        for scene in plan.scenes:
+        for scene in target_scenes:
             queries = self._queries_for_scene(scene)
             resolved = False
             saw_candidates = False
@@ -1603,6 +1877,16 @@ class VideoPipeline:
         fallback = json.dumps(candidate, sort_keys=True, ensure_ascii=True)
         digest = hashlib.sha1(fallback.encode("utf-8")).hexdigest()
         return f"{platform}:digest:{digest}"
+
+    def _asset_uniqueness_key_from_right(self, right: AssetRight) -> str:
+        return self._asset_uniqueness_key(
+            {
+                "source_platform": right.source_platform,
+                "source_asset_id": right.source_asset_id or "",
+                "source_url": right.source_url,
+                "download_url": right.source_url,
+            }
+        )
 
     def _stable_rotate_candidates(self, candidates: list[dict[str, Any]], seed: str) -> list[dict[str, Any]]:
         if not candidates:
