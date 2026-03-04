@@ -108,134 +108,14 @@ class VideoPipeline:
             self._check_dependencies()
             self._write_text(self.paths["prompt"], self.config.prompt.strip() + "\n")
 
-            plan = self._run_stage("script_plan", "Stage 1/7: Generating script plan", self._generate_script_plan)
-            self._initialize_duration_stats(plan)
-            plan = self._run_stage(
-                "duration_preflight",
-                "Stage 1.1/7: Aligning script length with target duration",
-                lambda: self._ensure_minimum_script_length(plan),
+            plan = self.run_draft_stage()
+            reviewed_plan = self.run_review_stage(plan)
+            preview_stage = self.run_preview_stage(reviewed_plan)
+            outputs = self.run_finalize_stage(
+                reviewed_plan,
+                rights=preview_stage["rights"],
+                timeline=preview_stage["timeline"],
             )
-            self._write_json(self.paths["script"], plan.to_dict())
-
-            adjust_passes = 0
-            audio_duration = 0.0
-            while True:
-                narration_text = self._clean_narration_text(plan.narration_text())
-                self._write_text(self.paths["narration_txt"], narration_text + "\n")
-
-                def voice_stage() -> None:
-                    self._synthesize_narration(narration_text, self.paths["narration_raw"])
-                    self._normalize_audio(self.paths["narration_raw"], self.paths["narration_wav"])
-
-                stage_key = "narration" if adjust_passes == 0 else f"narration_pass_{adjust_passes + 1}"
-                stage_label = "Stage 2/7: Synthesizing narration audio"
-                if adjust_passes > 0:
-                    stage_label = f"Stage 2/7: Re-synthesizing narration audio (pass {adjust_passes + 1})"
-                self._run_stage(stage_key, stage_label, voice_stage)
-
-                audio_duration = self._media_duration(self.paths["narration_wav"])
-                self._rebalance_scene_durations(plan, audio_duration)
-                self._update_duration_post_tts(plan, audio_duration, adjust_passes)
-                self._update_pacing_post_tts(narration_text, audio_duration, adjust_passes)
-
-                if self._duration_within_tolerance(audio_duration):
-                    break
-
-                if (
-                    self._duration_too_short(audio_duration)
-                    and adjust_passes < self.config.max_duration_adjust_passes
-                ):
-                    adjust_passes += 1
-                    self._warn(
-                        f"Narration duration is {audio_duration:.1f}s, below tolerance floor. "
-                        f"Expanding script and retrying (pass {adjust_passes})."
-                    )
-                    plan = self._run_stage(
-                        f"duration_adjust_{adjust_passes}",
-                        f"Stage 2/7: Expanding script for duration (pass {adjust_passes})",
-                        lambda: self._expand_short_script(plan, audio_duration),
-                    )
-                    self._write_json(self.paths["script"], plan.to_dict())
-                    continue
-
-                if (
-                    self._duration_too_long(audio_duration)
-                    and adjust_passes < self.config.max_duration_adjust_passes
-                ):
-                    adjust_passes += 1
-                    self._warn(
-                        f"Narration duration is {audio_duration:.1f}s, above tolerance ceiling. "
-                        f"Compressing script and retrying (pass {adjust_passes})."
-                    )
-                    plan = self._run_stage(
-                        f"duration_adjust_{adjust_passes}",
-                        f"Stage 2/7: Compressing script for duration (pass {adjust_passes})",
-                        lambda: self._compress_long_script(plan, audio_duration),
-                    )
-                    self._write_json(self.paths["script"], plan.to_dict())
-                    continue
-
-                requested = self.duration_stats.get("requested_seconds", self.config.target_seconds())
-                delta = audio_duration - float(requested)
-                delta_pct = (delta / float(requested) * 100.0) if requested else 0.0
-                self._warn(
-                    "Narration duration is outside tolerance but no more adjustment passes remain. "
-                    f"Proceeding with {audio_duration:.1f}s ({delta_pct:+.1f}%)."
-                )
-                break
-
-            self._write_json(self.paths["script"], plan.to_dict())
-
-            rights = self._run_stage("assets", "Stage 3/7: Resolving visual assets", lambda: self._resolve_assets(plan))
-            self._write_json(self.paths["script"], plan.to_dict())
-            self._prepare_bookend_backgrounds(plan)
-            self._write_clip_catalog(plan, rights)
-
-            captions = self._run_stage(
-                "captions",
-                "Stage 4/7: Building captions",
-                lambda: self._generate_captions(plan, self.paths["narration_wav"]),
-            )
-            intro_shift = self._intro_bookend_seconds()
-            if intro_shift > 0.0:
-                captions = self._shift_captions(captions, intro_shift)
-            self._write_srt(self.paths["captions"], captions)
-            self._write_ass(self.paths["captions_ass"], captions)
-
-            timeline = self._run_stage("timeline", "Stage 5/7: Building timeline", lambda: self._build_timeline(plan))
-            self._write_json(
-                self.paths["timeline"],
-                {
-                    "title": plan.title,
-                    "summary": plan.summary,
-                    "clips": [clip.to_dict() for clip in timeline],
-                    "total_seconds": round(sum(clip.seconds for clip in timeline), 3),
-                },
-            )
-
-            def render_stage() -> None:
-                self._render_video(timeline, self.paths["narration_wav"], self.paths["final_mp4"])
-                shutil.copy2(self.paths["captions"], self.paths["final_srt"])
-
-            self._run_stage("render", "Stage 6/7: Rendering final video", render_stage)
-
-            manifest = self._run_stage("manifest", "Stage 7/7: Writing rights manifest", lambda: self._build_manifest(plan, rights))
-            self._write_json(self.paths["manifest"], manifest)
-
-            outputs = {
-                "project_dir": str(self.config.project_dir.resolve()),
-                "script": str(self.paths["script"].resolve()),
-                "timeline": str(self.paths["timeline"].resolve()),
-                "clip_catalog": str(self.paths["clip_catalog"].resolve()),
-                "narration": str(self.paths["narration_wav"].resolve()),
-                "captions": str(self.paths["captions"].resolve()),
-                "captions_ass": str(self.paths["captions_ass"].resolve()),
-                "final_mp4": str(self.paths["final_mp4"].resolve()),
-                "final_srt": str(self.paths["final_srt"].resolve()),
-                "manifest": str(self.paths["manifest"].resolve()),
-                "run_log": str(self.paths["run_log"].resolve()),
-                "run_report": str(self.paths["run_report"].resolve()),
-            }
 
             self._finished_at = dt.datetime.now(dt.timezone.utc)
             self._write_run_report(status="success", outputs=outputs)
@@ -246,6 +126,141 @@ class VideoPipeline:
             self._log_with_level(f"Pipeline failed: {exc}", level="ERROR")
             self._write_run_report(status="failed", outputs=outputs, error=str(exc))
             raise
+
+    def run_draft_stage(self) -> ScriptPlan:
+        plan = self._run_stage("script_plan", "Stage 1/7: Generating script plan", self._generate_script_plan)
+        self._initialize_duration_stats(plan)
+        plan = self._run_stage(
+            "duration_preflight",
+            "Stage 1.1/7: Aligning script length with target duration",
+            lambda: self._ensure_minimum_script_length(plan),
+        )
+        self._write_json(self.paths["script"], plan.to_dict())
+
+        adjust_passes = 0
+        audio_duration = 0.0
+        while True:
+            narration_text = self._clean_narration_text(plan.narration_text())
+            self._write_text(self.paths["narration_txt"], narration_text + "\n")
+
+            def voice_stage() -> None:
+                self._synthesize_narration(narration_text, self.paths["narration_raw"])
+                self._normalize_audio(self.paths["narration_raw"], self.paths["narration_wav"])
+
+            stage_key = "narration" if adjust_passes == 0 else f"narration_pass_{adjust_passes + 1}"
+            stage_label = "Stage 2/7: Synthesizing narration audio"
+            if adjust_passes > 0:
+                stage_label = f"Stage 2/7: Re-synthesizing narration audio (pass {adjust_passes + 1})"
+            self._run_stage(stage_key, stage_label, voice_stage)
+
+            audio_duration = self._media_duration(self.paths["narration_wav"])
+            self._rebalance_scene_durations(plan, audio_duration)
+            self._update_duration_post_tts(plan, audio_duration, adjust_passes)
+            self._update_pacing_post_tts(narration_text, audio_duration, adjust_passes)
+
+            if self._duration_within_tolerance(audio_duration):
+                break
+
+            if self._duration_too_short(audio_duration) and adjust_passes < self.config.max_duration_adjust_passes:
+                adjust_passes += 1
+                self._warn(
+                    f"Narration duration is {audio_duration:.1f}s, below tolerance floor. "
+                    f"Expanding script and retrying (pass {adjust_passes})."
+                )
+                plan = self._run_stage(
+                    f"duration_adjust_{adjust_passes}",
+                    f"Stage 2/7: Expanding script for duration (pass {adjust_passes})",
+                    lambda: self._expand_short_script(plan, audio_duration),
+                )
+                self._write_json(self.paths["script"], plan.to_dict())
+                continue
+
+            if self._duration_too_long(audio_duration) and adjust_passes < self.config.max_duration_adjust_passes:
+                adjust_passes += 1
+                self._warn(
+                    f"Narration duration is {audio_duration:.1f}s, above tolerance ceiling. "
+                    f"Compressing script and retrying (pass {adjust_passes})."
+                )
+                plan = self._run_stage(
+                    f"duration_adjust_{adjust_passes}",
+                    f"Stage 2/7: Compressing script for duration (pass {adjust_passes})",
+                    lambda: self._compress_long_script(plan, audio_duration),
+                )
+                self._write_json(self.paths["script"], plan.to_dict())
+                continue
+
+            requested = self.duration_stats.get("requested_seconds", self.config.target_seconds())
+            delta = audio_duration - float(requested)
+            delta_pct = (delta / float(requested) * 100.0) if requested else 0.0
+            self._warn(
+                "Narration duration is outside tolerance but no more adjustment passes remain. "
+                f"Proceeding with {audio_duration:.1f}s ({delta_pct:+.1f}%)."
+            )
+            break
+
+        self._write_json(self.paths["script"], plan.to_dict())
+        return plan
+
+    def run_review_stage(self, plan: ScriptPlan) -> ScriptPlan:
+        return plan
+
+    def run_preview_stage(self, plan: ScriptPlan) -> dict[str, Any]:
+        rights = self._run_stage("assets", "Stage 3/7: Resolving visual assets", lambda: self._resolve_assets(plan))
+        self._write_json(self.paths["script"], plan.to_dict())
+        self._prepare_bookend_backgrounds(plan)
+        self._write_clip_catalog(plan, rights)
+
+        captions = self._run_stage(
+            "captions",
+            "Stage 4/7: Building captions",
+            lambda: self._generate_captions(plan, self.paths["narration_wav"]),
+        )
+        intro_shift = self._intro_bookend_seconds()
+        if intro_shift > 0.0:
+            captions = self._shift_captions(captions, intro_shift)
+        self._write_srt(self.paths["captions"], captions)
+        self._write_ass(self.paths["captions_ass"], captions)
+
+        timeline = self._run_stage("timeline", "Stage 5/7: Building timeline", lambda: self._build_timeline(plan))
+        self._write_json(
+            self.paths["timeline"],
+            {
+                "title": plan.title,
+                "summary": plan.summary,
+                "clips": [clip.to_dict() for clip in timeline],
+                "total_seconds": round(sum(clip.seconds for clip in timeline), 3),
+            },
+        )
+
+        return {
+            "rights": rights,
+            "timeline": timeline,
+        }
+
+    def run_finalize_stage(self, plan: ScriptPlan, *, rights: list[AssetRight], timeline: list[TimelineClip]) -> dict[str, str]:
+        def render_stage() -> None:
+            self._render_video(timeline, self.paths["narration_wav"], self.paths["final_mp4"])
+            shutil.copy2(self.paths["captions"], self.paths["final_srt"])
+
+        self._run_stage("render", "Stage 6/7: Rendering final video", render_stage)
+
+        manifest = self._run_stage("manifest", "Stage 7/7: Writing rights manifest", lambda: self._build_manifest(plan, rights))
+        self._write_json(self.paths["manifest"], manifest)
+
+        return {
+            "project_dir": str(self.config.project_dir.resolve()),
+            "script": str(self.paths["script"].resolve()),
+            "timeline": str(self.paths["timeline"].resolve()),
+            "clip_catalog": str(self.paths["clip_catalog"].resolve()),
+            "narration": str(self.paths["narration_wav"].resolve()),
+            "captions": str(self.paths["captions"].resolve()),
+            "captions_ass": str(self.paths["captions_ass"].resolve()),
+            "final_mp4": str(self.paths["final_mp4"].resolve()),
+            "final_srt": str(self.paths["final_srt"].resolve()),
+            "manifest": str(self.paths["manifest"].resolve()),
+            "run_log": str(self.paths["run_log"].resolve()),
+            "run_report": str(self.paths["run_report"].resolve()),
+        }
 
     def replace_clips_by_name(self, clip_names: list[str]) -> dict[str, str]:
         self._reset_run_state()
