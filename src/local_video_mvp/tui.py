@@ -1026,7 +1026,7 @@ class LocalVideoMvpTui:
         max_modal_height = max(6, height - 2)
         max_list_rows = max(1, max_modal_height - 4)
         list_rows = min(len(normalized), max_list_rows)
-        modal_height = list_rows + 4
+        modal_height = max(6, list_rows + 4)
 
         if modal_width < 12 or modal_height < 6:
             return None
@@ -1045,6 +1045,7 @@ class LocalVideoMvpTui:
         win.timeout(-1)
 
         while True:
+            self._draw()
             win.erase()
             try:
                 win.box()
