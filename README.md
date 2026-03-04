@@ -203,7 +203,7 @@ imagine
 `imagine` opens the TUI with default values:
 
 - prompt: `Autonomous cars`
-- project directory: `~/.imagine/projects/autonomous-cars`
+- project workspace: `~/.imagine/projects/autonomous-cars`
 - minutes: `2`
 - voice: `EN / EN-US`, profile `calm-documentary`, speed `1.0`
 
@@ -228,8 +228,13 @@ local-video-mvp tui \
 Key bindings:
 
 - `R`: run the full pipeline using the preferred profile (`ollama`, `melo`, `faster-whisper`, strict mode)
-- `E`: edit basic parameters (prompt, minutes, project dir, language, speaker, voice profile, voice speed)
+- `E`: edit parameters (`prompt`, `minutes`, `workspace`, `voice speed`) and choose from lists for language/speaker/profile
 - `Q`: quit (stops active run first)
+
+Current MVP voice picker scope:
+
+- language picker supports `EN` only for now
+- speaker picker is loaded from available EN speakers on your machine
 
 If Ollama is not already running, the TUI tries to start `ollama serve` automatically and stops it on exit when it was started by the TUI.
 

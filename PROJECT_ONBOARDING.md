@@ -121,7 +121,7 @@ imagine
 Default startup values:
 
 - prompt: `Autonomous cars`
-- project directory: `~/.imagine/projects/autonomous-cars`
+- project workspace: `~/.imagine/projects/autonomous-cars`
 - minutes: `2`
 - voice: `EN / EN-US`, profile `calm-documentary`, speed `1.0`
 
@@ -133,8 +133,13 @@ Default storage behavior:
 TUI shortcut focus for now:
 
 - `R` runs the preferred full pipeline profile from this onboarding guide.
-- `E` edits prompt, duration, project dir, and voice settings (language/speaker/profile/speed).
+- `E` edits prompt/duration/workspace/speed and uses list pickers for language/speaker/profile.
 - `Q` exits the TUI.
+
+Current voice picker scope:
+
+- language picker is restricted to `EN` for now
+- speaker picker shows available EN speakers on this machine
 
 TUI stock key discovery order:
 

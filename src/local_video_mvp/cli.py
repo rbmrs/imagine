@@ -201,7 +201,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Initial voice profile",
     )
     tui.add_argument("--voice-speed", type=float, default=1.0, help="Initial voice speed")
-    tui.add_argument("--melo-language", default="EN", help="Initial Melo language")
+    tui.add_argument("--melo-language", choices=["EN"], default="EN", help="Initial Melo language")
     tui.add_argument("--melo-speaker", default="EN-US", help="Initial Melo speaker")
 
     return parser
