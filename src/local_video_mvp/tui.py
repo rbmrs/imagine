@@ -65,6 +65,7 @@ class LocalVideoMvpTui:
         self._active_project_dir: Path | None = None
         self._pending_export_path: Path | None = None
         self._pending_unique_asset_prompt: dict[str, Any] | None = None
+        self._pending_clip_review_prompt: dict[str, Any] | None = None
 
         self._stock_api_keys: dict[str, str] = {}
         self._stock_key_sources: dict[str, str] = {}
@@ -114,6 +115,7 @@ class LocalVideoMvpTui:
 
             if not self._is_running():
                 self._maybe_prompt_unique_asset_shortfall()
+                self._maybe_prompt_clip_review()
 
             key = stdscr.getch()
             if key == -1:
@@ -238,6 +240,7 @@ class LocalVideoMvpTui:
                     clip_catalog = self._active_project_dir / "review" / "clip_catalog.json"
                     if clip_catalog.exists():
                         self._append_log(f"Clip catalog: {clip_catalog}")
+                        self._queue_clip_review_prompt(self._active_project_dir)
 
                 if inspect_code == 0 and exported_mp4 is not None:
                     self._set_status(f"Run complete. MP4 exported to {exported_mp4.name}.")
@@ -279,7 +282,7 @@ class LocalVideoMvpTui:
         current_pythonpath = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = f"{repo_src}:{current_pythonpath}" if current_pythonpath else repo_src
 
-        if label == "run":
+        if label in {"run", "replace"}:
             for key, value in self._stock_api_keys.items():
                 if key not in env and value:
                     env[key] = value
@@ -589,7 +592,11 @@ class LocalVideoMvpTui:
             workflow_kind = self._workflow_kind
 
         if workflow_kind != "run":
-            return "Inspect workflow" if workflow_kind == "inspect" else "Waiting for run"
+            if workflow_kind == "inspect":
+                return "Inspect workflow"
+            if workflow_kind == "replace":
+                return "Clip replacement workflow"
+            return "Waiting for run"
 
         if stage_index is None or stage_total is None or stage_total <= 0:
             return "Starting run..."
@@ -1032,6 +1039,322 @@ class LocalVideoMvpTui:
         if clip_names:
             self._append_log(f"Retrying may replace these unresolved clips: {', '.join(clip_names[:12])}")
         self._set_status("Keywords updated. Press R to retry generation.")
+
+    def _queue_clip_review_prompt(self, project_dir: Path) -> None:
+        with self._lock:
+            self._pending_clip_review_prompt = {
+                "project_dir": str(project_dir),
+            }
+
+    def _maybe_prompt_clip_review(self) -> None:
+        with self._lock:
+            pending = self._pending_clip_review_prompt
+            self._pending_clip_review_prompt = None
+
+        if not isinstance(pending, dict):
+            return
+
+        project_dir_raw = str(pending.get("project_dir") or "").strip()
+        if not project_dir_raw:
+            return
+
+        project_dir = Path(project_dir_raw).expanduser().resolve()
+        entries = self._load_clip_catalog_entries(project_dir)
+        if not entries:
+            return
+
+        should_review = self._prompt_yes_no(
+            title="Review Clip Catalog",
+            body=f"{len(entries)} clips available. Replace any mismatched clips now?",
+            default_yes=False,
+        )
+        if not should_review:
+            return
+
+        selected = self._select_multiple_clips(entries)
+        if selected is None:
+            self._set_status("Clip review cancelled.")
+            return
+        if not selected:
+            self._set_status("No clips selected for replacement.")
+            return
+
+        chosen_names = [str(entries[index].get("clip_name") or "").strip() for index in selected]
+        chosen_names = [name for name in chosen_names if name]
+        if not chosen_names:
+            self._set_status("No valid clip names selected for replacement.")
+            return
+
+        keywords_default = ", ".join(self.config.asset_keywords)
+        keywords_value = self._prompt_input("Replacement keywords (optional)", keywords_default)
+        if keywords_value is not None:
+            parsed = [part.strip() for part in re.split(r"[,;\n]+", keywords_value) if part.strip()]
+            normalized = self._normalize_asset_keywords(parsed)
+            if normalized:
+                self.config.asset_keywords = normalized
+                self._append_log(f"Replacement keywords set: {', '.join(self.config.asset_keywords)}")
+
+        self._start_replace_clips_workflow(project_dir, chosen_names)
+
+    def _load_clip_catalog_entries(self, project_dir: Path) -> list[dict[str, str]]:
+        clip_catalog_path = project_dir / "review" / "clip_catalog.json"
+        if not clip_catalog_path.exists():
+            return []
+
+        try:
+            payload = json.loads(clip_catalog_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"WARN: Could not parse clip catalog {clip_catalog_path}: {exc}")
+            return []
+
+        clips = payload.get("clips") if isinstance(payload, dict) else None
+        if not isinstance(clips, list):
+            return []
+
+        entries: list[dict[str, str]] = []
+        for item in clips:
+            if not isinstance(item, dict):
+                continue
+
+            clip_name = str(item.get("clip_name") or "").strip()
+            if not clip_name:
+                continue
+            if clip_name in {"intro-card", "outro-card"}:
+                continue
+
+            heading = str(item.get("heading") or "").strip() or "(untitled scene)"
+            provider = str(item.get("asset_provider") or "").strip()
+            scene_id = str(item.get("scene_id") or "").strip()
+            entries.append(
+                {
+                    "clip_name": clip_name,
+                    "heading": heading,
+                    "provider": provider,
+                    "scene_id": scene_id,
+                }
+            )
+
+        return entries
+
+    def _prompt_yes_no(self, title: str, body: str, default_yes: bool = False) -> bool:
+        if self._stdscr is None:
+            return default_yes
+
+        stdscr = self._stdscr
+        height, width = stdscr.getmaxyx()
+        modal_width = min(max(52, len(body) + 8), max(18, width - 2))
+        modal_height = 8
+        if modal_width < 18 or height < modal_height + 1:
+            return default_yes
+
+        top = max(0, (height - modal_height) // 2)
+        left = max(0, (width - modal_width) // 2)
+        win = curses.newwin(modal_height, modal_width, top, left)
+        win.keypad(True)
+        win.nodelay(False)
+        win.timeout(-1)
+
+        while True:
+            self._draw()
+            win.erase()
+            try:
+                win.box()
+            except curses.error:
+                pass
+
+            title_text = self._trim_tail(f" {title} ", max(1, modal_width - 4))
+            body_text = self._trim_tail(body, modal_width - 4)
+            if default_yes:
+                hint = "Enter yes | N no | Esc cancel"
+            else:
+                hint = "Y yes | Enter no | Esc cancel"
+
+            try:
+                win.addstr(0, 2, title_text, self._attr("accent", bold=True))
+                win.addstr(3, 2, body_text)
+                win.addstr(modal_height - 1, 2, self._trim_tail(hint, modal_width - 4), self._attr("muted"))
+            except curses.error:
+                pass
+
+            win.refresh()
+            key = win.getch()
+            if key in (27, ord("n"), ord("N")):
+                return False
+            if key in (ord("y"), ord("Y")):
+                return True
+            if key in (10, 13, curses.KEY_ENTER):
+                return default_yes
+
+    def _select_multiple_clips(self, entries: list[dict[str, str]]) -> list[int] | None:
+        if self._stdscr is None:
+            return None
+        if not entries:
+            return []
+
+        stdscr = self._stdscr
+        selected: set[int] = set()
+        cursor = 0
+        start_index = 0
+
+        while True:
+            self._draw()
+            height, width = stdscr.getmaxyx()
+
+            max_name_len = 0
+            for item in entries:
+                clip_name = str(item.get("clip_name") or "")
+                heading = str(item.get("heading") or "")
+                candidate = f"[ ] {clip_name} | {heading}"
+                max_name_len = max(max_name_len, len(candidate))
+
+            modal_width = min(max(64, max_name_len + 4), max(20, width - 2))
+            max_modal_height = max(10, height - 2)
+            visible_rows = max(1, max_modal_height - 4)
+            list_rows = min(len(entries), visible_rows)
+            modal_height = list_rows + 4
+
+            top = max(0, (height - modal_height) // 2)
+            left = max(0, (width - modal_width) // 2)
+
+            win = curses.newwin(modal_height, modal_width, top, left)
+            win.keypad(True)
+            win.nodelay(False)
+            win.timeout(-1)
+
+            if cursor < start_index:
+                start_index = cursor
+            elif cursor >= start_index + list_rows:
+                start_index = cursor - list_rows + 1
+
+            win.erase()
+            try:
+                win.box()
+            except curses.error:
+                pass
+
+            title = self._trim_tail(" Replace Clips ", max(1, modal_width - 4))
+            footer = "Space mark | Enter replace | Esc cancel"
+            try:
+                win.addstr(0, 2, title, self._attr("accent", bold=True))
+                win.addstr(modal_height - 1, 2, self._trim_tail(footer, modal_width - 4), self._attr("muted"))
+            except curses.error:
+                pass
+
+            for row in range(list_rows):
+                index = start_index + row
+                if index >= len(entries):
+                    break
+                item = entries[index]
+                clip_name = str(item.get("clip_name") or "")
+                heading = str(item.get("heading") or "")
+                mark = "[x]" if index in selected else "[ ]"
+                line = self._trim_tail(f"{mark} {clip_name} | {heading}", modal_width - 2)
+                attr = curses.A_REVERSE if index == cursor else 0
+                try:
+                    win.addstr(1 + row, 1, line, attr)
+                except curses.error:
+                    pass
+
+            win.refresh()
+            key = win.getch()
+
+            if key in (curses.KEY_UP, ord("k"), ord("K")):
+                cursor = (cursor - 1) % len(entries)
+                continue
+            if key in (curses.KEY_DOWN, ord("j"), ord("J")):
+                cursor = (cursor + 1) % len(entries)
+                continue
+            if key == ord(" "):
+                if cursor in selected:
+                    selected.remove(cursor)
+                else:
+                    selected.add(cursor)
+                continue
+            if key in (10, 13, curses.KEY_ENTER):
+                return sorted(selected)
+            if key == 27:
+                return None
+
+    def _start_replace_clips_workflow(self, project_dir: Path, clip_names: list[str]) -> None:
+        if self._is_running():
+            self._set_status("A command is already running.")
+            return
+
+        chosen = [str(name).strip() for name in clip_names if str(name).strip()]
+        if not chosen:
+            self._set_status("No clip names selected for replacement.")
+            return
+
+        self._active_project_dir = project_dir
+        self._pending_export_path = self._downloads_export_mp4_path(project_dir)
+
+        self._mark_command_start(workflow_kind="replace")
+        self._set_running(True)
+        self._set_status(f"Replacing {len(chosen)} clip(s) in {project_dir.name}...")
+        self._worker = threading.Thread(target=self._replace_clips_workflow, args=(chosen,), daemon=True)
+        self._worker.start()
+
+    def _replace_clips_workflow(self, clip_names: list[str]) -> None:
+        try:
+            self._refresh_stock_key_cache()
+            if not self._passes_asset_hard_guard_precheck():
+                self._set_status("Hard guard: missing stock API keys. Replacement blocked.")
+                return
+
+            replace_code = self._run_and_stream(self._build_replace_clips_command(clip_names), label="replace")
+            if replace_code == 0:
+                self._set_status("Replacement succeeded. Inspecting outputs...")
+                inspect_code = self._run_and_stream(self._build_inspect_command(), label="inspect")
+                exported_mp4 = self._export_final_mp4_to_downloads()
+
+                if inspect_code == 0 and exported_mp4 is not None:
+                    self._set_status(f"Replacement complete. MP4 exported to {exported_mp4.name}.")
+                elif inspect_code == 0:
+                    self._set_status("Replacement complete. MP4 export skipped.")
+                else:
+                    self._set_status(f"Replacement succeeded, inspect failed with exit code {inspect_code}.")
+
+                if self._active_project_dir is not None:
+                    clip_catalog = self._active_project_dir / "review" / "clip_catalog.json"
+                    if clip_catalog.exists():
+                        self._append_log(f"Clip catalog: {clip_catalog}")
+                        self._queue_clip_review_prompt(self._active_project_dir)
+            else:
+                queued_unique_prompt = self._queue_unique_asset_prompt_from_run_report()
+                if queued_unique_prompt:
+                    self._set_status("Replacement paused: broaden asset keywords to unlock more unique clips.")
+                else:
+                    self._set_status(f"Replacement failed with exit code {replace_code}.")
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"ERROR: {exc}")
+            self._set_status("Replacement failed before completion.")
+        finally:
+            self._mark_command_stop()
+            self._set_running(False)
+
+    def _build_replace_clips_command(self, clip_names: list[str]) -> list[str]:
+        project_dir = self._active_project_dir or self._latest_project_workspace()
+        if project_dir is None:
+            project_dir = self.config.project_dir
+
+        normalized = [str(name).strip().lower() for name in clip_names if str(name).strip()]
+        command = [
+            sys.executable,
+            "-m",
+            "local_video_mvp.cli",
+            "replace-clips",
+            "--project-dir",
+            str(project_dir),
+            "--clip-names",
+            *normalized,
+            "--require-external-assets",
+            "--verbose",
+        ]
+
+        if self.config.asset_keywords:
+            command.extend(["--asset-keywords", ", ".join(self.config.asset_keywords)])
+
+        return command
 
     def _elapsed_seconds(self) -> float:
         with self._lock:

@@ -138,6 +138,8 @@ TUI shortcut focus for now:
 - `C` opens workspace cleanup, where you mark folders and press Enter to delete.
 - `Q` exits the TUI.
 
+After successful generation, TUI can open a clip-review modal so you can select clip names from `review/clip_catalog.json` and replace only those visuals.
+
 Current voice picker scope:
 
 - language picker is restricted to `EN` for now
@@ -207,6 +209,11 @@ local-video-mvp run \
   --verbose
 
 local-video-mvp inspect --project-dir ./projects/demo
+
+local-video-mvp replace-clips \
+  --project-dir ./projects/demo \
+  --clip-names 03-why-lidar-fusion-matters 07-common-mistakes \
+  --asset-keywords "autonomous vehicles, sensors, traffic"
 
 trap - EXIT INT TERM
 cleanup

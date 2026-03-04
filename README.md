@@ -240,6 +240,8 @@ Key bindings:
 - `C`: clean old auto-managed workspaces (mark with Space, delete with Enter)
 - `Q`: quit (stops active run first)
 
+After a successful run, the TUI can open a floating clip-review modal from `review/clip_catalog.json` so you can mark mismatched clip names and replace only those visuals.
+
 Current MVP voice picker scope:
 
 - language picker supports `EN` only for now
@@ -296,6 +298,15 @@ Inspect quickly:
 
 ```bash
 local-video-mvp inspect --project-dir ./projects/diffusion-v1
+```
+
+Replace specific clips by name (without regenerating narration/script):
+
+```bash
+local-video-mvp replace-clips \
+  --project-dir ./projects/diffusion-v1 \
+  --clip-names 03-why-lidar-fusion-matters 07-common-mistakes \
+  --asset-keywords "autonomous vehicles, sensors, traffic"
 ```
 
 If stock API keys are missing, the report warns that placeholder visuals were used.
