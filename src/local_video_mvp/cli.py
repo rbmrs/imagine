@@ -99,6 +99,16 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="Run the full generation pipeline")
     run.add_argument("--prompt", required=True, help="Video prompt/topic")
     run.add_argument(
+        "--workflow-stage",
+        choices=["full", "draft", "review", "preview", "finalize"],
+        default="full",
+        help="Workflow stage to execute (default: full)",
+    )
+    run.add_argument(
+        "--review-script-json",
+        help="Optional JSON file used when --workflow-stage review",
+    )
+    run.add_argument(
         "--asset-keywords",
         default="",
         help="Comma-separated keywords to constrain stock footage search queries",
@@ -367,24 +377,58 @@ def run_command(args: argparse.Namespace) -> int:
     )
 
     pipeline = VideoPipeline(config)
-    outputs = pipeline.run()
+    workflow_stage = str(args.workflow_stage).strip().lower()
+    if workflow_stage == "full":
+        outputs = pipeline.run()
+        heading = "Pipeline completed successfully"
+    elif workflow_stage == "draft":
+        outputs = pipeline.run_draft()
+        heading = "Draft stage completed successfully"
+    elif workflow_stage == "review":
+        review_json_path = Path(args.review_script_json).expanduser().resolve() if args.review_script_json else None
+        outputs = pipeline.run_review(review_script_path=review_json_path)
+        heading = "Review stage completed successfully"
+    elif workflow_stage == "preview":
+        outputs = pipeline.run_preview()
+        heading = "Preview stage completed successfully"
+    elif workflow_stage == "finalize":
+        outputs = pipeline.run_finalize()
+        heading = "Finalize stage completed successfully"
+    else:
+        raise RuntimeError(f"Unsupported workflow stage: {workflow_stage}")
 
-    print("\nPipeline completed successfully:\n")
-    for key in (
+    print(f"\n{heading}:\n")
+    preferred_keys = (
         "project_dir",
         "script",
+        "approved_script",
         "timeline",
         "clip_catalog",
+        "narration_txt",
         "narration",
         "captions",
         "captions_ass",
+        "preview_mp4",
+        "preview_srt",
         "final_mp4",
         "final_srt",
         "manifest",
         "run_log",
         "run_report",
-    ):
-        print(f"- {key}: {outputs[key]}")
+    )
+    printed: set[str] = set()
+    for key in preferred_keys:
+        value = outputs.get(key)
+        if value:
+            print(f"- {key}: {value}")
+            printed.add(key)
+
+    for key in sorted(outputs.keys()):
+        if key in printed:
+            continue
+        value = outputs.get(key)
+        if value:
+            print(f"- {key}: {value}")
     return 0
 
 

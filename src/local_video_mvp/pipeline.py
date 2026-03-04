@@ -262,6 +262,224 @@ class VideoPipeline:
             "run_report": str(self.paths["run_report"].resolve()),
         }
 
+    def run_draft(self) -> dict[str, str]:
+        self._reset_run_state()
+        self._started_at = dt.datetime.now(dt.timezone.utc)
+        self._prepare_dirs()
+        self._log("Preparing project directories")
+
+        outputs: dict[str, str] = {}
+        try:
+            self._check_dependencies()
+            self._write_text(self.paths["prompt"], self.config.prompt.strip() + "\n")
+            plan = self.run_draft_stage()
+            self._write_json(self.paths["approved_script"], plan.to_dict())
+
+            outputs = {
+                "project_dir": str(self.config.project_dir.resolve()),
+                "script": str(self.paths["script"].resolve()),
+                "approved_script": str(self.paths["approved_script"].resolve()),
+                "narration_txt": str(self.paths["narration_txt"].resolve()),
+                "narration": str(self.paths["narration_wav"].resolve()),
+                "run_log": str(self.paths["run_log"].resolve()),
+                "run_report": str(self.paths["run_report"].resolve()),
+            }
+
+            self._finished_at = dt.datetime.now(dt.timezone.utc)
+            self._write_run_report(status="success", outputs=outputs)
+            self._log("Done")
+            return outputs
+        except Exception as exc:
+            self._finished_at = dt.datetime.now(dt.timezone.utc)
+            self._log_with_level(f"Pipeline failed: {exc}", level="ERROR")
+            self._write_run_report(status="failed", outputs=outputs, error=str(exc))
+            raise
+
+    def run_review(self, review_script_path: Path | None = None) -> dict[str, str]:
+        self._reset_run_state()
+        self._started_at = dt.datetime.now(dt.timezone.utc)
+        self._prepare_dirs()
+        self._log("Preparing project directories")
+
+        outputs: dict[str, str] = {}
+        try:
+            plan = self._load_existing_script_plan()
+            if review_script_path is not None:
+                source_path = review_script_path.expanduser().resolve()
+                if not source_path.exists():
+                    raise RuntimeError(f"Review script file not found: {source_path}")
+                payload = json.loads(source_path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    raise RuntimeError("Review script JSON must be an object")
+                plan = self._normalize_script_plan(payload)
+
+            self._write_json(self.paths["script"], plan.to_dict())
+            self._write_json(self.paths["approved_script"], plan.to_dict())
+
+            outputs = {
+                "project_dir": str(self.config.project_dir.resolve()),
+                "script": str(self.paths["script"].resolve()),
+                "approved_script": str(self.paths["approved_script"].resolve()),
+                "run_log": str(self.paths["run_log"].resolve()),
+                "run_report": str(self.paths["run_report"].resolve()),
+            }
+
+            self._finished_at = dt.datetime.now(dt.timezone.utc)
+            self._write_run_report(status="success", outputs=outputs)
+            self._log("Done")
+            return outputs
+        except Exception as exc:
+            self._finished_at = dt.datetime.now(dt.timezone.utc)
+            self._log_with_level(f"Pipeline failed: {exc}", level="ERROR")
+            self._write_run_report(status="failed", outputs=outputs, error=str(exc))
+            raise
+
+    def run_preview(self) -> dict[str, str]:
+        self._reset_run_state()
+        self._started_at = dt.datetime.now(dt.timezone.utc)
+        self._prepare_dirs()
+        self._log("Preparing project directories")
+
+        outputs: dict[str, str] = {}
+        try:
+            self._check_dependencies()
+            self._write_text(self.paths["prompt"], self.config.prompt.strip() + "\n")
+
+            plan = self._load_preferred_script_plan()
+            self._write_json(self.paths["script"], plan.to_dict())
+            self._ensure_narration_for_plan(plan)
+
+            stage = self.run_preview_stage(plan)
+            rights = list(stage["rights"])
+            timeline = list(stage["timeline"])
+
+            def render_preview_stage() -> None:
+                self._render_video(timeline, self.paths["narration_wav"], self.paths["preview_mp4"])
+                shutil.copy2(self.paths["captions"], self.paths["preview_srt"])
+
+            self._run_stage("preview_render", "Stage 6/7: Rendering preview video", render_preview_stage)
+            manifest = self._run_stage(
+                "manifest",
+                "Stage 7/7: Writing rights manifest",
+                lambda: self._build_manifest(plan, rights),
+            )
+            self._write_json(self.paths["manifest"], manifest)
+
+            outputs = {
+                "project_dir": str(self.config.project_dir.resolve()),
+                "script": str(self.paths["script"].resolve()),
+                "approved_script": str(self.paths["approved_script"].resolve()) if self.paths["approved_script"].exists() else "",
+                "timeline": str(self.paths["timeline"].resolve()),
+                "clip_catalog": str(self.paths["clip_catalog"].resolve()),
+                "narration": str(self.paths["narration_wav"].resolve()),
+                "captions": str(self.paths["captions"].resolve()),
+                "captions_ass": str(self.paths["captions_ass"].resolve()),
+                "preview_mp4": str(self.paths["preview_mp4"].resolve()),
+                "preview_srt": str(self.paths["preview_srt"].resolve()),
+                "manifest": str(self.paths["manifest"].resolve()),
+                "run_log": str(self.paths["run_log"].resolve()),
+                "run_report": str(self.paths["run_report"].resolve()),
+            }
+
+            self._finished_at = dt.datetime.now(dt.timezone.utc)
+            self._write_run_report(status="success", outputs=outputs)
+            self._log("Done")
+            return outputs
+        except Exception as exc:
+            self._finished_at = dt.datetime.now(dt.timezone.utc)
+            self._log_with_level(f"Pipeline failed: {exc}", level="ERROR")
+            self._write_run_report(status="failed", outputs=outputs, error=str(exc))
+            raise
+
+    def run_finalize(self) -> dict[str, str]:
+        self._reset_run_state()
+        self._started_at = dt.datetime.now(dt.timezone.utc)
+        self._prepare_dirs()
+        self._log("Preparing project directories")
+
+        outputs: dict[str, str] = {}
+        try:
+            self._check_dependencies()
+            self._write_text(self.paths["prompt"], self.config.prompt.strip() + "\n")
+
+            plan = self._load_preferred_script_plan()
+            self._write_json(self.paths["script"], plan.to_dict())
+            self._ensure_narration_for_plan(plan)
+
+            rights = self._load_existing_rights()
+            can_reuse_assets = bool(rights) and all(
+                scene.asset_path and Path(scene.asset_path).exists() for scene in plan.scenes
+            )
+
+            if can_reuse_assets:
+                captions = self._run_stage(
+                    "captions",
+                    "Stage 4/7: Building captions",
+                    lambda: self._generate_captions(plan, self.paths["narration_wav"]),
+                )
+                intro_shift = self._intro_bookend_seconds()
+                if intro_shift > 0.0:
+                    captions = self._shift_captions(captions, intro_shift)
+                self._write_srt(self.paths["captions"], captions)
+                self._write_ass(self.paths["captions_ass"], captions)
+
+                timeline = self._run_stage(
+                    "timeline",
+                    "Stage 5/7: Building timeline",
+                    lambda: self._build_timeline(plan),
+                )
+                self._write_json(
+                    self.paths["timeline"],
+                    {
+                        "title": plan.title,
+                        "summary": plan.summary,
+                        "clips": [clip.to_dict() for clip in timeline],
+                        "total_seconds": round(sum(clip.seconds for clip in timeline), 3),
+                    },
+                )
+            else:
+                stage = self.run_preview_stage(plan)
+                rights = list(stage["rights"])
+                timeline = list(stage["timeline"])
+
+            outputs = self.run_finalize_stage(plan, rights=rights, timeline=timeline)
+
+            self._finished_at = dt.datetime.now(dt.timezone.utc)
+            self._write_run_report(status="success", outputs=outputs)
+            self._log("Done")
+            return outputs
+        except Exception as exc:
+            self._finished_at = dt.datetime.now(dt.timezone.utc)
+            self._log_with_level(f"Pipeline failed: {exc}", level="ERROR")
+            self._write_run_report(status="failed", outputs=outputs, error=str(exc))
+            raise
+
+    def _load_preferred_script_plan(self) -> ScriptPlan:
+        approved_path = self.paths["approved_script"]
+        if approved_path.exists():
+            return self._load_existing_script_plan(approved_path)
+        return self._load_existing_script_plan()
+
+    def _ensure_narration_for_plan(self, plan: ScriptPlan) -> None:
+        narration_wav = self.paths["narration_wav"]
+        if narration_wav.exists() and narration_wav.stat().st_size > 0:
+            return
+
+        self._initialize_duration_stats(plan)
+        narration_text = self._clean_narration_text(plan.narration_text())
+        self._write_text(self.paths["narration_txt"], narration_text + "\n")
+
+        def voice_stage() -> None:
+            self._synthesize_narration(narration_text, self.paths["narration_raw"])
+            self._normalize_audio(self.paths["narration_raw"], narration_wav)
+
+        self._run_stage("narration", "Stage 2/7: Synthesizing narration audio", voice_stage)
+        audio_duration = self._media_duration(narration_wav)
+        self._rebalance_scene_durations(plan, audio_duration)
+        self._update_duration_post_tts(plan, audio_duration, adjust_passes=0)
+        self._update_pacing_post_tts(narration_text, audio_duration, adjust_passes=0)
+        self._write_json(self.paths["script"], plan.to_dict())
+
     def replace_clips_by_name(self, clip_names: list[str]) -> dict[str, str]:
         self._reset_run_state()
         self._started_at = dt.datetime.now(dt.timezone.utc)
@@ -404,6 +622,9 @@ class VideoPipeline:
             "captions_ass": project_dir / "captions.ass",
             "timeline": project_dir / "timeline.json",
             "clip_catalog": project_dir / "review" / "clip_catalog.json",
+            "approved_script": project_dir / "review" / "script_approved.json",
+            "preview_mp4": project_dir / "review" / "preview.mp4",
+            "preview_srt": project_dir / "review" / "preview.srt",
             "manifest": project_dir / "rights_manifest.json",
             "run_log": project_dir / "run.log",
             "run_report": project_dir / "run_report.json",
@@ -623,12 +844,12 @@ class VideoPipeline:
         used.add(candidate)
         return candidate
 
-    def _load_existing_script_plan(self) -> ScriptPlan:
-        script_path = self.paths["script"]
-        if not script_path.exists():
-            raise RuntimeError(f"script.json not found at {script_path}")
+    def _load_existing_script_plan(self, script_path: Path | None = None) -> ScriptPlan:
+        source_path = script_path.expanduser().resolve() if script_path is not None else self.paths["script"]
+        if not source_path.exists():
+            raise RuntimeError(f"script.json not found at {source_path}")
 
-        payload = json.loads(script_path.read_text(encoding="utf-8"))
+        payload = json.loads(source_path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise RuntimeError("script.json is invalid: expected top-level JSON object")
 
