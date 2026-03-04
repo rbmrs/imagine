@@ -41,6 +41,9 @@ class LocalVideoMvpTui:
 
     def __init__(self, config: TuiConfig) -> None:
         self.config = config
+        self.config.project_dir = self.config.project_dir.expanduser().resolve()
+        self.config.project_dir.mkdir(parents=True, exist_ok=True)
+
         self._stdscr: Any = None
         self._repo_root = Path(__file__).resolve().parents[2]
 
@@ -57,6 +60,8 @@ class LocalVideoMvpTui:
         self._stage_index: float | None = None
         self._stage_total: int | None = None
         self._prior_total_seconds: float | None = None
+        self._active_project_dir: Path | None = None
+        self._pending_export_path: Path | None = None
 
         self._stock_api_keys: dict[str, str] = {}
         self._stock_key_sources: dict[str, str] = {}
@@ -168,6 +173,10 @@ class LocalVideoMvpTui:
             self._edit_parameters()
             return
 
+        if char in {"c", "C"}:
+            self._clean_projects()
+            return
+
     def _start_run_workflow(self) -> None:
         if self._is_running():
             self._set_status("A command is already running.")
@@ -177,9 +186,11 @@ class LocalVideoMvpTui:
         if not self._passes_asset_hard_guard_precheck():
             return
 
+        workspace = self._prepare_run_workspace()
+
         self._mark_command_start(workflow_kind="run")
         self._set_running(True)
-        self._set_status("Starting run workflow...")
+        self._set_status(f"Starting run workflow: {workspace.name}")
         self._worker = threading.Thread(target=self._run_workflow, daemon=True)
         self._worker.start()
 
@@ -288,6 +299,10 @@ class LocalVideoMvpTui:
             self._set_active_process(None)
 
     def _build_run_command(self) -> list[str]:
+        project_dir = self._active_project_dir
+        if project_dir is None:
+            project_dir = self._prepare_run_workspace()
+
         return [
             sys.executable,
             "-m",
@@ -296,7 +311,7 @@ class LocalVideoMvpTui:
             "--prompt",
             self.config.prompt,
             "--project-dir",
-            str(self.config.project_dir),
+            str(project_dir),
             "--minutes",
             str(self.config.minutes),
             "--resolution",
@@ -334,13 +349,17 @@ class LocalVideoMvpTui:
         ]
 
     def _build_inspect_command(self) -> list[str]:
+        project_dir = self._active_project_dir or self._latest_project_workspace()
+        if project_dir is None:
+            project_dir = self.config.project_dir
+
         return [
             sys.executable,
             "-m",
             "local_video_mvp.cli",
             "inspect",
             "--project-dir",
-            str(self.config.project_dir),
+            str(project_dir),
         ]
 
     def _ensure_ollama_running(self) -> None:
@@ -383,28 +402,28 @@ class LocalVideoMvpTui:
         title = f" Imagine TUI {spinner} "
         self._safe_addstr(0, 0, title, width, attr=self._attr("title", bold=True))
 
-        hint = "R Run  E Edit  Q Quit"
+        hint = "R Run  E Edit  C Clean  Q Quit"
         self._safe_addstr(1, 0, hint, width, attr=self._attr("muted"))
         self._safe_hline(2, width)
 
         self._draw_box(3, 0, 7, width, title=" Configuration ", attr=self._attr("accent"))
         self._safe_addstr(4, 2, f"Prompt : {self._trim_tail(self.config.prompt, width - 14)}", width)
-        self._safe_addstr(5, 2, f"Workspace: {self._trim_middle(str(self.config.project_dir), width - 16)}", width)
-        self._safe_addstr(6, 2, f"Minutes: {self.config.minutes}", width)
+        self._safe_addstr(5, 2, f"Minutes: {self.config.minutes}", width)
         self._safe_addstr(
-            7,
+            6,
             2,
             f"Voice  : {self.config.melo_language}/{self.config.melo_speaker}  "
             f"profile={self.config.voice_profile} speed={self.config.voice_speed:.2f}",
             width,
         )
         self._safe_addstr(
-            8,
+            7,
             2,
-            f"MP4 out: {self._trim_middle(str(self._downloads_export_mp4_path()), width - 13)}",
+            f"MP4 out: {self._trim_middle(str(self._mp4_output_preview_path()), width - 13)}",
             width,
             attr=self._attr("muted"),
         )
+        self._safe_addstr(8, 2, "Workspaces are auto-managed under ~/.imagine/projects", width, attr=self._attr("muted"))
 
         self._draw_box(10, 0, 6, width, title=" Runtime ", attr=self._attr("accent"))
         state_text, state_attr = self._state_display()
@@ -435,12 +454,11 @@ class LocalVideoMvpTui:
 
     def _draw_compact(self, height: int, width: int) -> None:
         self._safe_addstr(0, 0, "Imagine TUI", width, attr=self._attr("title", bold=True))
-        self._safe_addstr(1, 0, "R Run  E Edit  Q Quit", width, attr=self._attr("muted"))
+        self._safe_addstr(1, 0, "R Run  E Edit  C Clean  Q Quit", width, attr=self._attr("muted"))
         self._safe_addstr(3, 0, f"Prompt: {self._trim_tail(self.config.prompt, width - 8)}", width)
-        self._safe_addstr(4, 0, f"Workspace: {self._trim_middle(str(self.config.project_dir), width - 11)}", width)
-        self._safe_addstr(5, 0, f"Minutes: {self.config.minutes}", width)
+        self._safe_addstr(4, 0, f"Minutes: {self.config.minutes}", width)
         self._safe_addstr(
-            6,
+            5,
             0,
             self._trim_tail(
                 f"Voice: {self.config.melo_language}/{self.config.melo_speaker} "
@@ -449,18 +467,18 @@ class LocalVideoMvpTui:
             ),
             width,
         )
-        self._safe_addstr(7, 0, self._trim_tail(f"MP4: {self._downloads_export_mp4_path()}", width), width)
+        self._safe_addstr(6, 0, self._trim_tail(f"MP4: {self._mp4_output_preview_path()}", width), width)
         state_text, state_attr = self._state_display()
-        self._safe_addstr(9, 0, f"{state_text}", width, attr=state_attr)
-        self._safe_addstr(10, 0, self._trim_tail(self._progress_phase_text(), width), width)
+        self._safe_addstr(8, 0, f"{state_text}", width, attr=state_attr)
+        self._safe_addstr(9, 0, self._trim_tail(self._progress_phase_text(), width), width)
         assets_text, assets_attr = self._asset_status_display()
-        self._safe_addstr(11, 0, self._trim_tail(assets_text, width), width, attr=assets_attr)
-        self._safe_addstr(12, 0, self._trim_tail(self._get_status(), width), width)
+        self._safe_addstr(10, 0, self._trim_tail(assets_text, width), width, attr=assets_attr)
+        self._safe_addstr(11, 0, self._trim_tail(self._get_status(), width), width)
 
         logs = self._get_logs()
-        log_rows = max(1, height - 14)
+        log_rows = max(1, height - 13)
         for idx, line in enumerate(logs[-log_rows:]):
-            self._safe_addstr(14 + idx, 0, self._trim_tail(line, width), width, attr=self._log_line_attr(line))
+            self._safe_addstr(13 + idx, 0, self._trim_tail(line, width), width, attr=self._log_line_attr(line))
 
     def _state_display(self) -> tuple[str, int]:
         running = self._is_running()
@@ -762,10 +780,10 @@ class LocalVideoMvpTui:
                 self._set_status(message)
 
     def _refresh_prior_total_seconds(self) -> None:
-        report_path = self.config.project_dir / "run_report.json"
+        report_path = self._latest_run_report_path()
         prior_total: float | None = None
 
-        if report_path.exists():
+        if report_path is not None and report_path.exists():
             try:
                 payload = json.loads(report_path.read_text(encoding="utf-8"))
                 raw_total = payload.get("total_seconds")
@@ -782,25 +800,83 @@ class LocalVideoMvpTui:
         slug = slug.strip("-")
         return slug or "imagine"
 
-    def _downloads_export_mp4_path(self) -> Path:
+    def _iter_project_workspaces(self) -> list[Path]:
+        root = self.config.project_dir
+        if not root.exists():
+            return []
+
+        entries: list[Path] = []
+        for path in root.iterdir():
+            if path.is_dir():
+                entries.append(path)
+
+        entries.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+        return entries
+
+    def _latest_project_workspace(self) -> Path | None:
+        entries = self._iter_project_workspaces()
+        return entries[0] if entries else None
+
+    def _latest_run_report_path(self) -> Path | None:
+        for workspace in self._iter_project_workspaces():
+            report_path = workspace / "run_report.json"
+            if report_path.exists():
+                return report_path
+        return None
+
+    def _prepare_run_workspace(self) -> Path:
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+        prompt_slug = self._slugify(self.config.prompt)[:48]
+        base_name = f"{prompt_slug}-{stamp}"
+        candidate = self.config.project_dir / base_name
+        suffix = 1
+        while candidate.exists():
+            candidate = self.config.project_dir / f"{base_name}-{suffix:02d}"
+            suffix += 1
+
+        candidate.mkdir(parents=True, exist_ok=False)
+        self._active_project_dir = candidate
+        self._pending_export_path = self._downloads_export_mp4_path(candidate)
+        self._append_log(f"Run workspace: {candidate}")
+        self._append_log(f"Planned MP4 output: {self._pending_export_path}")
+        return candidate
+
+    def _downloads_export_mp4_path(self, project_dir: Path) -> Path:
         downloads_dir = (Path.home() / "Downloads").resolve()
-        project_name = self._slugify(self.config.project_dir.name)
+        project_name = self._slugify(project_dir.name)
         return downloads_dir / f"{project_name}.mp4"
 
+    def _mp4_output_preview_path(self) -> Path:
+        if self._pending_export_path is not None:
+            return self._pending_export_path
+
+        base_slug = self._slugify(self.config.prompt)
+        return (Path.home() / "Downloads" / f"{base_slug}-<timestamp>.mp4").resolve()
+
     def _export_final_mp4_to_downloads(self) -> Path | None:
-        source_mp4 = self.config.project_dir / "output" / "final.mp4"
+        project_dir = self._active_project_dir
+        if project_dir is None:
+            self._append_log("WARN: No active workspace found for MP4 export.")
+            return None
+
+        source_mp4 = project_dir / "output" / "final.mp4"
         if not source_mp4.exists():
             self._append_log(f"WARN: final.mp4 not found at {source_mp4}")
             return None
 
-        target_mp4 = self._downloads_export_mp4_path()
+        target_mp4 = self._downloads_export_mp4_path(project_dir)
         target_mp4.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_mp4, target_mp4)
+        self._pending_export_path = target_mp4
         self._append_log(f"Exported final MP4 to {target_mp4}")
         return target_mp4
 
     def _count_placeholder_scenes(self) -> int:
-        timeline_path = self.config.project_dir / "timeline.json"
+        project_dir = self._active_project_dir
+        if project_dir is None:
+            return 0
+
+        timeline_path = project_dir / "timeline.json"
         if not timeline_path.exists():
             return 0
 
@@ -862,7 +938,6 @@ class LocalVideoMvpTui:
 
         before = (
             self.config.prompt,
-            str(self.config.project_dir),
             self.config.minutes,
             self.config.melo_language,
             self.config.melo_speaker,
@@ -891,10 +966,6 @@ class LocalVideoMvpTui:
             except ValueError:
                 self._append_log("WARN: Minutes must be a positive integer. Keeping previous value.")
                 had_warning = True
-
-        project_dir_value = self._prompt_input("Project workspace dir", str(self.config.project_dir))
-        if project_dir_value is not None:
-            self.config.project_dir = Path(project_dir_value).expanduser().resolve()
 
         language_value = self._select_from_list(
             label="Melo language",
@@ -944,7 +1015,6 @@ class LocalVideoMvpTui:
 
         after = (
             self.config.prompt,
-            str(self.config.project_dir),
             self.config.minutes,
             self.config.melo_language,
             self.config.melo_speaker,
@@ -967,6 +1037,125 @@ class LocalVideoMvpTui:
             self._set_status("No parameter changes.")
         else:
             self._set_status("Parameters updated.")
+
+    def _clean_projects(self) -> None:
+        if self._is_running():
+            self._set_status("Cannot clean workspaces while run is in progress.")
+            return
+
+        workspaces = self._iter_project_workspaces()
+        if not workspaces:
+            self._set_status("No workspaces to clean.")
+            return
+
+        selected = self._select_multiple_workspaces(workspaces)
+        if selected is None:
+            self._set_status("Cleanup cancelled.")
+            return
+        if not selected:
+            self._set_status("No workspaces selected.")
+            return
+
+        deleted = 0
+        failed = 0
+        selected_paths = [workspaces[index] for index in selected]
+
+        for path in selected_paths:
+            try:
+                shutil.rmtree(path)
+                deleted += 1
+                self._append_log(f"Deleted workspace: {path}")
+                if self._active_project_dir is not None and path == self._active_project_dir:
+                    self._active_project_dir = None
+                    self._pending_export_path = None
+            except Exception as exc:  # noqa: BLE001
+                failed += 1
+                self._append_log(f"ERROR: Failed to delete workspace {path}: {exc}")
+
+        if failed > 0:
+            self._set_status(f"Cleanup finished: deleted {deleted}, failed {failed}.")
+        else:
+            self._set_status(f"Cleanup finished: deleted {deleted} workspace(s).")
+
+    def _select_multiple_workspaces(self, workspaces: list[Path]) -> list[int] | None:
+        if self._stdscr is None:
+            return None
+
+        stdscr = self._stdscr
+        selected: set[int] = set()
+        cursor = 0
+        start_index = 0
+
+        while True:
+            self._draw()
+            height, width = stdscr.getmaxyx()
+
+            max_name_len = max(len(path.name) for path in workspaces)
+            modal_width = min(max(56, max_name_len + 10), max(20, width - 2))
+            max_modal_height = max(8, height - 2)
+            visible_rows = max(1, max_modal_height - 4)
+            list_rows = min(len(workspaces), visible_rows)
+            modal_height = list_rows + 4
+
+            top = max(0, (height - modal_height) // 2)
+            left = max(0, (width - modal_width) // 2)
+
+            win = curses.newwin(modal_height, modal_width, top, left)
+            win.keypad(True)
+            win.nodelay(False)
+            win.timeout(-1)
+
+            if cursor < start_index:
+                start_index = cursor
+            elif cursor >= start_index + list_rows:
+                start_index = cursor - list_rows + 1
+
+            win.erase()
+            try:
+                win.box()
+            except curses.error:
+                pass
+
+            title = self._trim_tail(" Clean Workspaces ", max(1, modal_width - 4))
+            footer = "Space mark | Enter delete | Esc cancel"
+            try:
+                win.addstr(0, 2, title, self._attr("accent", bold=True))
+                win.addstr(modal_height - 1, 2, self._trim_tail(footer, modal_width - 4), self._attr("muted"))
+            except curses.error:
+                pass
+
+            for row in range(list_rows):
+                index = start_index + row
+                if index >= len(workspaces):
+                    break
+                path = workspaces[index]
+                mark = "[x]" if index in selected else "[ ]"
+                line = self._trim_tail(f"{mark} {path.name}", modal_width - 2)
+                attr = curses.A_REVERSE if index == cursor else 0
+                try:
+                    win.addstr(1 + row, 1, line, attr)
+                except curses.error:
+                    pass
+
+            win.refresh()
+            key = win.getch()
+
+            if key in (curses.KEY_UP, ord("k"), ord("K")):
+                cursor = (cursor - 1) % len(workspaces)
+                continue
+            if key in (curses.KEY_DOWN, ord("j"), ord("J")):
+                cursor = (cursor + 1) % len(workspaces)
+                continue
+            if key == ord(" "):
+                if cursor in selected:
+                    selected.remove(cursor)
+                else:
+                    selected.add(cursor)
+                continue
+            if key in (10, 13, curses.KEY_ENTER):
+                return sorted(selected)
+            if key == 27:
+                return None
 
     def _prompt_input(self, label: str, current_value: str) -> str | None:
         if self._stdscr is None:

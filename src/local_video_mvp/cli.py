@@ -190,8 +190,8 @@ def build_parser() -> argparse.ArgumentParser:
     tui.add_argument("--prompt", default="Autonomous cars", help="Initial prompt shown in the TUI")
     tui.add_argument(
         "--project-dir",
-        default=str((Path.home() / ".imagine" / "projects" / "autonomous-cars").resolve()),
-        help="Initial project directory",
+        default=str((Path.home() / ".imagine" / "projects").resolve()),
+        help="Projects root directory used for auto-managed run workspaces",
     )
     tui.add_argument("--minutes", type=int, default=2, help="Initial target duration in minutes")
     tui.add_argument(
@@ -539,7 +539,7 @@ def imagine_entry() -> int:
 
     return run_tui(
         prompt="Autonomous cars",
-        project_dir=(Path.home() / ".imagine" / "projects" / "autonomous-cars").resolve(),
+        project_dir=(Path.home() / ".imagine" / "projects").resolve(),
         minutes=2,
         voice_profile="calm-documentary",
         voice_speed=1.0,

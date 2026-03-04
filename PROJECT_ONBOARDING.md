@@ -121,19 +121,19 @@ imagine
 Default startup values:
 
 - prompt: `Autonomous cars`
-- project workspace: `~/.imagine/projects/autonomous-cars`
 - minutes: `2`
 - voice: `EN / EN-US`, profile `calm-documentary`, speed `1.0`
 
 Default storage behavior:
 
-- project artifacts and reports stay under `~/.imagine/projects/autonomous-cars`
-- TUI exports final video to `~/Downloads/autonomous-cars.mp4`
+- TUI auto-creates run workspaces under `~/.imagine/projects/<prompt-slug>-<timestamp>/`
+- TUI exports final video to `~/Downloads/<prompt-slug>-<timestamp>.mp4`
 
 TUI shortcut focus for now:
 
 - `R` runs the preferred full pipeline profile from this onboarding guide.
-- `E` edits prompt/duration/workspace/speed and uses list pickers for language/speaker/profile.
+- `E` edits prompt/duration/speed and uses list pickers for language/speaker/profile.
+- `C` opens workspace cleanup, where you mark folders and press Enter to delete.
 - `Q` exits the TUI.
 
 Current voice picker scope:

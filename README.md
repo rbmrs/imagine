@@ -203,21 +203,20 @@ imagine
 `imagine` opens the TUI with default values:
 
 - prompt: `Autonomous cars`
-- project workspace: `~/.imagine/projects/autonomous-cars`
 - minutes: `2`
 - voice: `EN / EN-US`, profile `calm-documentary`, speed `1.0`
 
 Storage behavior with TUI defaults:
 
-- full project artifacts/logs/reports stay under `~/.imagine/projects/autonomous-cars`
-- after a successful run, TUI exports only the final MP4 to `~/Downloads/autonomous-cars.mp4`
+- TUI auto-creates a run workspace under `~/.imagine/projects/<prompt-slug>-<timestamp>/`
+- after a successful run, TUI exports only the final MP4 to `~/Downloads/<prompt-slug>-<timestamp>.mp4`
 
 If you want custom startup values, you can still use:
 
 ```bash
 local-video-mvp tui \
   --prompt "Your topic" \
-  --project-dir ./projects/demo \
+  --project-dir ~/.imagine/projects \
   --minutes 5 \
   --melo-language EN \
   --melo-speaker EN-US \
@@ -228,7 +227,8 @@ local-video-mvp tui \
 Key bindings:
 
 - `R`: run the full pipeline using the preferred profile (`ollama`, `melo`, `faster-whisper`, strict mode)
-- `E`: edit parameters (`prompt`, `minutes`, `workspace`, `voice speed`) and choose from lists for language/speaker/profile
+- `E`: edit parameters (`prompt`, `minutes`, `voice speed`) and choose from lists for language/speaker/profile
+- `C`: clean old auto-managed workspaces (mark with Space, delete with Enter)
 - `Q`: quit (stops active run first)
 
 Current MVP voice picker scope:
