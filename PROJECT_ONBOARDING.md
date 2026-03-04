@@ -121,6 +121,7 @@ imagine
 Default startup values:
 
 - prompt: `Autonomous cars`
+- asset keywords: `cars, roads`
 - minutes: `2`
 - voice: `EN / EN-US`, profile `calm-documentary`, speed `1.0`
 
@@ -128,11 +129,12 @@ Default storage behavior:
 
 - TUI auto-creates run workspaces under `~/.imagine/projects/<prompt-slug>-<timestamp>/`
 - TUI exports final video to `~/Downloads/<prompt-slug>-<timestamp>.mp4`
+- intro/outro cards reuse extracted background frames from resolved scene assets when available
 
 TUI shortcut focus for now:
 
 - `R` runs the preferred full pipeline profile from this onboarding guide.
-- `E` edits prompt/duration/speed and uses list pickers for language/speaker/profile.
+- `E` edits prompt/asset-keywords/duration/speed and uses list pickers for language/speaker/profile.
 - `C` opens workspace cleanup, where you mark folders and press Enter to delete.
 - `Q` exits the TUI.
 
@@ -184,6 +186,7 @@ fi
 
 local-video-mvp run \
   --prompt "Your topic" \
+  --asset-keywords "cars, roads" \
   --project-dir ./projects/demo \
   --minutes 5 \
   --resolution 1280x720 \

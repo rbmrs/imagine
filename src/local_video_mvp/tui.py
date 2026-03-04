@@ -23,6 +23,7 @@ from typing import Any, Deque, TextIO
 @dataclass
 class TuiConfig:
     prompt: str
+    asset_keywords: list[str]
     project_dir: Path
     minutes: int
     voice_profile: str
@@ -41,6 +42,7 @@ class LocalVideoMvpTui:
 
     def __init__(self, config: TuiConfig) -> None:
         self.config = config
+        self.config.asset_keywords = self._normalize_asset_keywords(self.config.asset_keywords)
         self.config.project_dir = self.config.project_dir.expanduser().resolve()
         self.config.project_dir.mkdir(parents=True, exist_ok=True)
 
@@ -303,7 +305,7 @@ class LocalVideoMvpTui:
         if project_dir is None:
             project_dir = self._prepare_run_workspace()
 
-        return [
+        command = [
             sys.executable,
             "-m",
             "local_video_mvp.cli",
@@ -347,6 +349,11 @@ class LocalVideoMvpTui:
             "--require-external-assets",
             "--verbose",
         ]
+
+        if self.config.asset_keywords:
+            command.extend(["--asset-keywords", ", ".join(self.config.asset_keywords)])
+
+        return command
 
     def _build_inspect_command(self) -> list[str]:
         project_dir = self._active_project_dir or self._latest_project_workspace()
@@ -393,7 +400,7 @@ class LocalVideoMvpTui:
         stdscr.erase()
         height, width = stdscr.getmaxyx()
 
-        if width < 50 or height < 19:
+        if width < 50 or height < 20:
             self._draw_compact(height, width)
             stdscr.refresh()
             return
@@ -423,7 +430,8 @@ class LocalVideoMvpTui:
             width,
             attr=self._attr("muted"),
         )
-        self._safe_addstr(8, 2, "Workspaces are auto-managed under ~/.imagine/projects", width, attr=self._attr("muted"))
+        keywords_text = ", ".join(self.config.asset_keywords) if self.config.asset_keywords else "(auto from script scenes)"
+        self._safe_addstr(8, 2, f"Keywords: {self._trim_tail(keywords_text, width - 14)}", width, attr=self._attr("muted"))
 
         self._draw_box(10, 0, 6, width, title=" Runtime ", attr=self._attr("accent"))
         state_text, state_attr = self._state_display()
@@ -468,17 +476,19 @@ class LocalVideoMvpTui:
             width,
         )
         self._safe_addstr(6, 0, self._trim_tail(f"MP4: {self._mp4_output_preview_path()}", width), width)
+        keywords_text = ", ".join(self.config.asset_keywords) if self.config.asset_keywords else "(auto scenes)"
+        self._safe_addstr(7, 0, self._trim_tail(f"Keywords: {keywords_text}", width), width)
         state_text, state_attr = self._state_display()
-        self._safe_addstr(8, 0, f"{state_text}", width, attr=state_attr)
-        self._safe_addstr(9, 0, self._trim_tail(self._progress_phase_text(), width), width)
+        self._safe_addstr(9, 0, f"{state_text}", width, attr=state_attr)
+        self._safe_addstr(10, 0, self._trim_tail(self._progress_phase_text(), width), width)
         assets_text, assets_attr = self._asset_status_display()
-        self._safe_addstr(10, 0, self._trim_tail(assets_text, width), width, attr=assets_attr)
-        self._safe_addstr(11, 0, self._trim_tail(self._get_status(), width), width)
+        self._safe_addstr(11, 0, self._trim_tail(assets_text, width), width, attr=assets_attr)
+        self._safe_addstr(12, 0, self._trim_tail(self._get_status(), width), width)
 
         logs = self._get_logs()
-        log_rows = max(1, height - 13)
+        log_rows = max(1, height - 14)
         for idx, line in enumerate(logs[-log_rows:]):
-            self._safe_addstr(13 + idx, 0, self._trim_tail(line, width), width, attr=self._log_line_attr(line))
+            self._safe_addstr(14 + idx, 0, self._trim_tail(line, width), width, attr=self._log_line_attr(line))
 
     def _state_display(self) -> tuple[str, int]:
         running = self._is_running()
@@ -800,6 +810,20 @@ class LocalVideoMvpTui:
         slug = slug.strip("-")
         return slug or "imagine"
 
+    def _normalize_asset_keywords(self, raw: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            value = str(item).strip()
+            if not value:
+                continue
+            lowered = value.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            out.append(value)
+        return out[:8]
+
     def _iter_project_workspaces(self) -> list[Path]:
         root = self.config.project_dir
         if not root.exists():
@@ -938,6 +962,7 @@ class LocalVideoMvpTui:
 
         before = (
             self.config.prompt,
+            tuple(self.config.asset_keywords),
             self.config.minutes,
             self.config.melo_language,
             self.config.melo_speaker,
@@ -955,6 +980,13 @@ class LocalVideoMvpTui:
             else:
                 self._append_log("WARN: Prompt cannot be empty. Keeping previous value.")
                 had_warning = True
+
+        keyword_default = ", ".join(self.config.asset_keywords)
+        keyword_value = self._prompt_input("Asset keywords (comma-separated)", keyword_default)
+        if keyword_value is not None:
+            self.config.asset_keywords = self._normalize_asset_keywords(
+                [part.strip() for part in re.split(r"[,;\n]+", keyword_value) if part.strip()]
+            )
 
         minutes_value = self._prompt_input("Minutes", str(self.config.minutes))
         if minutes_value is not None:
@@ -1015,6 +1047,7 @@ class LocalVideoMvpTui:
 
         after = (
             self.config.prompt,
+            tuple(self.config.asset_keywords),
             self.config.minutes,
             self.config.melo_language,
             self.config.melo_speaker,
@@ -1027,6 +1060,7 @@ class LocalVideoMvpTui:
             self._append_log(
                 "Updated config: "
                 f"minutes={self.config.minutes}, "
+                f"keywords={','.join(self.config.asset_keywords) if self.config.asset_keywords else 'auto'}, "
                 f"voice={self.config.melo_language}/{self.config.melo_speaker}, "
                 f"profile={self.config.voice_profile}, speed={self.config.voice_speed:.2f}"
             )
@@ -1474,6 +1508,7 @@ class LocalVideoMvpTui:
 
 def run_tui(
     prompt: str,
+    asset_keywords: list[str],
     project_dir: Path,
     minutes: int,
     voice_profile: str,
@@ -1487,6 +1522,7 @@ def run_tui(
 
     config = TuiConfig(
         prompt=prompt,
+        asset_keywords=[str(item).strip() for item in (asset_keywords or []) if str(item).strip()],
         project_dir=project_dir,
         minutes=max(1, minutes),
         voice_profile=voice_profile,

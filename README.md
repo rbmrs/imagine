@@ -103,6 +103,7 @@ Then run:
 ```bash
 local-video-mvp run \
   --prompt "Explain how diffusion models work for beginners" \
+  --asset-keywords "cars, roads" \
   --project-dir ./projects/diffusion-v1 \
   --minutes 5 \
   --resolution 1280x720 \
@@ -135,6 +136,11 @@ Voice pacing defaults to `calm-documentary`. You can switch later with:
 - `--voice-profile energetic-explainer`
 
 Pause boundaries are automatically refined to avoid awkward breaks before tiny trailing words and after common function words.
+
+Asset relevance control:
+
+- `--asset-keywords "cars, roads"` constrains footage search to those terms
+- when keywords are set, stock queries always include them
 
 Video effects presets (long-form safe):
 
@@ -203,6 +209,7 @@ imagine
 `imagine` opens the TUI with default values:
 
 - prompt: `Autonomous cars`
+- asset keywords: `cars, roads`
 - minutes: `2`
 - voice: `EN / EN-US`, profile `calm-documentary`, speed `1.0`
 
@@ -216,6 +223,7 @@ If you want custom startup values, you can still use:
 ```bash
 local-video-mvp tui \
   --prompt "Your topic" \
+  --asset-keywords "cars, roads" \
   --project-dir ~/.imagine/projects \
   --minutes 5 \
   --melo-language EN \
@@ -227,7 +235,7 @@ local-video-mvp tui \
 Key bindings:
 
 - `R`: run the full pipeline using the preferred profile (`ollama`, `melo`, `faster-whisper`, strict mode)
-- `E`: edit parameters (`prompt`, `minutes`, `voice speed`) and choose from lists for language/speaker/profile
+- `E`: edit parameters (`prompt`, `asset keywords`, `minutes`, `voice speed`) and choose from lists for language/speaker/profile
 - `C`: clean old auto-managed workspaces (mark with Space, delete with Enter)
 - `Q`: quit (stops active run first)
 

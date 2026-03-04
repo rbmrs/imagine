@@ -74,6 +74,8 @@ class VideoPipeline:
         self.duration_stats: dict[str, Any] = {}
         self.pacing_stats: dict[str, Any] = {}
         self.used_template_fallback = False
+        self._intro_bookend_background: Path | None = None
+        self._outro_bookend_background: Path | None = None
         self._ollama_ready = False
         self._started_at: dt.datetime | None = None
         self._finished_at: dt.datetime | None = None
@@ -168,6 +170,7 @@ class VideoPipeline:
 
             rights = self._run_stage("assets", "Stage 3/7: Resolving visual assets", lambda: self._resolve_assets(plan))
             self._write_json(self.paths["script"], plan.to_dict())
+            self._prepare_bookend_backgrounds(plan)
 
             captions = self._run_stage(
                 "captions",
@@ -1400,61 +1403,68 @@ class VideoPipeline:
                 raise RuntimeError(message + " --require-external-assets is enabled.")
             self._warn(message + " Using generated placeholders.")
 
+        if self.config.asset_keywords:
+            self._log(f"Asset keyword constraint enabled: {', '.join(self.config.asset_keywords)}")
+
         for scene in plan.scenes:
-            query = self._query_for_scene(scene)
+            queries = self._queries_for_scene(scene)
             resolved = False
             for provider_name, api_key in provider_order:
                 if not api_key:
                     continue
 
-                cache_key = (provider_name, query.lower())
-                candidate = query_cache.get(cache_key)
-                if cache_key not in query_cache:
-                    candidate = None
-                    try:
-                        if provider_name == "pexels":
-                            candidate = self._search_pexels_video(scene, api_key, query=query)
-                        elif provider_name == "pixabay":
-                            candidate = self._search_pixabay_video(scene, api_key, query=query)
-                    except Exception as exc:
-                        self._log(f"{provider_name} search failed for {scene.scene_id}: {exc}")
+                for query in queries:
+                    cache_key = (provider_name, query.lower())
+                    candidate = query_cache.get(cache_key)
+                    if cache_key not in query_cache:
                         candidate = None
+                        try:
+                            if provider_name == "pexels":
+                                candidate = self._search_pexels_video(scene, api_key, query=query)
+                            elif provider_name == "pixabay":
+                                candidate = self._search_pixabay_video(scene, api_key, query=query)
+                        except Exception as exc:
+                            self._log(f"{provider_name} search failed for {scene.scene_id} ({query}): {exc}")
+                            candidate = None
 
-                    query_cache[cache_key] = candidate
+                        query_cache[cache_key] = candidate
 
-                if not candidate:
-                    continue
+                    if not candidate:
+                        continue
 
-                try:
-                    local_path = self._download_asset(str(candidate["download_url"]))
+                    try:
+                        local_path = self._download_asset(str(candidate["download_url"]))
 
-                    scene.asset_path = str(local_path)
-                    scene.asset_provider = str(candidate.get("source_platform") or "unknown")
+                        scene.asset_path = str(local_path)
+                        scene.asset_provider = str(candidate.get("source_platform") or "unknown")
 
-                    right = AssetRight(
-                        scene_id=scene.scene_id,
-                        source_platform=str(candidate.get("source_platform") or "unknown"),
-                        source_asset_id=str(candidate.get("source_asset_id") or "") or None,
-                        source_url=str(candidate.get("source_url") or candidate.get("download_url") or ""),
-                        creator_name=(str(candidate.get("creator_name")) if candidate.get("creator_name") else None),
-                        creator_profile_url=(
-                            str(candidate.get("creator_profile_url")) if candidate.get("creator_profile_url") else None
-                        ),
-                        license_name=(str(candidate.get("license_name")) if candidate.get("license_name") else None),
-                        license_url=(str(candidate.get("license_url")) if candidate.get("license_url") else None),
-                        downloaded_at=dt.datetime.now(dt.timezone.utc).isoformat(),
-                        local_path=str(local_path.resolve()),
-                        sha256=self._file_sha256(local_path),
-                        restriction_flags=list(candidate.get("restriction_flags") or []),
-                        attribution_required=bool(candidate.get("attribution_required", False)),
-                        attribution_text=(str(candidate.get("attribution_text")) if candidate.get("attribution_text") else None),
-                    )
-                    rights.append(right)
-                    resolved = True
+                        right = AssetRight(
+                            scene_id=scene.scene_id,
+                            source_platform=str(candidate.get("source_platform") or "unknown"),
+                            source_asset_id=str(candidate.get("source_asset_id") or "") or None,
+                            source_url=str(candidate.get("source_url") or candidate.get("download_url") or ""),
+                            creator_name=(str(candidate.get("creator_name")) if candidate.get("creator_name") else None),
+                            creator_profile_url=(
+                                str(candidate.get("creator_profile_url")) if candidate.get("creator_profile_url") else None
+                            ),
+                            license_name=(str(candidate.get("license_name")) if candidate.get("license_name") else None),
+                            license_url=(str(candidate.get("license_url")) if candidate.get("license_url") else None),
+                            downloaded_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+                            local_path=str(local_path.resolve()),
+                            sha256=self._file_sha256(local_path),
+                            restriction_flags=list(candidate.get("restriction_flags") or []),
+                            attribution_required=bool(candidate.get("attribution_required", False)),
+                            attribution_text=(str(candidate.get("attribution_text")) if candidate.get("attribution_text") else None),
+                        )
+                        rights.append(right)
+                        resolved = True
+                        break
+                    except Exception as exc:
+                        download_failures += 1
+                        self._log(f"Asset download failed for {scene.scene_id} ({provider_name}, {query}): {exc}")
+
+                if resolved:
                     break
-                except Exception as exc:
-                    download_failures += 1
-                    self._log(f"Asset download failed for {scene.scene_id} ({provider_name}): {exc}")
 
             if not resolved:
                 placeholder_scenes += 1
@@ -1491,7 +1501,7 @@ class VideoPipeline:
         if not isinstance(videos, list) or not videos:
             return None
 
-        pivot = abs(hash(f"{scene.scene_id}:{query}")) % min(len(videos), 5)
+        pivot = self._stable_pivot(f"{scene.scene_id}:{query}", min(len(videos), 5))
         best = videos[pivot]
         files = best.get("video_files") if isinstance(best, dict) else None
         if not isinstance(files, list) or not files:
@@ -1539,7 +1549,7 @@ class VideoPipeline:
         if not isinstance(hits, list) or not hits:
             return None
 
-        pivot = abs(hash(f"{scene.scene_id}:{query}")) % min(len(hits), 5)
+        pivot = self._stable_pivot(f"{scene.scene_id}:{query}", min(len(hits), 5))
         best = hits[pivot]
         if not isinstance(best, dict):
             return None
@@ -1572,10 +1582,54 @@ class VideoPipeline:
         }
 
     def _query_for_scene(self, scene: Scene) -> str:
-        terms = [term.strip() for term in scene.search_terms if term.strip()]
-        if terms:
-            return " ".join(terms[:3])
-        return scene.heading
+        return self._queries_for_scene(scene)[0]
+
+    def _stable_pivot(self, seed: str, upper_bound: int) -> int:
+        limit = max(1, int(upper_bound))
+        digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()
+        return int(digest[:12], 16) % limit
+
+    def _queries_for_scene(self, scene: Scene) -> list[str]:
+        scene_terms = [term.strip() for term in scene.search_terms if term.strip()]
+
+        keywords: list[str] = []
+        seen_keywords: set[str] = set()
+        for item in self.config.asset_keywords:
+            value = str(item).strip()
+            if not value:
+                continue
+            lowered = value.lower()
+            if lowered in seen_keywords:
+                continue
+            seen_keywords.add(lowered)
+            keywords.append(value)
+
+        if keywords:
+            combined: list[str] = list(keywords)
+            for term in scene_terms:
+                lowered = term.lower()
+                if lowered in seen_keywords:
+                    continue
+                combined.append(term)
+
+            primary = " ".join(combined[:6]).strip()
+            fallback = " ".join(keywords[:4]).strip()
+
+            queries: list[str] = []
+            if primary:
+                queries.append(primary)
+            if fallback and fallback.lower() not in {item.lower() for item in queries}:
+                queries.append(fallback)
+            if queries:
+                return queries
+
+        if scene_terms:
+            return [" ".join(scene_terms[:3])]
+
+        heading = str(scene.heading).strip()
+        if heading:
+            return [heading]
+        return [self.config.prompt]
 
     def _download_asset(self, url: str) -> Path:
         parsed = urlparse(url)
@@ -1766,6 +1820,8 @@ class VideoPipeline:
             should_break = False
             if gap >= 0.38 and len(current) >= min_words:
                 should_break = True
+            if gap >= 0.22 and self._token_has_terminal_punctuation(str(current[-1][2])):
+                should_break = True
             if candidate_words > max_words:
                 should_break = True
             if len(candidate_text) > max_chars:
@@ -1778,7 +1834,7 @@ class VideoPipeline:
 
             current.append((start, end, normalized))
 
-            if self._token_has_terminal_punctuation(normalized) and len(current) >= min_words:
+            if self._token_has_terminal_punctuation(normalized):
                 flush_current()
 
         flush_current()
@@ -2039,17 +2095,82 @@ class VideoPipeline:
         else:
             shutil.copy2(mixed_mp4, final_mp4)
 
+    def _prepare_bookend_backgrounds(self, plan: ScriptPlan) -> None:
+        self._intro_bookend_background = None
+        self._outro_bookend_background = None
+
+        scene_assets: list[Path] = []
+        for scene in plan.scenes:
+            if not scene.asset_path:
+                continue
+            source = Path(scene.asset_path)
+            if source.exists():
+                scene_assets.append(source)
+
+        if not scene_assets:
+            return
+
+        self._intro_bookend_background = self._resolve_bookend_background(scene_assets[0], "intro")
+        self._outro_bookend_background = self._resolve_bookend_background(scene_assets[-1], "outro")
+
+        if self._outro_bookend_background is None and self._intro_bookend_background is not None:
+            self._outro_bookend_background = self._intro_bookend_background
+
+    def _resolve_bookend_background(self, source: Path, tag: str) -> Path | None:
+        ext = source.suffix.lower()
+        if ext in {".jpg", ".jpeg", ".png", ".webp"}:
+            return source
+
+        if ext not in {".mp4", ".mov", ".m4v", ".webm", ".mkv"}:
+            return None
+
+        target_dir = self.paths["tmp"] / "bookends"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha1(str(source.resolve()).encode("utf-8")).hexdigest()[:12]
+        frame_path = target_dir / f"{tag}-{digest}.jpg"
+        if frame_path.exists() and frame_path.stat().st_size > 0:
+            return frame_path
+
+        for seek in (1.0, 0.0):
+            command = [
+                "ffmpeg",
+                "-y",
+                "-ss",
+                f"{seek:.2f}",
+                "-i",
+                str(source),
+                "-frames:v",
+                "1",
+                str(frame_path),
+            ]
+            result = self._run_command(command, timeout=180, check=False)
+            if result.returncode == 0 and frame_path.exists() and frame_path.stat().st_size > 0:
+                return frame_path
+
+        self._warn(f"Could not extract {tag} background frame from {source.name}; using default card background.")
+        return None
+
     def _render_single_clip(self, clip: TimelineClip, output_clip: Path, index: int) -> None:
         duration = max(0.3, clip.seconds)
         if clip.scene_id == "__intro":
-            command = self._intro_clip_command(output_clip=output_clip, duration=duration, title=clip.heading)
+            command = self._intro_clip_command(
+                output_clip=output_clip,
+                duration=duration,
+                title=clip.heading,
+                background_image=self._intro_bookend_background,
+            )
             result = self._run_command(command, timeout=900, check=False)
             if result.returncode != 0:
                 raise RuntimeError(f"Failed to render intro clip: {result.stderr.strip()}")
             return
 
         if clip.scene_id == "__outro":
-            command = self._outro_clip_command(output_clip=output_clip, duration=duration, text=clip.heading)
+            command = self._outro_clip_command(
+                output_clip=output_clip,
+                duration=duration,
+                text=clip.heading,
+                background_image=self._outro_bookend_background,
+            )
             result = self._run_command(command, timeout=900, check=False)
             if result.returncode != 0:
                 raise RuntimeError(f"Failed to render outro clip: {result.stderr.strip()}")
@@ -2131,7 +2252,13 @@ class VideoPipeline:
         if result.returncode != 0:
             raise RuntimeError(f"Failed to render clip {clip.scene_id}: {result.stderr.strip()}")
 
-    def _intro_clip_command(self, output_clip: Path, duration: float, title: str) -> list[str]:
+    def _intro_clip_command(
+        self,
+        output_clip: Path,
+        duration: float,
+        title: str,
+        background_image: Path | None = None,
+    ) -> list[str]:
         style = self._normalized_bookend_style()
         palette = self._bookend_palette(style=style, is_intro=True)
         wrapped_title = self._wrap_bookend_text(title or "Explainer")
@@ -2152,17 +2279,32 @@ class VideoPipeline:
 
         fade = min(0.45, max(0.2, duration * 0.2))
         fade_out_start = max(0.0, duration - fade)
+
+        input_args: list[str]
+        visual_prefix = ""
+        if background_image and background_image.exists():
+            input_args = ["-loop", "1", "-i", str(background_image)]
+            visual_prefix = (
+                f"scale={self.config.width}:{self.config.height}:force_original_aspect_ratio=increase,"
+                f"crop={self.config.width}:{self.config.height},fps={self.config.fps},"
+            )
+        else:
+            input_args = [
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=c={palette['base']}:s={self.config.width}x{self.config.height}:r={self.config.fps}",
+            ]
+
         return [
             "ffmpeg",
             "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            f"color=c={palette['base']}:s={self.config.width}x{self.config.height}:r={self.config.fps}",
+            *input_args,
             "-t",
             f"{duration:.3f}",
             "-vf",
             (
+                f"{visual_prefix}"
                 f"drawbox=x=0:y=0:w=iw:h=ih:color={palette['overlay']}:t=fill,"
                 f"drawbox=x=iw*0.11:y=ih*0.22:w=iw*0.78:h=ih*0.56:color={palette['panel']}:t=fill,"
                 f"drawbox=x=iw*0.16:y=ih*0.245:w=iw*0.68:h=2:color={palette['accent']}:t=fill,"
@@ -2184,7 +2326,13 @@ class VideoPipeline:
             str(output_clip),
         ]
 
-    def _outro_clip_command(self, output_clip: Path, duration: float, text: str) -> list[str]:
+    def _outro_clip_command(
+        self,
+        output_clip: Path,
+        duration: float,
+        text: str,
+        background_image: Path | None = None,
+    ) -> list[str]:
         style = self._normalized_bookend_style()
         palette = self._bookend_palette(style=style, is_intro=False)
         wrapped_title = self._wrap_bookend_text(text or "Thanks for watching")
@@ -2205,17 +2353,32 @@ class VideoPipeline:
 
         fade = min(0.45, max(0.2, duration * 0.2))
         fade_out_start = max(0.0, duration - fade)
+
+        input_args: list[str]
+        visual_prefix = ""
+        if background_image and background_image.exists():
+            input_args = ["-loop", "1", "-i", str(background_image)]
+            visual_prefix = (
+                f"scale={self.config.width}:{self.config.height}:force_original_aspect_ratio=increase,"
+                f"crop={self.config.width}:{self.config.height},fps={self.config.fps},"
+            )
+        else:
+            input_args = [
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=c={palette['base']}:s={self.config.width}x{self.config.height}:r={self.config.fps}",
+            ]
+
         return [
             "ffmpeg",
             "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            f"color=c={palette['base']}:s={self.config.width}x{self.config.height}:r={self.config.fps}",
+            *input_args,
             "-t",
             f"{duration:.3f}",
             "-vf",
             (
+                f"{visual_prefix}"
                 f"drawbox=x=0:y=0:w=iw:h=ih:color={palette['overlay']}:t=fill,"
                 f"drawbox=x=iw*0.10:y=ih*0.26:w=iw*0.80:h=ih*0.50:color={palette['panel']}:t=fill,"
                 f"drawbox=x=iw*0.16:y=ih*0.735:w=iw*0.68:h=2:color={palette['accent']}:t=fill,"
@@ -2432,6 +2595,7 @@ class VideoPipeline:
             "pipeline_version": "v1-local-720p",
             "config": {
                 "minutes": self.config.minutes,
+                "asset_keywords": list(self.config.asset_keywords),
                 "resolution": f"{self.config.width}x{self.config.height}",
                 "fps": self.config.fps,
                 "video_effects": self.config.video_effects,

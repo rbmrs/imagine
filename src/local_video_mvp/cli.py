@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -21,6 +22,23 @@ def _parse_resolution(raw: str) -> tuple[int, int]:
     return width, height
 
 
+def _parse_asset_keywords(raw: str) -> list[str]:
+    if not raw:
+        return []
+
+    parts = [item.strip() for item in re.split(r"[,;\n]+", raw) if item.strip()]
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        lowered = part.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        out.append(part)
+
+    return out[:8]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="local-video-mvp",
@@ -30,6 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run", help="Run the full generation pipeline")
     run.add_argument("--prompt", required=True, help="Video prompt/topic")
+    run.add_argument(
+        "--asset-keywords",
+        default="",
+        help="Comma-separated keywords to constrain stock footage search queries",
+    )
     run.add_argument("--project-dir", required=True, help="Output project directory")
     run.add_argument("--minutes", type=int, default=5, help="Target duration in minutes (default: 5)")
     run.add_argument("--resolution", default="1280x720", help="Output resolution, default 1280x720")
@@ -189,6 +212,11 @@ def build_parser() -> argparse.ArgumentParser:
     tui = subparsers.add_parser("tui", help="Open terminal UI for common workflows")
     tui.add_argument("--prompt", default="Autonomous cars", help="Initial prompt shown in the TUI")
     tui.add_argument(
+        "--asset-keywords",
+        default="cars, roads",
+        help="Initial comma-separated asset keywords",
+    )
+    tui.add_argument(
         "--project-dir",
         default=str((Path.home() / ".imagine" / "projects").resolve()),
         help="Projects root directory used for auto-managed run workspaces",
@@ -222,6 +250,7 @@ def run_command(args: argparse.Namespace) -> int:
     config = PipelineConfig(
         prompt=args.prompt.strip(),
         project_dir=Path(args.project_dir).expanduser().resolve(),
+        asset_keywords=_parse_asset_keywords(str(args.asset_keywords)),
         minutes=max(1, args.minutes),
         width=width,
         height=height,
@@ -517,6 +546,7 @@ def tui_command(args: argparse.Namespace) -> int:
     from .tui import run_tui
 
     prompt = str(args.prompt).strip() or "Your topic"
+    asset_keywords = _parse_asset_keywords(str(args.asset_keywords))
     project_dir = Path(args.project_dir).expanduser().resolve()
     minutes = max(1, int(args.minutes))
     voice_profile = str(args.voice_profile).strip() or "calm-documentary"
@@ -525,6 +555,7 @@ def tui_command(args: argparse.Namespace) -> int:
     melo_speaker = str(args.melo_speaker).strip() or "EN-US"
     return run_tui(
         prompt=prompt,
+        asset_keywords=asset_keywords,
         project_dir=project_dir,
         minutes=minutes,
         voice_profile=voice_profile,
@@ -539,6 +570,7 @@ def imagine_entry() -> int:
 
     return run_tui(
         prompt="Autonomous cars",
+        asset_keywords=["cars", "roads"],
         project_dir=(Path.home() / ".imagine" / "projects").resolve(),
         minutes=2,
         voice_profile="calm-documentary",
