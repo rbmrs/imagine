@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import curses
+import io
 import datetime as dt
 import json
 import os
@@ -11,6 +12,8 @@ import subprocess
 import sys
 import threading
 import time
+import warnings
+from contextlib import redirect_stderr
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -849,6 +852,15 @@ class LocalVideoMvpTui:
             self._set_status("Cannot edit while a run is in progress.")
             return
 
+        before = (
+            self.config.prompt,
+            str(self.config.project_dir),
+            self.config.minutes,
+            self.config.melo_language,
+            self.config.melo_speaker,
+            self.config.voice_profile,
+            round(float(self.config.voice_speed), 3),
+        )
         had_warning = False
         self._set_status("Edit mode: press Enter to keep current values.")
 
@@ -886,11 +898,7 @@ class LocalVideoMvpTui:
                 had_warning = True
 
         available_speakers = self._load_melo_speakers(self.config.melo_language)
-        if available_speakers:
-            preview = ", ".join(available_speakers[:8])
-            suffix = " ..." if len(available_speakers) > 8 else ""
-            self._append_log(f"Speakers [{self.config.melo_language}]: {preview}{suffix}")
-        else:
+        if not available_speakers:
             self._append_log(
                 f"WARN: Could not load speaker inventory for language {self.config.melo_language}. "
                 "Manual speaker input will still be accepted."
@@ -941,15 +949,29 @@ class LocalVideoMvpTui:
         self._refresh_prior_total_seconds()
         self._refresh_stock_key_cache()
 
-        self._append_log(
-            "Updated config: "
-            f"minutes={self.config.minutes}, "
-            f"voice={self.config.melo_language}/{self.config.melo_speaker}, "
-            f"profile={self.config.voice_profile}, speed={self.config.voice_speed:.2f}"
+        after = (
+            self.config.prompt,
+            str(self.config.project_dir),
+            self.config.minutes,
+            self.config.melo_language,
+            self.config.melo_speaker,
+            self.config.voice_profile,
+            round(float(self.config.voice_speed), 3),
         )
+        changed = after != before
+
+        if changed:
+            self._append_log(
+                "Updated config: "
+                f"minutes={self.config.minutes}, "
+                f"voice={self.config.melo_language}/{self.config.melo_speaker}, "
+                f"profile={self.config.voice_profile}, speed={self.config.voice_speed:.2f}"
+            )
 
         if had_warning:
             self._set_status("Parameters updated with warnings.")
+        elif not changed:
+            self._set_status("No parameter changes.")
         else:
             self._set_status("Parameters updated.")
 
@@ -997,12 +1019,15 @@ class LocalVideoMvpTui:
 
     def _load_melo_speakers(self, language: str) -> list[str]:
         try:
-            from melo.api import TTS  # type: ignore
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=FutureWarning)
+                with redirect_stderr(io.StringIO()):
+                    from melo.api import TTS  # type: ignore
 
-            tts = TTS(language=language, device="auto")
-            hps = getattr(tts, "hps", None)
-            hps_data = getattr(hps, "data", None)
-            spk2id = dict(getattr(hps_data, "spk2id", {}) or {})
+                    tts = TTS(language=language, device="auto")
+                    hps = getattr(tts, "hps", None)
+                    hps_data = getattr(hps, "data", None)
+                    spk2id = dict(getattr(hps_data, "spk2id", {}) or {})
             return sorted(str(name) for name in spk2id.keys())
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"WARN: Melo speaker inventory unavailable for {language}: {exc}")
