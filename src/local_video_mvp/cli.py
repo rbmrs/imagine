@@ -301,6 +301,7 @@ def run_command(args: argparse.Namespace) -> int:
         "project_dir",
         "script",
         "timeline",
+        "clip_catalog",
         "narration",
         "captions",
         "captions_ass",
@@ -364,6 +365,12 @@ def inspect_command(args: argparse.Namespace) -> int:
     if isinstance(pacing_stats, dict) and pacing_stats:
         print("- pacing_stats:")
         for key, value in pacing_stats.items():
+            print(f"  - {key}: {value}")
+
+    asset_stats = payload.get("asset_stats", {})
+    if isinstance(asset_stats, dict) and asset_stats:
+        print("- asset_stats:")
+        for key, value in asset_stats.items():
             print(f"  - {key}: {value}")
 
     outputs = payload.get("outputs", {})

@@ -62,6 +62,13 @@ FUNCTION_WORDS = {
 }
 
 
+class AssetUniquenessError(RuntimeError):
+    def __init__(self, message: str, *, shortfall_scene_ids: list[str], keywords: list[str]):
+        super().__init__(message)
+        self.shortfall_scene_ids = shortfall_scene_ids
+        self.keywords = keywords
+
+
 class VideoPipeline:
     def __init__(self, config: PipelineConfig):
         self.config = config
@@ -73,6 +80,7 @@ class VideoPipeline:
         self.caption_stats: dict[str, Any] = {}
         self.duration_stats: dict[str, Any] = {}
         self.pacing_stats: dict[str, Any] = {}
+        self.asset_stats: dict[str, Any] = {}
         self.used_template_fallback = False
         self._intro_bookend_background: Path | None = None
         self._outro_bookend_background: Path | None = None
@@ -171,6 +179,7 @@ class VideoPipeline:
             rights = self._run_stage("assets", "Stage 3/7: Resolving visual assets", lambda: self._resolve_assets(plan))
             self._write_json(self.paths["script"], plan.to_dict())
             self._prepare_bookend_backgrounds(plan)
+            self._write_clip_catalog(plan, rights)
 
             captions = self._run_stage(
                 "captions",
@@ -207,6 +216,7 @@ class VideoPipeline:
                 "project_dir": str(self.config.project_dir.resolve()),
                 "script": str(self.paths["script"].resolve()),
                 "timeline": str(self.paths["timeline"].resolve()),
+                "clip_catalog": str(self.paths["clip_catalog"].resolve()),
                 "narration": str(self.paths["narration_wav"].resolve()),
                 "captions": str(self.paths["captions"].resolve()),
                 "captions_ass": str(self.paths["captions_ass"].resolve()),
@@ -231,6 +241,7 @@ class VideoPipeline:
         return {
             "root": project_dir,
             "assets_cache": project_dir / "assets" / "cache",
+            "review": project_dir / "review",
             "tmp": project_dir / "tmp",
             "output": project_dir / "output",
             "prompt": project_dir / "prompt.txt",
@@ -241,6 +252,7 @@ class VideoPipeline:
             "captions": project_dir / "captions.srt",
             "captions_ass": project_dir / "captions.ass",
             "timeline": project_dir / "timeline.json",
+            "clip_catalog": project_dir / "review" / "clip_catalog.json",
             "manifest": project_dir / "rights_manifest.json",
             "run_log": project_dir / "run.log",
             "run_report": project_dir / "run_report.json",
@@ -249,7 +261,7 @@ class VideoPipeline:
         }
 
     def _prepare_dirs(self) -> None:
-        for key in ("root", "assets_cache", "tmp", "output"):
+        for key in ("root", "assets_cache", "review", "tmp", "output"):
             self.paths[key].mkdir(parents=True, exist_ok=True)
 
     def _check_dependencies(self) -> None:
@@ -392,6 +404,7 @@ class VideoPipeline:
 
         scenes: list[Scene] = []
         scene_limit = max(1, self.config.max_scenes)
+        used_clip_names: set[str] = set()
 
         for idx, item in enumerate(raw_scenes[:scene_limit]):
             if not isinstance(item, dict):
@@ -410,9 +423,12 @@ class VideoPipeline:
             if not search_terms:
                 search_terms = self._default_search_terms(heading)
 
+            clip_name = self._build_scene_clip_name(idx=idx, heading=heading, used=used_clip_names)
+
             scenes.append(
                 Scene(
                     scene_id=f"scene_{idx + 1:03d}",
+                    clip_name=clip_name,
                     heading=heading,
                     voiceover=voiceover,
                     search_terms=search_terms[:4],
@@ -430,6 +446,31 @@ class VideoPipeline:
             scene.seconds = per_scene
 
         return ScriptPlan(title=title, summary=summary, scenes=scenes)
+
+    def _build_scene_clip_name(self, idx: int, heading: str, used: set[str]) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "-", heading.strip().lower())
+        slug = slug.strip("-")
+        if not slug:
+            slug = "scene"
+
+        parts = [part for part in slug.split("-") if part]
+        base = "-".join(parts[:6]).strip("-")
+        if not base:
+            base = "scene"
+        if len(base) > 48:
+            base = base[:48].rstrip("-")
+        if not base:
+            base = "scene"
+
+        prefix = f"{idx + 1:02d}"
+        candidate = f"{prefix}-{base}"
+        suffix = 2
+        while candidate in used:
+            candidate = f"{prefix}-{base}-{suffix}"
+            suffix += 1
+
+        used.add(candidate)
+        return candidate
 
     def _duration_bounds(self) -> tuple[float, float, float]:
         target_seconds = float(self.config.target_seconds())
@@ -1388,9 +1429,14 @@ class VideoPipeline:
 
     def _resolve_assets(self, plan: ScriptPlan) -> list[AssetRight]:
         rights: list[AssetRight] = []
-        query_cache: dict[tuple[str, str], dict[str, Any] | None] = {}
+        query_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
         download_failures = 0
         placeholder_scenes = 0
+        duplicate_candidate_rejections = 0
+        unique_shortfall_scene_ids: list[str] = []
+        unique_shortfall_clip_names: list[str] = []
+        unresolved_scene_ids: list[str] = []
+        used_asset_keys: set[str] = set()
 
         provider_order = [
             ("pexels", self.config.pexels_api_key),
@@ -1409,65 +1455,97 @@ class VideoPipeline:
         for scene in plan.scenes:
             queries = self._queries_for_scene(scene)
             resolved = False
+            saw_candidates = False
+            scene_duplicate_rejections = 0
             for provider_name, api_key in provider_order:
                 if not api_key:
                     continue
 
                 for query in queries:
                     cache_key = (provider_name, query.lower())
-                    candidate = query_cache.get(cache_key)
+                    candidates = query_cache.get(cache_key)
                     if cache_key not in query_cache:
-                        candidate = None
+                        candidates = []
                         try:
                             if provider_name == "pexels":
-                                candidate = self._search_pexels_video(scene, api_key, query=query)
+                                candidates = self._search_pexels_videos(api_key, query=query)
                             elif provider_name == "pixabay":
-                                candidate = self._search_pixabay_video(scene, api_key, query=query)
+                                candidates = self._search_pixabay_videos(api_key, query=query)
                         except Exception as exc:
                             self._log(f"{provider_name} search failed for {scene.scene_id} ({query}): {exc}")
-                            candidate = None
+                            candidates = []
 
-                        query_cache[cache_key] = candidate
+                        query_cache[cache_key] = list(candidates)
 
-                    if not candidate:
+                    if not candidates:
                         continue
+                    saw_candidates = True
 
-                    try:
-                        local_path = self._download_asset(str(candidate["download_url"]))
+                    for candidate in candidates:
+                        unique_key = self._asset_uniqueness_key(candidate)
+                        if unique_key in used_asset_keys:
+                            duplicate_candidate_rejections += 1
+                            scene_duplicate_rejections += 1
+                            continue
 
-                        scene.asset_path = str(local_path)
-                        scene.asset_provider = str(candidate.get("source_platform") or "unknown")
+                        try:
+                            local_path = self._download_asset(str(candidate["download_url"]))
 
-                        right = AssetRight(
-                            scene_id=scene.scene_id,
-                            source_platform=str(candidate.get("source_platform") or "unknown"),
-                            source_asset_id=str(candidate.get("source_asset_id") or "") or None,
-                            source_url=str(candidate.get("source_url") or candidate.get("download_url") or ""),
-                            creator_name=(str(candidate.get("creator_name")) if candidate.get("creator_name") else None),
-                            creator_profile_url=(
-                                str(candidate.get("creator_profile_url")) if candidate.get("creator_profile_url") else None
-                            ),
-                            license_name=(str(candidate.get("license_name")) if candidate.get("license_name") else None),
-                            license_url=(str(candidate.get("license_url")) if candidate.get("license_url") else None),
-                            downloaded_at=dt.datetime.now(dt.timezone.utc).isoformat(),
-                            local_path=str(local_path.resolve()),
-                            sha256=self._file_sha256(local_path),
-                            restriction_flags=list(candidate.get("restriction_flags") or []),
-                            attribution_required=bool(candidate.get("attribution_required", False)),
-                            attribution_text=(str(candidate.get("attribution_text")) if candidate.get("attribution_text") else None),
-                        )
-                        rights.append(right)
-                        resolved = True
+                            scene.asset_path = str(local_path)
+                            scene.asset_provider = str(candidate.get("source_platform") or "unknown")
+                            used_asset_keys.add(unique_key)
+
+                            right = AssetRight(
+                                scene_id=scene.scene_id,
+                                source_platform=str(candidate.get("source_platform") or "unknown"),
+                                source_asset_id=str(candidate.get("source_asset_id") or "") or None,
+                                source_url=str(candidate.get("source_url") or candidate.get("download_url") or ""),
+                                creator_name=(str(candidate.get("creator_name")) if candidate.get("creator_name") else None),
+                                creator_profile_url=(
+                                    str(candidate.get("creator_profile_url")) if candidate.get("creator_profile_url") else None
+                                ),
+                                license_name=(str(candidate.get("license_name")) if candidate.get("license_name") else None),
+                                license_url=(str(candidate.get("license_url")) if candidate.get("license_url") else None),
+                                downloaded_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+                                local_path=str(local_path.resolve()),
+                                sha256=self._file_sha256(local_path),
+                                restriction_flags=list(candidate.get("restriction_flags") or []),
+                                attribution_required=bool(candidate.get("attribution_required", False)),
+                                attribution_text=(
+                                    str(candidate.get("attribution_text")) if candidate.get("attribution_text") else None
+                                ),
+                            )
+                            rights.append(right)
+                            resolved = True
+                            break
+                        except Exception as exc:
+                            download_failures += 1
+                            self._log(f"Asset download failed for {scene.scene_id} ({provider_name}, {query}): {exc}")
+
+                    if resolved:
                         break
-                    except Exception as exc:
-                        download_failures += 1
-                        self._log(f"Asset download failed for {scene.scene_id} ({provider_name}, {query}): {exc}")
 
                 if resolved:
                     break
 
             if not resolved:
                 placeholder_scenes += 1
+                unresolved_scene_ids.append(scene.scene_id)
+                if saw_candidates and scene_duplicate_rejections > 0:
+                    unique_shortfall_scene_ids.append(scene.scene_id)
+                    unique_shortfall_clip_names.append(scene.clip_name)
+
+        self.asset_stats = {
+            "resolved_scene_count": len(rights),
+            "placeholder_scene_count": placeholder_scenes,
+            "download_failures": download_failures,
+            "duplicate_candidate_rejections": duplicate_candidate_rejections,
+            "unique_shortfall_count": len(unique_shortfall_scene_ids),
+            "unique_shortfall_scene_ids": unique_shortfall_scene_ids,
+            "unique_shortfall_clip_names": unique_shortfall_clip_names,
+            "unresolved_scene_ids": unresolved_scene_ids,
+            "asset_keywords": list(self.config.asset_keywords),
+        }
 
         if download_failures > 0:
             self._warn(
@@ -1476,6 +1554,19 @@ class VideoPipeline:
             )
 
         if self.config.require_external_assets and placeholder_scenes > 0:
+            if unique_shortfall_scene_ids:
+                keyword_hint = ", ".join(self.config.asset_keywords) if self.config.asset_keywords else "(none)"
+                clip_hint = ", ".join(unique_shortfall_clip_names[:8])
+                raise AssetUniquenessError(
+                    (
+                        "Unique asset shortfall: could not resolve unique stock clips for "
+                        f"{len(unique_shortfall_scene_ids)} scene(s). Broaden --asset-keywords and retry. "
+                        f"Current keywords: {keyword_hint}. "
+                        f"Affected clips: {clip_hint}"
+                    ),
+                    shortfall_scene_ids=list(unique_shortfall_scene_ids),
+                    keywords=list(self.config.asset_keywords),
+                )
             raise RuntimeError(
                 f"{placeholder_scenes} scenes could not resolve an external stock asset while "
                 "--require-external-assets is enabled."
@@ -1484,102 +1575,167 @@ class VideoPipeline:
         if placeholder_scenes > 0 and rights:
             self._warn(f"{placeholder_scenes} scenes used placeholder visuals because no stock asset was resolved.")
 
+        if unique_shortfall_scene_ids and not self.config.require_external_assets:
+            keyword_hint = ", ".join(self.config.asset_keywords) if self.config.asset_keywords else "(none)"
+            self._warn(
+                "Unique asset shortfall detected. Some scenes would require repeated clips. "
+                f"Broaden asset keywords and retry. Current keywords: {keyword_hint}."
+            )
+
         if not rights:
             self._warn("No external assets resolved for this run. Final video uses generated placeholders only.")
         return rights
 
-    def _search_pexels_video(self, scene: Scene, api_key: str, query: str | None = None) -> dict[str, Any] | None:
-        if not query:
-            query = self._query_for_scene(scene)
-        url = f"https://api.pexels.com/videos/search?query={quote_plus(query)}&orientation=landscape&per_page=8"
+    def _asset_uniqueness_key(self, candidate: dict[str, Any]) -> str:
+        platform = str(candidate.get("source_platform") or "unknown").strip().lower()
+        source_asset_id = str(candidate.get("source_asset_id") or "").strip()
+        if source_asset_id:
+            return f"{platform}:id:{source_asset_id}"
+
+        source_url = str(candidate.get("source_url") or "").strip().lower()
+        if source_url:
+            return f"{platform}:url:{source_url}"
+
+        download_url = str(candidate.get("download_url") or "").strip().lower()
+        if download_url:
+            return f"{platform}:download:{download_url}"
+
+        fallback = json.dumps(candidate, sort_keys=True, ensure_ascii=True)
+        digest = hashlib.sha1(fallback.encode("utf-8")).hexdigest()
+        return f"{platform}:digest:{digest}"
+
+    def _stable_rotate_candidates(self, candidates: list[dict[str, Any]], seed: str) -> list[dict[str, Any]]:
+        if not candidates:
+            return []
+
+        ordered = sorted(
+            candidates,
+            key=lambda item: (
+                str(item.get("source_asset_id") or ""),
+                str(item.get("download_url") or ""),
+            ),
+        )
+
+        if len(ordered) <= 1:
+            return ordered
+
+        pivot = self._stable_pivot(seed, len(ordered))
+        return ordered[pivot:] + ordered[:pivot]
+
+    def _search_pexels_videos(self, api_key: str, query: str) -> list[dict[str, Any]]:
+        url = f"https://api.pexels.com/videos/search?query={quote_plus(query)}&orientation=landscape&per_page=20"
         response = self.http.get(url, headers={"Authorization": api_key}, timeout=(5, 15))
         if response.status_code != 200:
-            return None
+            return []
 
         payload = response.json()
         videos = payload.get("videos")
         if not isinstance(videos, list) or not videos:
-            return None
+            return []
 
-        pivot = self._stable_pivot(f"{scene.scene_id}:{query}", min(len(videos), 5))
-        best = videos[pivot]
-        files = best.get("video_files") if isinstance(best, dict) else None
-        if not isinstance(files, list) or not files:
-            return None
+        candidates: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for best in videos:
+            if not isinstance(best, dict):
+                continue
 
-        files_sorted = sorted(
-            [f for f in files if isinstance(f, dict) and f.get("link")],
-            key=lambda f: int(f.get("width") or 0),
-            reverse=True,
-        )
-        if not files_sorted:
-            return None
+            files = best.get("video_files")
+            if not isinstance(files, list) or not files:
+                continue
 
-        selected = files_sorted[0]
-        user = best.get("user") if isinstance(best, dict) else {}
-        if not isinstance(user, dict):
-            user = {}
+            files_sorted = sorted(
+                [f for f in files if isinstance(f, dict) and f.get("link")],
+                key=lambda f: int(f.get("width") or 0),
+                reverse=True,
+            )
+            if not files_sorted:
+                continue
 
-        return {
-            "source_platform": "pexels",
-            "source_asset_id": str(best.get("id") or ""),
-            "download_url": str(selected.get("link")),
-            "source_url": f"https://www.pexels.com/video/{best.get('id')}/",
-            "creator_name": user.get("name"),
-            "creator_profile_url": user.get("url"),
-            "license_name": "Pexels License",
-            "license_url": "https://www.pexels.com/license/",
-            "restriction_flags": [],
-            "attribution_required": False,
-        }
+            selected = files_sorted[0]
+            user = best.get("user") if isinstance(best, dict) else {}
+            if not isinstance(user, dict):
+                user = {}
 
-    def _search_pixabay_video(self, scene: Scene, api_key: str, query: str | None = None) -> dict[str, Any] | None:
-        if not query:
-            query = self._query_for_scene(scene)
+            source_asset_id = str(best.get("id") or "")
+            if source_asset_id and source_asset_id in seen:
+                continue
+            if source_asset_id:
+                seen.add(source_asset_id)
+
+            candidates.append(
+                {
+                    "source_platform": "pexels",
+                    "source_asset_id": source_asset_id,
+                    "download_url": str(selected.get("link")),
+                    "source_url": f"https://www.pexels.com/video/{best.get('id')}/",
+                    "creator_name": user.get("name"),
+                    "creator_profile_url": user.get("url"),
+                    "license_name": "Pexels License",
+                    "license_url": "https://www.pexels.com/license/",
+                    "restriction_flags": [],
+                    "attribution_required": False,
+                }
+            )
+
+        return self._stable_rotate_candidates(candidates, seed=f"pexels:{query.lower()}")
+
+    def _search_pixabay_videos(self, api_key: str, query: str) -> list[dict[str, Any]]:
         url = (
             "https://pixabay.com/api/videos/"
-            f"?key={quote_plus(api_key)}&q={quote_plus(query)}&safesearch=true&per_page=8"
+            f"?key={quote_plus(api_key)}&q={quote_plus(query)}&safesearch=true&per_page=20"
         )
         response = self.http.get(url, timeout=(5, 15))
         if response.status_code != 200:
-            return None
+            return []
 
         payload = response.json()
         hits = payload.get("hits")
         if not isinstance(hits, list) or not hits:
-            return None
+            return []
 
-        pivot = self._stable_pivot(f"{scene.scene_id}:{query}", min(len(hits), 5))
-        best = hits[pivot]
-        if not isinstance(best, dict):
-            return None
-
-        videos = best.get("videos")
-        if not isinstance(videos, dict):
-            return None
-
+        candidates: list[dict[str, Any]] = []
+        seen: set[str] = set()
         quality_order = ["large", "medium", "small", "tiny"]
-        selected_url = None
-        for key in quality_order:
-            block = videos.get(key)
-            if isinstance(block, dict) and block.get("url"):
-                selected_url = str(block["url"])
-                break
-        if not selected_url:
-            return None
 
-        return {
-            "source_platform": "pixabay",
-            "source_asset_id": str(best.get("id") or ""),
-            "download_url": selected_url,
-            "source_url": str(best.get("pageURL") or ""),
-            "creator_name": str(best.get("user") or "") or None,
-            "creator_profile_url": None,
-            "license_name": "Pixabay License",
-            "license_url": "https://pixabay.com/service/license/",
-            "restriction_flags": [],
-            "attribution_required": False,
-        }
+        for best in hits:
+            if not isinstance(best, dict):
+                continue
+
+            videos = best.get("videos")
+            if not isinstance(videos, dict):
+                continue
+
+            selected_url = ""
+            for key in quality_order:
+                block = videos.get(key)
+                if isinstance(block, dict) and block.get("url"):
+                    selected_url = str(block["url"])
+                    break
+            if not selected_url:
+                continue
+
+            source_asset_id = str(best.get("id") or "")
+            if source_asset_id and source_asset_id in seen:
+                continue
+            if source_asset_id:
+                seen.add(source_asset_id)
+
+            candidates.append(
+                {
+                    "source_platform": "pixabay",
+                    "source_asset_id": source_asset_id,
+                    "download_url": selected_url,
+                    "source_url": str(best.get("pageURL") or ""),
+                    "creator_name": str(best.get("user") or "") or None,
+                    "creator_profile_url": None,
+                    "license_name": "Pixabay License",
+                    "license_url": "https://pixabay.com/service/license/",
+                    "restriction_flags": [],
+                    "attribution_required": False,
+                }
+            )
+
+        return self._stable_rotate_candidates(candidates, seed=f"pixabay:{query.lower()}")
 
     def _query_for_scene(self, scene: Scene) -> str:
         return self._queries_for_scene(scene)[0]
@@ -1971,6 +2127,7 @@ class VideoPipeline:
             clips.append(
                 TimelineClip(
                     scene_id="__intro",
+                    clip_name="intro-card",
                     start=start,
                     end=end,
                     seconds=intro_seconds,
@@ -1986,6 +2143,7 @@ class VideoPipeline:
             clips.append(
                 TimelineClip(
                     scene_id=scene.scene_id,
+                    clip_name=scene.clip_name,
                     start=start,
                     end=end,
                     seconds=scene.seconds,
@@ -2002,6 +2160,7 @@ class VideoPipeline:
             clips.append(
                 TimelineClip(
                     scene_id="__outro",
+                    clip_name="outro-card",
                     start=start,
                     end=end,
                     seconds=outro_seconds,
@@ -2150,6 +2309,35 @@ class VideoPipeline:
         self._warn(f"Could not extract {tag} background frame from {source.name}; using default card background.")
         return None
 
+    def _write_clip_catalog(self, plan: ScriptPlan, rights: list[AssetRight]) -> None:
+        rights_by_scene: dict[str, AssetRight] = {item.scene_id: item for item in rights}
+        clips: list[dict[str, Any]] = []
+        for scene in plan.scenes:
+            right = rights_by_scene.get(scene.scene_id)
+            clips.append(
+                {
+                    "scene_id": scene.scene_id,
+                    "clip_name": scene.clip_name,
+                    "heading": scene.heading,
+                    "seconds": round(scene.seconds, 3),
+                    "search_terms": list(scene.search_terms),
+                    "asset_provider": scene.asset_provider,
+                    "asset_path": scene.asset_path,
+                    "source_asset_id": right.source_asset_id if right else None,
+                    "source_url": right.source_url if right else None,
+                    "creator_name": right.creator_name if right else None,
+                }
+            )
+
+        payload = {
+            "title": plan.title,
+            "summary": plan.summary,
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "asset_keywords": list(self.config.asset_keywords),
+            "clips": clips,
+        }
+        self._write_json(self.paths["clip_catalog"], payload)
+
     def _render_single_clip(self, clip: TimelineClip, output_clip: Path, index: int) -> None:
         duration = max(0.3, clip.seconds)
         if clip.scene_id == "__intro":
@@ -2183,13 +2371,31 @@ class VideoPipeline:
             ext = source.suffix.lower()
             if ext in {".mp4", ".mov", ".m4v", ".webm", ".mkv"}:
                 vf_primary = self._clip_vf(source_kind="video", index=index)
+                vf_retry = vf_fallback
+
+                input_args = ["-i", str(source)]
+                source_duration: float | None = None
+                try:
+                    source_duration = self._media_duration(source)
+                except Exception as exc:
+                    self._log(f"Could not probe source duration for {clip.scene_id}: {exc}")
+
+                if source_duration is not None and source_duration > duration + 0.08:
+                    max_seek = max(0.0, source_duration - duration)
+                    if max_seek > 0:
+                        bucket = self._stable_pivot(f"{clip.scene_id}:{source.name}", 1000)
+                        seek_ratio = float(bucket) / 999.0
+                        seek_seconds = max_seek * seek_ratio
+                        input_args = ["-ss", f"{seek_seconds:.3f}", "-i", str(source)]
+                elif source_duration is not None and source_duration < max(0.2, duration - 0.05):
+                    slow_factor = min(8.0, max(1.0, duration / max(0.05, source_duration)))
+                    vf_primary = f"setpts={slow_factor:.6f}*PTS,{vf_primary}"
+                    vf_retry = f"setpts={slow_factor:.6f}*PTS,{vf_fallback}"
+
                 command = [
                     "ffmpeg",
                     "-y",
-                    "-stream_loop",
-                    "-1",
-                    "-i",
-                    str(source),
+                    *input_args,
                     "-t",
                     f"{duration:.3f}",
                     "-vf",
@@ -2206,7 +2412,7 @@ class VideoPipeline:
                     str(output_clip),
                 ]
                 fallback = [*command]
-                fallback[fallback.index("-vf") + 1] = vf_fallback
+                fallback[fallback.index("-vf") + 1] = vf_retry
             elif ext in {".jpg", ".jpeg", ".png", ".webp"}:
                 vf_primary = self._clip_vf(source_kind="image", index=index)
                 command = [
@@ -2557,6 +2763,7 @@ class VideoPipeline:
             self.paths["captions_ass"],
             self.paths["script"],
             self.paths["timeline"],
+            self.paths["clip_catalog"],
         ]
         outputs: list[dict[str, Any]] = []
         for path in out_files:
@@ -2763,6 +2970,7 @@ class VideoPipeline:
             "caption_stats": self.caption_stats,
             "duration_stats": self.duration_stats,
             "pacing_stats": self.pacing_stats,
+            "asset_stats": self.asset_stats,
             "fallbacks": {
                 "used_template_script": self.used_template_fallback,
             },

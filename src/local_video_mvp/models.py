@@ -58,6 +58,7 @@ class PipelineConfig:
 @dataclass
 class Scene:
     scene_id: str
+    clip_name: str
     heading: str
     voiceover: str
     search_terms: list[str]
@@ -68,6 +69,7 @@ class Scene:
     def to_dict(self) -> dict[str, Any]:
         return {
             "scene_id": self.scene_id,
+            "clip_name": self.clip_name,
             "heading": self.heading,
             "voiceover": self.voiceover,
             "search_terms": self.search_terms,
@@ -133,6 +135,7 @@ class AssetRight:
 @dataclass
 class TimelineClip:
     scene_id: str
+    clip_name: str
     start: float
     end: float
     seconds: float
@@ -142,6 +145,7 @@ class TimelineClip:
     def to_dict(self) -> dict[str, Any]:
         return {
             "scene_id": self.scene_id,
+            "clip_name": self.clip_name,
             "start": round(self.start, 3),
             "end": round(self.end, 3),
             "seconds": round(self.seconds, 3),
