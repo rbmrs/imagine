@@ -123,6 +123,7 @@ Default startup values:
 - prompt: `Autonomous cars`
 - project directory: `~/.imagine/projects/autonomous-cars`
 - minutes: `2`
+- voice: `EN / EN-US`, profile `calm-documentary`, speed `1.0`
 
 Default storage behavior:
 
@@ -132,6 +133,7 @@ Default storage behavior:
 TUI shortcut focus for now:
 
 - `R` runs the preferred full pipeline profile from this onboarding guide.
+- `E` edits prompt, duration, project dir, and voice settings (language/speaker/profile/speed).
 - `Q` exits the TUI.
 
 TUI stock key discovery order:

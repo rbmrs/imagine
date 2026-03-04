@@ -205,6 +205,7 @@ imagine
 - prompt: `Autonomous cars`
 - project directory: `~/.imagine/projects/autonomous-cars`
 - minutes: `2`
+- voice: `EN / EN-US`, profile `calm-documentary`, speed `1.0`
 
 Storage behavior with TUI defaults:
 
@@ -214,12 +215,20 @@ Storage behavior with TUI defaults:
 If you want custom startup values, you can still use:
 
 ```bash
-local-video-mvp tui --prompt "Your topic" --project-dir ./projects/demo --minutes 5
+local-video-mvp tui \
+  --prompt "Your topic" \
+  --project-dir ./projects/demo \
+  --minutes 5 \
+  --melo-language EN \
+  --melo-speaker EN-US \
+  --voice-profile calm-documentary \
+  --voice-speed 1.0
 ```
 
 Key bindings:
 
 - `R`: run the full pipeline using the preferred profile (`ollama`, `melo`, `faster-whisper`, strict mode)
+- `E`: edit basic parameters (prompt, minutes, project dir, language, speaker, voice profile, voice speed)
 - `Q`: quit (stops active run first)
 
 If Ollama is not already running, the TUI tries to start `ollama serve` automatically and stops it on exit when it was started by the TUI.

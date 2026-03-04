@@ -194,6 +194,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Initial project directory",
     )
     tui.add_argument("--minutes", type=int, default=2, help="Initial target duration in minutes")
+    tui.add_argument(
+        "--voice-profile",
+        choices=["calm-documentary", "balanced", "energetic-explainer"],
+        default="calm-documentary",
+        help="Initial voice profile",
+    )
+    tui.add_argument("--voice-speed", type=float, default=1.0, help="Initial voice speed")
+    tui.add_argument("--melo-language", default="EN", help="Initial Melo language")
+    tui.add_argument("--melo-speaker", default="EN-US", help="Initial Melo speaker")
 
     return parser
 
@@ -510,7 +519,19 @@ def tui_command(args: argparse.Namespace) -> int:
     prompt = str(args.prompt).strip() or "Your topic"
     project_dir = Path(args.project_dir).expanduser().resolve()
     minutes = max(1, int(args.minutes))
-    return run_tui(prompt=prompt, project_dir=project_dir, minutes=minutes)
+    voice_profile = str(args.voice_profile).strip() or "calm-documentary"
+    voice_speed = max(0.5, min(2.0, float(args.voice_speed)))
+    melo_language = str(args.melo_language).strip().upper() or "EN"
+    melo_speaker = str(args.melo_speaker).strip() or "EN-US"
+    return run_tui(
+        prompt=prompt,
+        project_dir=project_dir,
+        minutes=minutes,
+        voice_profile=voice_profile,
+        voice_speed=voice_speed,
+        melo_language=melo_language,
+        melo_speaker=melo_speaker,
+    )
 
 
 def imagine_entry() -> int:
@@ -520,6 +541,10 @@ def imagine_entry() -> int:
         prompt="Autonomous cars",
         project_dir=(Path.home() / ".imagine" / "projects" / "autonomous-cars").resolve(),
         minutes=2,
+        voice_profile="calm-documentary",
+        voice_speed=1.0,
+        melo_language="EN",
+        melo_speaker="EN-US",
     )
 
 

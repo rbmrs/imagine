@@ -22,11 +22,16 @@ class TuiConfig:
     prompt: str
     project_dir: Path
     minutes: int
+    voice_profile: str
+    voice_speed: float
+    melo_language: str
+    melo_speaker: str
 
 
 class LocalVideoMvpTui:
     SPINNER_FRAMES = ["-", "\\", "|", "/"]
     STOCK_ENV_KEYS = ("PEXELS_API_KEY", "PIXABAY_API_KEY")
+    VOICE_PROFILE_CHOICES = ("calm-documentary", "balanced", "energetic-explainer")
     STAGE_LINE_RE = re.compile(r"\[local-video-mvp\]\s+Stage\s+(\d+(?:\.\d+)?)/(\d+):\s+(.+)")
     STAGE_COMPLETE_RE = re.compile(r"\[local-video-mvp\]\s+([A-Za-z0-9_]+)\s+completed in\s+([0-9]+(?:\.[0-9]+)?)s")
 
@@ -153,6 +158,10 @@ class LocalVideoMvpTui:
 
         if char in {"r", "R"}:
             self._start_run_workflow()
+            return
+
+        if char in {"e", "E"}:
+            self._edit_parameters()
             return
 
     def _start_run_workflow(self) -> None:
@@ -295,8 +304,14 @@ class LocalVideoMvpTui:
             "--require-ollama",
             "--tts-engine",
             "melo",
+            "--melo-language",
+            self.config.melo_language,
+            "--melo-speaker",
+            self.config.melo_speaker,
             "--voice-profile",
-            "calm-documentary",
+            self.config.voice_profile,
+            "--voice-speed",
+            f"{self.config.voice_speed:.2f}",
             "--video-effects",
             "subtle-motion",
             "--include-intro",
@@ -355,7 +370,7 @@ class LocalVideoMvpTui:
         stdscr.erase()
         height, width = stdscr.getmaxyx()
 
-        if width < 50 or height < 16:
+        if width < 50 or height < 19:
             self._draw_compact(height, width)
             stdscr.refresh()
             return
@@ -364,24 +379,32 @@ class LocalVideoMvpTui:
         title = f" Imagine TUI {spinner} "
         self._safe_addstr(0, 0, title, width, attr=self._attr("title", bold=True))
 
-        hint = "R Run  Q Quit"
+        hint = "R Run  E Edit  Q Quit"
         self._safe_addstr(1, 0, hint, width, attr=self._attr("muted"))
         self._safe_hline(2, width)
 
-        self._draw_box(3, 0, 5, width, title=" Configuration ", attr=self._attr("accent"))
+        self._draw_box(3, 0, 7, width, title=" Configuration ", attr=self._attr("accent"))
         self._safe_addstr(4, 2, f"Prompt : {self._trim_tail(self.config.prompt, width - 14)}", width)
         self._safe_addstr(5, 2, f"Project: {self._trim_middle(str(self.config.project_dir), width - 14)}", width)
         self._safe_addstr(6, 2, f"Minutes: {self.config.minutes}", width)
+        self._safe_addstr(
+            7,
+            2,
+            f"Voice  : {self.config.melo_language}/{self.config.melo_speaker}  "
+            f"profile={self.config.voice_profile} speed={self.config.voice_speed:.2f}",
+            width,
+        )
+        self._safe_addstr(8, 2, "Edit with E (prompt, duration, project, voice).", width, attr=self._attr("muted"))
 
-        self._draw_box(8, 0, 6, width, title=" Runtime ", attr=self._attr("accent"))
+        self._draw_box(10, 0, 6, width, title=" Runtime ", attr=self._attr("accent"))
         state_text, state_attr = self._state_display()
-        self._safe_addstr(9, 2, f"State  : {state_text}", width, attr=state_attr)
-        self._safe_addstr(10, 2, f"Phase  : {self._trim_tail(self._progress_phase_text(), width - 14)}", width)
+        self._safe_addstr(11, 2, f"State  : {state_text}", width, attr=state_attr)
+        self._safe_addstr(12, 2, f"Phase  : {self._trim_tail(self._progress_phase_text(), width - 14)}", width)
         assets_text, assets_attr = self._asset_status_display()
-        self._safe_addstr(11, 2, f"Assets : {self._trim_tail(assets_text, width - 14)}", width, attr=assets_attr)
-        self._safe_addstr(12, 2, f"Status : {self._trim_tail(self._get_status(), width - 14)}", width)
+        self._safe_addstr(13, 2, f"Assets : {self._trim_tail(assets_text, width - 14)}", width, attr=assets_attr)
+        self._safe_addstr(14, 2, f"Status : {self._trim_tail(self._get_status(), width - 14)}", width)
 
-        logs_top = 14
+        logs_top = 16
         logs_height = max(3, height - logs_top - 1)
         self._draw_box(logs_top, 0, logs_height, width, title=" Logs ", attr=self._attr("accent"))
 
@@ -402,21 +425,31 @@ class LocalVideoMvpTui:
 
     def _draw_compact(self, height: int, width: int) -> None:
         self._safe_addstr(0, 0, "Imagine TUI", width, attr=self._attr("title", bold=True))
-        self._safe_addstr(1, 0, "R Run  Q Quit", width, attr=self._attr("muted"))
+        self._safe_addstr(1, 0, "R Run  E Edit  Q Quit", width, attr=self._attr("muted"))
         self._safe_addstr(3, 0, f"Prompt: {self._trim_tail(self.config.prompt, width - 8)}", width)
         self._safe_addstr(4, 0, f"Project: {self._trim_middle(str(self.config.project_dir), width - 9)}", width)
         self._safe_addstr(5, 0, f"Minutes: {self.config.minutes}", width)
+        self._safe_addstr(
+            6,
+            0,
+            self._trim_tail(
+                f"Voice: {self.config.melo_language}/{self.config.melo_speaker} "
+                f"{self.config.voice_profile} {self.config.voice_speed:.2f}",
+                width,
+            ),
+            width,
+        )
         state_text, state_attr = self._state_display()
-        self._safe_addstr(7, 0, f"{state_text}", width, attr=state_attr)
-        self._safe_addstr(8, 0, self._trim_tail(self._progress_phase_text(), width), width)
+        self._safe_addstr(8, 0, f"{state_text}", width, attr=state_attr)
+        self._safe_addstr(9, 0, self._trim_tail(self._progress_phase_text(), width), width)
         assets_text, assets_attr = self._asset_status_display()
-        self._safe_addstr(9, 0, self._trim_tail(assets_text, width), width, attr=assets_attr)
-        self._safe_addstr(10, 0, self._trim_tail(self._get_status(), width), width)
+        self._safe_addstr(10, 0, self._trim_tail(assets_text, width), width, attr=assets_attr)
+        self._safe_addstr(11, 0, self._trim_tail(self._get_status(), width), width)
 
         logs = self._get_logs()
-        log_rows = max(1, height - 12)
+        log_rows = max(1, height - 13)
         for idx, line in enumerate(logs[-log_rows:]):
-            self._safe_addstr(12 + idx, 0, self._trim_tail(line, width), width, attr=self._log_line_attr(line))
+            self._safe_addstr(13 + idx, 0, self._trim_tail(line, width), width, attr=self._log_line_attr(line))
 
     def _state_display(self) -> tuple[str, int]:
         running = self._is_running()
@@ -811,6 +844,170 @@ class LocalVideoMvpTui:
             self._stage_index = None
             self._stage_total = None
 
+    def _edit_parameters(self) -> None:
+        if self._is_running():
+            self._set_status("Cannot edit while a run is in progress.")
+            return
+
+        had_warning = False
+        self._set_status("Edit mode: press Enter to keep current values.")
+
+        prompt_value = self._prompt_input("Prompt", self.config.prompt)
+        if prompt_value is not None:
+            candidate = prompt_value.strip()
+            if candidate:
+                self.config.prompt = candidate
+            else:
+                self._append_log("WARN: Prompt cannot be empty. Keeping previous value.")
+                had_warning = True
+
+        minutes_value = self._prompt_input("Minutes", str(self.config.minutes))
+        if minutes_value is not None:
+            try:
+                minutes = int(minutes_value)
+                if minutes <= 0:
+                    raise ValueError
+                self.config.minutes = minutes
+            except ValueError:
+                self._append_log("WARN: Minutes must be a positive integer. Keeping previous value.")
+                had_warning = True
+
+        project_dir_value = self._prompt_input("Project dir", str(self.config.project_dir))
+        if project_dir_value is not None:
+            self.config.project_dir = Path(project_dir_value).expanduser().resolve()
+
+        language_value = self._prompt_input("Melo language", self.config.melo_language)
+        if language_value is not None:
+            candidate_language = language_value.strip().upper()
+            if candidate_language:
+                self.config.melo_language = candidate_language
+            else:
+                self._append_log("WARN: Melo language cannot be empty. Keeping previous value.")
+                had_warning = True
+
+        available_speakers = self._load_melo_speakers(self.config.melo_language)
+        if available_speakers:
+            preview = ", ".join(available_speakers[:8])
+            suffix = " ..." if len(available_speakers) > 8 else ""
+            self._append_log(f"Speakers [{self.config.melo_language}]: {preview}{suffix}")
+        else:
+            self._append_log(
+                f"WARN: Could not load speaker inventory for language {self.config.melo_language}. "
+                "Manual speaker input will still be accepted."
+            )
+
+        speaker_value = self._prompt_input(
+            f"Melo speaker ({self.config.melo_language})",
+            self.config.melo_speaker,
+        )
+        if speaker_value is not None:
+            candidate_speaker = speaker_value.strip()
+            if not candidate_speaker:
+                self._append_log("WARN: Melo speaker cannot be empty. Keeping previous value.")
+                had_warning = True
+            elif available_speakers and candidate_speaker not in available_speakers:
+                self._append_log(
+                    f"WARN: Speaker '{candidate_speaker}' not found for {self.config.melo_language}. "
+                    "Keeping previous value."
+                )
+                had_warning = True
+            else:
+                self.config.melo_speaker = candidate_speaker
+
+        profile_hint = "|".join(self.VOICE_PROFILE_CHOICES)
+        profile_value = self._prompt_input(f"Voice profile ({profile_hint})", self.config.voice_profile)
+        if profile_value is not None:
+            candidate_profile = profile_value.strip()
+            if candidate_profile in self.VOICE_PROFILE_CHOICES:
+                self.config.voice_profile = candidate_profile
+            else:
+                self._append_log(
+                    f"WARN: Unknown voice profile '{candidate_profile}'. "
+                    f"Use one of: {', '.join(self.VOICE_PROFILE_CHOICES)}"
+                )
+                had_warning = True
+
+        speed_value = self._prompt_input("Voice speed (0.5-2.0)", f"{self.config.voice_speed:.2f}")
+        if speed_value is not None:
+            try:
+                speed = float(speed_value)
+                if speed < 0.5 or speed > 2.0:
+                    raise ValueError
+                self.config.voice_speed = speed
+            except ValueError:
+                self._append_log("WARN: Voice speed must be between 0.5 and 2.0. Keeping previous value.")
+                had_warning = True
+
+        self._refresh_prior_total_seconds()
+        self._refresh_stock_key_cache()
+
+        self._append_log(
+            "Updated config: "
+            f"minutes={self.config.minutes}, "
+            f"voice={self.config.melo_language}/{self.config.melo_speaker}, "
+            f"profile={self.config.voice_profile}, speed={self.config.voice_speed:.2f}"
+        )
+
+        if had_warning:
+            self._set_status("Parameters updated with warnings.")
+        else:
+            self._set_status("Parameters updated.")
+
+    def _prompt_input(self, label: str, current_value: str) -> str | None:
+        if self._stdscr is None:
+            return None
+
+        stdscr = self._stdscr
+        height, width = stdscr.getmaxyx()
+        prompt = f"{label} [{current_value}] > "
+        prompt_display = self._trim_tail(prompt, max(1, width - 1))
+
+        stdscr.nodelay(False)
+        stdscr.timeout(-1)
+        curses.echo()
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+
+        raw = b""
+        try:
+            stdscr.move(height - 1, 0)
+            stdscr.clrtoeol()
+            self._safe_addstr(height - 1, 0, prompt_display, width, attr=self._attr("accent", bold=True))
+            stdscr.refresh()
+
+            input_col = min(len(prompt_display), max(0, width - 2))
+            raw = stdscr.getstr(height - 1, input_col, max(1, width - input_col - 1))
+        except curses.error:
+            raw = b""
+        finally:
+            curses.noecho()
+            stdscr.nodelay(True)
+            stdscr.timeout(120)
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+
+        value = raw.decode("utf-8", errors="ignore").strip()
+        if not value:
+            return None
+        return value
+
+    def _load_melo_speakers(self, language: str) -> list[str]:
+        try:
+            from melo.api import TTS  # type: ignore
+
+            tts = TTS(language=language, device="auto")
+            hps = getattr(tts, "hps", None)
+            hps_data = getattr(hps, "data", None)
+            spk2id = dict(getattr(hps_data, "spk2id", {}) or {})
+            return sorted(str(name) for name in spk2id.keys())
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"WARN: Melo speaker inventory unavailable for {language}: {exc}")
+            return []
+
     def _trim_tail(self, text: str, limit: int) -> str:
         if limit <= 0:
             return ""
@@ -947,7 +1144,23 @@ class LocalVideoMvpTui:
                 pass
 
 
-def run_tui(prompt: str, project_dir: Path, minutes: int) -> int:
-    config = TuiConfig(prompt=prompt, project_dir=project_dir, minutes=max(1, minutes))
+def run_tui(
+    prompt: str,
+    project_dir: Path,
+    minutes: int,
+    voice_profile: str,
+    voice_speed: float,
+    melo_language: str,
+    melo_speaker: str,
+) -> int:
+    config = TuiConfig(
+        prompt=prompt,
+        project_dir=project_dir,
+        minutes=max(1, minutes),
+        voice_profile=voice_profile,
+        voice_speed=max(0.5, min(2.0, float(voice_speed))),
+        melo_language=str(melo_language).strip() or "EN",
+        melo_speaker=str(melo_speaker).strip() or "EN-US",
+    )
     app = LocalVideoMvpTui(config)
     return app.run()
