@@ -332,7 +332,7 @@ class LocalVideoMvpTui:
         else:
             workspace = self._active_project_dir
 
-        if self._hitl_stage == "draft" and not self._ensure_ollama_available_with_modal():
+        if self._hitl_stage in {"draft", "full"} and not self._ensure_ollama_available_with_modal():
             return
 
         self._mark_command_start(workflow_kind="run")
@@ -363,7 +363,7 @@ class LocalVideoMvpTui:
             for warning in self._stock_key_warnings:
                 self._append_log(f"WARN: {warning}")
 
-            if stage == "draft":
+            if stage in {"draft", "full"}:
                 self._ensure_ollama_running()
 
             run_code = self._run_and_stream(self._build_run_command(workflow_stage=stage), label="run")
@@ -676,7 +676,7 @@ class LocalVideoMvpTui:
                 "`--script-engine template` instead."
             ),
         )
-        self._append_log("WARN: Ollama unavailable. Draft stage was blocked before run start.")
+        self._append_log("WARN: Ollama unavailable. Run was blocked before start.")
         self._set_status("Ollama unavailable. Start `ollama serve` and retry.")
         return False
 
