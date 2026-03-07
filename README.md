@@ -140,7 +140,7 @@ For quick debug loops, add `--fast-mode`. This applies a cheaper profile:
 - caps target duration to 1 minute
 - lowers render resolution/fps
 - switches captions to `heuristic`
-- disables intro/outro cards while keeping burned subtitles enabled
+- keeps shorter intro/outro cards while keeping burned subtitles enabled
 - relaxes external asset requirement so placeholder paths can still complete
 
 Duration control defaults to a +/-25% tolerance around requested minutes.

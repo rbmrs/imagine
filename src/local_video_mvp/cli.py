@@ -112,8 +112,10 @@ def _apply_fast_mode_profile(config: PipelineConfig) -> None:
     config.width, config.height = _scaled_fast_mode_resolution(config.width, config.height)
     config.fps = min(config.fps, 24)
     config.video_effects = "clean"
-    config.include_intro = False
-    config.include_outro = False
+    config.include_intro = True
+    config.include_outro = True
+    config.intro_seconds = min(max(0.8, float(config.intro_seconds)), 1.2)
+    config.outro_seconds = min(max(1.0, float(config.outro_seconds)), 1.4)
     config.caption_engine = "heuristic"
     config.burn_subtitles = True
     config.max_duration_adjust_passes = 0
