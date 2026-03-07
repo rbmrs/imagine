@@ -106,6 +106,55 @@ def _scaled_fast_mode_resolution(width: int, height: int) -> tuple[int, int]:
     return (max(2, scaled_width), max(2, scaled_height))
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _discover_default_brand_bookend_assets() -> dict[str, str] | None:
+    candidate_roots = [
+        _repo_root(),
+        Path.cwd().resolve(),
+    ]
+    seen: set[Path] = set()
+
+    for root in candidate_roots:
+        if root in seen:
+            continue
+        seen.add(root)
+        brand_dir = root / "projects" / "brand-kit"
+        logo_path = brand_dir / "logo-option-3-geometric.png"
+        intro_path = brand_dir / "channel-bg-intro.jpg"
+        outro_path = brand_dir / "channel-bg-outro.jpg"
+        if not logo_path.exists():
+            continue
+        if not intro_path.exists() and not outro_path.exists():
+            continue
+        return {
+            "brand_logo_path": str(logo_path.resolve()),
+            "brand_intro_image_path": str(intro_path.resolve()) if intro_path.exists() else "",
+            "brand_outro_image_path": str(outro_path.resolve()) if outro_path.exists() else "",
+        }
+
+    return None
+
+
+def _apply_default_brand_bookends(config: PipelineConfig) -> None:
+    if str(config.bookend_style or "").strip().lower() not in {"", "minimal-clean"}:
+        return
+    if config.brand_logo_path or config.brand_intro_image_path or config.brand_outro_image_path:
+        return
+
+    assets = _discover_default_brand_bookend_assets()
+    if assets is None:
+        return
+
+    config.bookend_style = "brand-image-motion"
+    config.brand_logo_path = assets.get("brand_logo_path") or None
+    config.brand_intro_image_path = assets.get("brand_intro_image_path") or None
+    config.brand_outro_image_path = assets.get("brand_outro_image_path") or None
+    config.brand_use_scene_fallback = False
+
+
 def _apply_fast_mode_profile(config: PipelineConfig) -> None:
     config.fast_mode = True
     config.minutes = min(config.minutes, 1)
@@ -160,7 +209,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--fast-mode",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Use a faster debug profile (caps duration, lowers render cost, disables bookends and burned subtitles)",
+        help="Use a faster debug profile (caps duration, lowers render cost, shortens bookends, keeps burned subtitles)",
     )
 
     run.add_argument(
@@ -446,6 +495,7 @@ def run_command(args: argparse.Namespace) -> int:
     )
     if config.fast_mode:
         _apply_fast_mode_profile(config)
+    _apply_default_brand_bookends(config)
 
     pipeline = VideoPipeline(config)
     workflow_stage = str(args.workflow_stage).strip().lower()
@@ -574,6 +624,7 @@ def replace_clips_command(args: argparse.Namespace) -> int:
         brand_use_scene_fallback=_coerce_bool(manifest_config.get("brand_use_scene_fallback"), False),
         verbose=bool(args.verbose),
     )
+    _apply_default_brand_bookends(config)
 
     pipeline = VideoPipeline(config)
     outputs = pipeline.replace_clips_by_name(clip_names)

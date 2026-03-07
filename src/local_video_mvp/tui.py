@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Deque, Literal, TextIO, TypeVar, cast, overload
 
+from .cli import _apply_default_brand_bookends
 from .models import PipelineConfig
 from .pipeline import VideoPipeline
 
@@ -2175,6 +2176,7 @@ class LocalVideoMvpTui:
             min_scene_seconds=5.0,
             verbose=True,
         )
+        _apply_default_brand_bookends(config)
         return VideoPipeline(config)
 
     def _synthesize_scene_narration_sample(self, project_dir: Path, scene_id: str, text: str) -> Path | None:

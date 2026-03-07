@@ -178,6 +178,8 @@ Intro/outro options:
 - `--brand-outro-image-path /path/to/outro-bg.jpg`
 - `--brand-use-scene-fallback` / `--no-brand-use-scene-fallback`
 
+When `projects/brand-kit/` contains the standard channel assets, the CLI now auto-promotes the default bookend style to `brand-image-motion` and uses those assets unless you explicitly provide alternate brand paths or a different non-default style.
+
 If you use `--script-engine ollama`, make sure Ollama server is running:
 
 ```bash

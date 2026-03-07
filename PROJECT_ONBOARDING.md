@@ -86,6 +86,7 @@ Outputs per run are created under `projects/<project-id>/`.
 - Brand-driven bookends support logo + custom intro/outro background images
 - Intro/outro title wrapping + safer text rendering for punctuation-heavy titles
 - Fast/debug mode for shorter lower-cost validation runs
+- Default runs auto-use `projects/brand-kit/` assets for branded bookends when that kit is present
 
 ## CLI commands you should know
 
