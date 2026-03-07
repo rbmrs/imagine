@@ -3937,6 +3937,7 @@ class LocalVideoMvpTui:
                         label="Voice",
                         options=[item["label"] for item in voice_entries],
                         current_value=current_label,
+                        marked_value=current_label,
                         return_escaped=True,
                     )
                 )
@@ -3970,6 +3971,7 @@ class LocalVideoMvpTui:
                         label="Voice profile",
                         options=list(self.VOICE_PROFILE_CHOICES),
                         current_value=self.config.voice_profile,
+                        marked_value=self.config.voice_profile,
                         return_escaped=True,
                     )
                 )
@@ -4365,6 +4367,7 @@ class LocalVideoMvpTui:
         options: list[str],
         current_value: str,
         *,
+        marked_value: str | None = None,
         return_escaped: Literal[False] = False,
     ) -> str | None:
         ...
@@ -4376,6 +4379,7 @@ class LocalVideoMvpTui:
         options: list[str],
         current_value: str,
         *,
+        marked_value: str | None = None,
         return_escaped: Literal[True],
     ) -> tuple[str | None, bool]:
         ...
@@ -4386,6 +4390,7 @@ class LocalVideoMvpTui:
         options: list[str],
         current_value: str,
         *,
+        marked_value: str | None = None,
         return_escaped: bool = False,
     ) -> str | None | tuple[str | None, bool]:
         if self._stdscr is None:
@@ -4430,7 +4435,7 @@ class LocalVideoMvpTui:
                 pass
 
             title_text = self._trim_tail(f" {label} ", max(1, modal_width - 4))
-            help_text = "Enter select | Esc back"
+            help_text = "Enter select | Esc back" if not marked_value else "Enter select | * current | Esc back"
             try:
                 win.addstr(0, 2, title_text, self._attr("accent", bold=True))
                 win.addstr(modal_height - 1, 2, self._trim_tail(help_text, modal_width - 4), self._attr("muted"))
@@ -4448,7 +4453,8 @@ class LocalVideoMvpTui:
                     break
                 item = normalized[option_index]
                 prefix = ">" if option_index == selected else " "
-                line = self._trim_tail(f"{prefix} {item}", modal_width - 2)
+                marker = "*" if marked_value and item == marked_value else " "
+                line = self._trim_tail(f"{prefix} {marker} {item}", modal_width - 2)
                 attr = curses.A_REVERSE if option_index == selected else 0
                 try:
                     win.addstr(1 + row, 1, line, attr)
