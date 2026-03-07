@@ -89,6 +89,38 @@ def _coerce_str(value: Any, default: str) -> str:
     return default
 
 
+def _scaled_fast_mode_resolution(width: int, height: int) -> tuple[int, int]:
+    if width <= 0 or height <= 0:
+        return (640, 360)
+
+    scale = min(1.0, 640.0 / float(width), 360.0 / float(height))
+    if scale >= 1.0:
+        return (width, height)
+
+    scaled_width = max(2, int(width * scale))
+    scaled_height = max(2, int(height * scale))
+    if scaled_width % 2 != 0:
+        scaled_width -= 1
+    if scaled_height % 2 != 0:
+        scaled_height -= 1
+    return (max(2, scaled_width), max(2, scaled_height))
+
+
+def _apply_fast_mode_profile(config: PipelineConfig) -> None:
+    config.fast_mode = True
+    config.minutes = min(config.minutes, 1)
+    config.width, config.height = _scaled_fast_mode_resolution(config.width, config.height)
+    config.fps = min(config.fps, 24)
+    config.video_effects = "clean"
+    config.include_intro = False
+    config.include_outro = False
+    config.caption_engine = "heuristic"
+    config.burn_subtitles = False
+    config.max_duration_adjust_passes = 0
+    config.require_external_assets = False
+    config.max_scenes = min(config.max_scenes, 6)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="local-video-mvp",
@@ -122,6 +154,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--minutes", type=int, default=5, help="Target duration in minutes (default: 5)")
     run.add_argument("--resolution", default="1280x720", help="Output resolution, default 1280x720")
     run.add_argument("--fps", type=int, default=30, help="Output frame rate")
+    run.add_argument(
+        "--fast-mode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use a faster debug profile (caps duration, lowers render cost, disables bookends and burned subtitles)",
+    )
 
     run.add_argument(
         "--script-engine",
@@ -329,6 +367,12 @@ def build_parser() -> argparse.ArgumentParser:
     tui.add_argument("--tts-engine", choices=["melo", "piper"], default="melo", help="Initial TTS engine")
     tui.add_argument("--piper-voice-id", default="", help="Initial Piper voice id")
     tui.add_argument("--piper-speaker-id", type=int, help="Initial Piper speaker id")
+    tui.add_argument(
+        "--fast-mode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Initial TUI fast/debug mode state",
+    )
 
     return parser
 
@@ -349,6 +393,7 @@ def run_command(args: argparse.Namespace) -> int:
         prompt=args.prompt.strip(),
         project_dir=Path(args.project_dir).expanduser().resolve(),
         asset_keywords=_parse_asset_keywords(str(args.asset_keywords)),
+        fast_mode=bool(args.fast_mode),
         minutes=max(1, args.minutes),
         width=width,
         height=height,
@@ -397,6 +442,8 @@ def run_command(args: argparse.Namespace) -> int:
         min_scene_seconds=max(1.0, float(args.min_scene_seconds)),
         verbose=bool(args.verbose),
     )
+    if config.fast_mode:
+        _apply_fast_mode_profile(config)
 
     pipeline = VideoPipeline(config)
     workflow_stage = str(args.workflow_stage).strip().lower()
@@ -496,6 +543,7 @@ def replace_clips_command(args: argparse.Namespace) -> int:
         prompt=prompt,
         project_dir=project_dir,
         asset_keywords=keywords,
+        fast_mode=_coerce_bool(manifest_config.get("fast_mode"), False),
         minutes=max(1, _coerce_int(manifest_config.get("minutes"), 1)),
         width=width,
         height=height,
@@ -802,6 +850,7 @@ def tui_command(args: argparse.Namespace) -> int:
         tts_engine = "melo"
     piper_voice_id = str(args.piper_voice_id).strip()
     piper_speaker_id = args.piper_speaker_id
+    fast_mode = bool(args.fast_mode)
     return run_tui(
         prompt=prompt,
         asset_keywords=asset_keywords,
@@ -814,6 +863,7 @@ def tui_command(args: argparse.Namespace) -> int:
         tts_engine=tts_engine,
         piper_voice_id=piper_voice_id,
         piper_speaker_id=piper_speaker_id,
+        fast_mode=fast_mode,
     )
 
 
@@ -832,6 +882,7 @@ def imagine_entry() -> int:
         tts_engine="melo",
         piper_voice_id="",
         piper_speaker_id=None,
+        fast_mode=False,
     )
 
 

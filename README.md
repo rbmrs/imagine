@@ -135,6 +135,14 @@ local-video-mvp run \
   --strict-commercial-safe
 ```
 
+For quick debug loops, add `--fast-mode`. This applies a cheaper profile:
+
+- caps target duration to 1 minute
+- lowers render resolution/fps
+- switches captions to `heuristic`
+- disables intro/outro cards and burned subtitle burn-in
+- relaxes external asset requirement so placeholder paths can still complete
+
 Duration control defaults to a +/-25% tolerance around requested minutes.
 If generated narration is too short, the pipeline auto-expands script content and retries synthesis.
 
@@ -248,7 +256,7 @@ local-video-mvp tui \
 Key bindings:
 
 - `R`: run/advance HITL flow (`draft (review-ready) -> scene review -> preview -> finalize`) for the active workspace
-- `S`: open settings (currently includes `HITL` On/Off toggle)
+- `S`: open settings (`HITL` On/Off and `Fast mode` On/Off for quicker debug runs)
 - `E`: edit parameters (`prompt`, `asset keywords`, `minutes`, `voice speed`) and choose from lists for language/speaker/profile
 - `D`: open debug menu (terminal video playback test + unified `Test voices` list with Melo and Piper entries)
 - `C`: clean old auto-managed workspaces (mark with Space, delete with Enter)

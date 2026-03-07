@@ -10,6 +10,7 @@ class PipelineConfig:
     prompt: str
     project_dir: Path
     asset_keywords: list[str] = field(default_factory=list)
+    fast_mode: bool = False
     minutes: int = 5
     width: int = 1280
     height: int = 720

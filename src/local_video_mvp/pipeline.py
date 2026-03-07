@@ -155,6 +155,18 @@ class VideoPipeline:
         self.pacing_stats = {}
         self.asset_stats = {}
         self.optimization_stats = {}
+        self.optimization_stats["profile"] = {
+            "fast_mode": bool(self.config.fast_mode),
+            "minutes": self.config.minutes,
+            "resolution": f"{self.config.width}x{self.config.height}",
+            "fps": self.config.fps,
+            "caption_engine": self.config.caption_engine,
+            "burn_subtitles": self.config.burn_subtitles,
+            "include_intro": self.config.include_intro,
+            "include_outro": self.config.include_outro,
+            "require_external_assets": self.config.require_external_assets,
+            "video_effects": self.config.video_effects,
+        }
         self.used_template_fallback = False
         self._piper_command = None
 
@@ -822,6 +834,7 @@ class VideoPipeline:
             "narration_sha256": self._safe_file_sha256(self.paths["narration_wav"]),
             "captions_ass_sha256": self._safe_file_sha256(self.paths["captions_ass"]) if self.config.burn_subtitles else "",
             "render": {
+                "fast_mode": self.config.fast_mode,
                 "width": self.config.width,
                 "height": self.config.height,
                 "fps": self.config.fps,
@@ -4318,6 +4331,7 @@ class VideoPipeline:
             "app_version": "0.1.0",
             "pipeline_version": "v1-local-720p",
             "config": {
+                "fast_mode": self.config.fast_mode,
                 "minutes": self.config.minutes,
                 "asset_keywords": list(self.config.asset_keywords),
                 "resolution": f"{self.config.width}x{self.config.height}",
