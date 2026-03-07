@@ -222,7 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--require-ollama",
         action="store_true",
-        help="Fail the run if Ollama server/model is unavailable (no template fallback)",
+        help="Deprecated compatibility flag; --script-engine ollama already fails if Ollama is unavailable",
     )
 
     run.add_argument(

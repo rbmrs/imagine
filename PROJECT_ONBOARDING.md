@@ -89,6 +89,7 @@ Outputs per run are created under `projects/<project-id>/`.
 - Intro/outro title wrapping + safer text rendering for punctuation-heavy titles
 - Fast/debug mode for shorter lower-cost validation runs
 - Default runs auto-use `projects/brand-kit/` assets for branded bookends when that kit is present
+- Ollama runs now fail fast instead of silently degrading into template-script output
 
 ## CLI commands you should know
 
@@ -149,6 +150,8 @@ TUI shortcut focus for now:
 The TUI persists the last values changed via `Edit` plus settings toggles in `~/.imagine/tui_settings.json`. Startup values from CLI/defaults are used only when the persisted file is absent or contains invalid fields.
 
 Checkpoint modals appear between stages so you can approve/review before continuing. After draft, TUI opens a scene review hub (Up/Down + Enter), then scene-by-scene HITL review (text -> narration -> clip), including clip replacement with same/new keywords before preview/finalize. Once preview is rendered, TUI offers Preview Actions (play preview in terminal, finalize now, or back). Finalize now reuses the approved preview render when inputs are unchanged; otherwise it re-renders.
+
+For draft runs, TUI tries to start `ollama serve` automatically. If Ollama is still unavailable, TUI now blocks the run and shows an `Ollama unavailable` modal instead of generating placeholder narration.
 
 Fast mode is intended for cheap validation passes. It caps runs to roughly 1 minute, lowers render cost, switches captions to heuristic timing, keeps burned subtitles enabled, uses shorter intro/outro cards, and allows placeholder assets so pipeline plumbing can be checked quickly.
 

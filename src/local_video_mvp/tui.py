@@ -332,6 +332,9 @@ class LocalVideoMvpTui:
         else:
             workspace = self._active_project_dir
 
+        if self._hitl_stage == "draft" and not self._ensure_ollama_available_with_modal():
+            return
+
         self._mark_command_start(workflow_kind="run")
         self._set_running(True)
         self._set_status(f"Starting {self._hitl_stage} stage: {workspace.name}")
@@ -591,6 +594,7 @@ class LocalVideoMvpTui:
                     "ollama",
                     "--ollama-model",
                     "qwen2.5:14b",
+                    "--require-ollama",
                 ]
             )
             if stage == "draft":
@@ -639,6 +643,42 @@ class LocalVideoMvpTui:
         self._append_log(f"Started Ollama server (pid={process.pid}).")
         self._append_log(f"Ollama log: {log_path}")
         time.sleep(2.0)
+
+    def _ollama_available(self) -> bool:
+        if shutil.which("ollama") is None:
+            return False
+        try:
+            result = subprocess.run(
+                ["ollama", "list"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            return False
+        return result.returncode == 0
+
+    def _ensure_ollama_available_with_modal(self) -> bool:
+        if self._ollama_available():
+            return True
+
+        self._ensure_ollama_running()
+        if self._ollama_available():
+            return True
+
+        self._show_paginated_text_modal(
+            "Ollama Unavailable",
+            (
+                "Ollama is unavailable, so script generation cannot continue.\n\n"
+                "Start Ollama with `ollama serve` and try again.\n"
+                "If you intentionally want placeholder script text, run the CLI with "
+                "`--script-engine template` instead."
+            ),
+        )
+        self._append_log("WARN: Ollama unavailable. Draft stage was blocked before run start.")
+        self._set_status("Ollama unavailable. Start `ollama serve` and retry.")
+        return False
 
     def _draw(self) -> None:
         if self._stdscr is None:

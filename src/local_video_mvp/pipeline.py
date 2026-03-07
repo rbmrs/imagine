@@ -1115,10 +1115,9 @@ class VideoPipeline:
             self._require_binary("ollama")
             self._ollama_ready = self._ollama_server_ready()
             if not self._ollama_ready:
-                message = "Could not connect to Ollama server; run 'ollama serve' to enable model-based scripts"
-                if self.config.require_ollama:
-                    raise RuntimeError(message)
-                self._warn(message + ". Falling back to template script mode.")
+                raise RuntimeError(
+                    "Ollama is unavailable. Start it with 'ollama serve' or switch to --script-engine template."
+                )
         if self.config.tts_engine == "piper":
             command = self._resolve_piper_command()
             if command is None:
@@ -1149,7 +1148,9 @@ class VideoPipeline:
         if self.config.script_engine == "ollama" and self._ollama_ready:
             raw_plan = self._generate_script_plan_ollama()
             if raw_plan is None:
-                self._warn("Ollama plan generation failed; using template fallback")
+                raise RuntimeError(
+                    "Ollama script generation failed. Fix the Ollama model/server or switch to --script-engine template."
+                )
 
         if raw_plan is None:
             self.used_template_fallback = True
@@ -1293,6 +1294,8 @@ class VideoPipeline:
             )
 
         if not scenes:
+            if self.config.script_engine == "ollama":
+                raise RuntimeError("Ollama returned an invalid script plan with no usable scenes.")
             fallback = self._generate_script_plan_template()
             return self._normalize_script_plan(fallback)
 

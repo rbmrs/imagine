@@ -198,8 +198,7 @@ If you use `--script-engine ollama`, make sure Ollama server is running:
 ollama serve
 ```
 
-In non-strict mode, when Ollama is unavailable the pipeline falls back to a local template script and logs a warning.
-To force a hard failure instead, add `--require-ollama`.
+When `--script-engine ollama` is selected, the pipeline now fails fast if Ollama is unavailable or returns an invalid script plan. Use `--script-engine template` only when you intentionally want the local placeholder/debug script path.
 
 To run narration with Piper instead of Melo:
 
@@ -304,7 +303,7 @@ Current MVP voice picker scope:
 - Melo speaker picker is loaded from available EN speakers on your machine
 - Piper picker uses curated built-in voices (same catalog used by Debug -> Test voices)
 
-If Ollama is not already running, the TUI tries to start `ollama serve` automatically and stops it on exit when it was started by the TUI.
+If Ollama is not already running, the TUI tries to start `ollama serve` automatically and stops it on exit when it was started by the TUI. If Ollama still cannot be reached, TUI now shows an `Ollama unavailable` modal and blocks the draft run before any placeholder script is generated.
 
 Stock asset keys are auto-discovered by TUI (in this order):
 
