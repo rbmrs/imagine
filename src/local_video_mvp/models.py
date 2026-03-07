@@ -47,6 +47,9 @@ class PipelineConfig:
     brand_intro_image_path: str | None = None
     brand_outro_image_path: str | None = None
     brand_use_scene_fallback: bool = False
+    channel_name: str = "IMAGINE"
+    intro_tagline: str = ""
+    outro_tagline: str = "Watch next"
     voice_profile: str = "calm-documentary"
     voice_speed: float = 1.0
     melo_language: str = "EN"

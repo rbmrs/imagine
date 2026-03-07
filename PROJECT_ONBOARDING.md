@@ -84,6 +84,8 @@ Outputs per run are created under `projects/<project-id>/`.
 - Intro/outro support with configurable timing/text
 - Bookend style presets (`minimal-clean`, `cinematic-subtle`, `brand-image-motion`)
 - Brand-driven bookends support logo + custom intro/outro background images
+- Branded bookends now support `channel_name`, `intro_tagline`, and `outro_tagline`
+- `brand-image-motion` uses a logo-led asymmetric layout instead of a centered title card
 - Intro/outro title wrapping + safer text rendering for punctuation-heavy titles
 - Fast/debug mode for shorter lower-cost validation runs
 - Default runs auto-use `projects/brand-kit/` assets for branded bookends when that kit is present
@@ -133,7 +135,7 @@ Default storage behavior:
 
 - TUI auto-creates run workspaces under `~/.imagine/projects/<prompt-slug>-<timestamp>/`
 - TUI exports final video to `~/Downloads/<prompt-slug>-<timestamp>.mp4`
-- intro/outro cards reuse extracted background frames from resolved scene assets when available
+- intro/outro default to branded bookends when `projects/brand-kit/` is present; otherwise the configured card style is used
 
 TUI shortcut focus for now:
 
@@ -232,6 +234,9 @@ local-video-mvp run \
   --video-effects subtle-motion \
   --include-intro \
   --include-outro \
+  --channel-name IMAGINE \
+  --intro-tagline "Explainers about AI systems and ideas" \
+  --outro-tagline "Watch next" \
   --bookend-style minimal-clean \
   --caption-engine faster-whisper \
   --caption-style engagement \

@@ -256,6 +256,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--intro-seconds", type=float, default=2.8, help="Intro card duration in seconds")
     run.add_argument("--outro-seconds", type=float, default=3.0, help="Outro card duration in seconds")
     run.add_argument("--outro-text", default="Thanks for watching", help="Outro card text")
+    run.add_argument("--channel-name", default="IMAGINE", help="Brand/channel name used in intro/outro")
+    run.add_argument("--intro-tagline", default="", help="Optional small intro tagline")
+    run.add_argument("--outro-tagline", default="Watch next", help="Optional small outro tagline")
     run.add_argument(
         "--bookend-style",
         choices=["minimal-clean", "cinematic-subtle", "brand-image-motion"],
@@ -480,6 +483,9 @@ def run_command(args: argparse.Namespace) -> int:
         intro_seconds=intro_seconds,
         outro_seconds=outro_seconds,
         outro_text=str(args.outro_text).strip() or "Thanks for watching",
+        channel_name=str(args.channel_name).strip() or "IMAGINE",
+        intro_tagline=str(args.intro_tagline).strip(),
+        outro_tagline=str(args.outro_tagline).strip() or "Watch next",
         bookend_style=args.bookend_style,
         brand_logo_path=str(args.brand_logo_path).strip() if args.brand_logo_path else None,
         brand_intro_image_path=str(args.brand_intro_image_path).strip() if args.brand_intro_image_path else None,
@@ -617,6 +623,9 @@ def replace_clips_command(args: argparse.Namespace) -> int:
         intro_seconds=max(0.0, _coerce_float(manifest_config.get("intro_seconds"), 0.0)),
         outro_seconds=max(0.0, _coerce_float(manifest_config.get("outro_seconds"), 0.0)),
         outro_text=_coerce_str(manifest_config.get("outro_text"), "Thanks for watching"),
+        channel_name=_coerce_str(manifest_config.get("channel_name"), "IMAGINE"),
+        intro_tagline=_coerce_str(manifest_config.get("intro_tagline"), ""),
+        outro_tagline=_coerce_str(manifest_config.get("outro_tagline"), "Watch next"),
         bookend_style=_coerce_str(manifest_config.get("bookend_style"), "minimal-clean"),
         brand_logo_path=_coerce_str(manifest_config.get("brand_logo_path"), "") or None,
         brand_intro_image_path=_coerce_str(manifest_config.get("brand_intro_image_path"), "") or None,

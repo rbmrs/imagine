@@ -845,6 +845,9 @@ class VideoPipeline:
                 "intro_seconds": self.config.intro_seconds,
                 "outro_seconds": self.config.outro_seconds,
                 "outro_text": self.config.outro_text,
+                "channel_name": self.config.channel_name,
+                "intro_tagline": self.config.intro_tagline,
+                "outro_tagline": self.config.outro_tagline,
                 "bookend_style": self.config.bookend_style,
                 "brand_logo_path": self.config.brand_logo_path,
                 "brand_intro_image_path": self.config.brand_intro_image_path,
@@ -3761,13 +3764,18 @@ class VideoPipeline:
         palette = self._bookend_palette(style=style, is_intro=True)
         wrapped_title = self._wrap_bookend_text(title or "Explainer")
         title_font = self._bookend_title_font_size(wrapped_title)
+        brand_label = self._bookend_channel_name()
+        intro_tagline = self._normalized_bookend_tagline(self.config.intro_tagline)
 
         title_file = output_clip.with_suffix(".intro_title.txt")
+        brand_file = output_clip.with_suffix(".intro_brand.txt")
         subtitle_file = output_clip.with_suffix(".intro_subtitle.txt")
         self._write_text(title_file, wrapped_title + "\n")
-        self._write_text(subtitle_file, "Generated locally\n")
+        self._write_text(brand_file, brand_label + "\n")
+        self._write_text(subtitle_file, intro_tagline + "\n")
 
         title_textfile = self._escape_drawtext_path(title_file)
+        brand_textfile = self._escape_drawtext_path(brand_file)
         subtitle_textfile = self._escape_drawtext_path(subtitle_file)
 
         title_lines = max(1, len([line for line in wrapped_title.splitlines() if line.strip()]))
@@ -3779,9 +3787,21 @@ class VideoPipeline:
         fade_out_start = max(0.0, duration - fade)
 
         if style == "brand-image-motion":
-            subtitle_font = max(18, int(self.config.height * 0.028))
-            title_y = int(self.config.height * 0.46)
-            subtitle_y = int(self.config.height * 0.72)
+            title_font = max(28, int(title_font * 0.84))
+            subtitle_font = max(16, int(self.config.height * 0.024))
+            brand_font = max(16, int(self.config.height * 0.022))
+            panel_x = int(self.config.width * 0.08)
+            panel_y = int(self.config.height * 0.12)
+            panel_w = int(self.config.width * 0.42)
+            panel_h = int(self.config.height * 0.72)
+            accent_w = max(4, int(self.config.width * 0.006))
+            title_x = panel_x + int(self.config.width * 0.03)
+            logo_y = int(self.config.height * 0.15)
+            title_y = int(self.config.height * 0.42)
+            subtitle_y = int(self.config.height * 0.69)
+            brand_y = int(self.config.height * 0.34)
+            text_alpha = "'if(lt(t,0.22),0,if(lt(t,0.62),(t-0.22)/0.40,1))'"
+            subtitle_alpha = "'if(lt(t,0.38),0,if(lt(t,0.76),(t-0.38)/0.38,1))'"
 
             input_args: list[str] = []
             if background_image and background_image.exists():
@@ -3804,32 +3824,44 @@ class VideoPipeline:
                 (
                     f"[0:v]scale={self.config.width}:{self.config.height}:force_original_aspect_ratio=increase,"
                     f"crop={self.config.width}:{self.config.height},"
-                    "zoompan=z='min(zoom+0.0008,1.07)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+                    "zoompan=z='min(zoom+0.0008,1.06)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
                     f"d=1:s={self.config.width}x{self.config.height}:fps={self.config.fps},"
                     "eq=contrast=1.05:saturation=1.08:brightness=0.015,"
                     f"drawbox=x=0:y=0:w=iw:h=ih:color={palette['overlay']}:t=fill,"
-                    f"drawbox=x=iw*0.08:y=ih*0.20:w=iw*0.84:h=ih*0.62:color={palette['panel']}:t=fill[bookend_base]"
+                    f"drawbox=x={panel_x}:y={panel_y}:w={panel_w}:h={panel_h}:color={palette['panel']}:t=fill,"
+                    f"drawbox=x={panel_x}:y={panel_y + int(self.config.height * 0.08)}:w={accent_w}:h={int(self.config.height * 0.38)}:color={palette['accent']}:t=fill,"
+                    f"drawbox=x={panel_x + int(self.config.width * 0.03)}:y={int(self.config.height * 0.64)}:"
+                    f"w={int(self.config.width * 0.18)}:h=2:color={palette['accent']}:t=fill[bookend_base]"
                 ),
             ]
 
             current_label = "bookend_base"
             if use_logo:
-                logo_width = int(self.config.width * 0.24)
-                filter_parts.append(f"[1:v]scale=w={logo_width}:h=-1[bookend_logo]")
+                logo_width = int(self.config.width * 0.17)
                 filter_parts.append(
-                    f"[{current_label}][bookend_logo]overlay=x=(W-w)/2:y={int(self.config.height * 0.12)}:format=auto[bookend_logo_out]"
+                    f"[1:v]scale=w={logo_width}:h=-1,format=rgba,fade=t=in:st=0.08:d=0.26:alpha=1[bookend_logo]"
+                )
+                filter_parts.append(
+                    f"[{current_label}][bookend_logo]overlay=x={title_x}:y={logo_y}:format=auto[bookend_logo_out]"
                 )
                 current_label = "bookend_logo_out"
 
             if include_text:
-                filter_parts.append(
-                    (
-                        f"[{current_label}]drawtext=textfile='{title_textfile}':fontcolor={palette['title_color']}:"
-                        f"fontsize={title_font}:x=(w-text_w)/2:y={title_y}:line_spacing=10:"
-                        "shadowcolor=black@0.85:shadowx=2:shadowy=2,"
+                text_parts = [
+                    f"drawtext=textfile='{brand_textfile}':fontcolor={palette['subtitle_color']}:fontsize={brand_font}:"
+                    f"x={title_x}:y={brand_y}:alpha={text_alpha}:shadowcolor=black@0.75:shadowx=1:shadowy=1",
+                    f"drawtext=textfile='{title_textfile}':fontcolor={palette['title_color']}:fontsize={title_font}:"
+                    f"x={title_x}:y={title_y}:line_spacing=8:alpha={text_alpha}:"
+                    "shadowcolor=black@0.88:shadowx=2:shadowy=2",
+                ]
+                if intro_tagline:
+                    text_parts.append(
                         f"drawtext=textfile='{subtitle_textfile}':fontcolor={palette['subtitle_color']}:"
-                        f"fontsize={subtitle_font}:x=(w-text_w)/2:y={subtitle_y}[bookend_text]"
+                        f"fontsize={subtitle_font}:x={title_x}:y={subtitle_y}:alpha={subtitle_alpha}:"
+                        "shadowcolor=black@0.72:shadowx=1:shadowy=1"
                     )
+                filter_parts.append(
+                    f"[{current_label}]{','.join(text_parts)}[bookend_text]"
                 )
                 current_label = "bookend_text"
 
@@ -3924,13 +3956,18 @@ class VideoPipeline:
         palette = self._bookend_palette(style=style, is_intro=False)
         wrapped_title = self._wrap_bookend_text(text or "Thanks for watching")
         title_font = self._bookend_title_font_size(wrapped_title)
+        brand_label = self._bookend_channel_name()
+        outro_tagline = self._normalized_bookend_tagline(self.config.outro_tagline)
 
         outro_file = output_clip.with_suffix(".outro_title.txt")
+        brand_file = output_clip.with_suffix(".outro_brand.txt")
         subtitle_file = output_clip.with_suffix(".outro_subtitle.txt")
         self._write_text(outro_file, wrapped_title + "\n")
-        self._write_text(subtitle_file, "See you in the next video\n")
+        self._write_text(brand_file, brand_label + "\n")
+        self._write_text(subtitle_file, outro_tagline + "\n")
 
         outro_textfile = self._escape_drawtext_path(outro_file)
+        brand_textfile = self._escape_drawtext_path(brand_file)
         sub_textfile = self._escape_drawtext_path(subtitle_file)
 
         title_lines = max(1, len([line for line in wrapped_title.splitlines() if line.strip()]))
@@ -3942,9 +3979,25 @@ class VideoPipeline:
         fade_out_start = max(0.0, duration - fade)
 
         if style == "brand-image-motion":
-            subtitle_font = max(18, int(self.config.height * 0.028))
-            title_y = int(self.config.height * 0.12)
-            subtitle_y = int(self.config.height * 0.20)
+            title_font = max(28, int(title_font * 0.8))
+            subtitle_font = max(16, int(self.config.height * 0.024))
+            brand_font = max(16, int(self.config.height * 0.021))
+            header_x = int(self.config.width * 0.09)
+            header_y = int(self.config.height * 0.13)
+            logo_y = int(self.config.height * 0.08)
+            title_y = int(self.config.height * 0.19)
+            subtitle_y = int(self.config.height * 0.31)
+            left_box_x = int(self.config.width * 0.08)
+            right_box_x = int(self.config.width * 0.56)
+            box_y = int(self.config.height * 0.39)
+            box_w = int(self.config.width * 0.30)
+            box_h = int(self.config.height * 0.33)
+            cta_x = int(self.config.width * 0.36)
+            cta_y = int(self.config.height * 0.83)
+            cta_w = int(self.config.width * 0.28)
+            cta_h = int(self.config.height * 0.08)
+            label_y = box_y + box_h + int(self.config.height * 0.03)
+            text_alpha = "'if(lt(t,0.18),0,if(lt(t,0.55),(t-0.18)/0.37,1))'"
 
             input_args: list[str] = []
             if background_image and background_image.exists():
@@ -3971,30 +4024,46 @@ class VideoPipeline:
                     f"d=1:s={self.config.width}x{self.config.height}:fps={self.config.fps},"
                     "eq=contrast=1.04:saturation=1.05:brightness=0.01,"
                     f"drawbox=x=0:y=0:w=iw:h=ih:color={palette['overlay']}:t=fill,"
-                    f"drawbox=x=iw*0.06:y=ih*0.28:w=iw*0.40:h=ih*0.46:color={palette['accent']}:t=4,"
-                    f"drawbox=x=iw*0.54:y=ih*0.28:w=iw*0.40:h=ih*0.46:color={palette['accent']}:t=4,"
-                    f"drawbox=x=iw*0.34:y=ih*0.80:w=iw*0.32:h=ih*0.11:color={palette['panel']}:t=fill[bookend_base]"
+                    f"drawbox=x={left_box_x}:y={box_y}:w={box_w}:h={box_h}:color={palette['accent']}:t=4,"
+                    f"drawbox=x={right_box_x}:y={box_y}:w={box_w}:h={box_h}:color={palette['accent']}:t=4,"
+                    f"drawbox=x={cta_x}:y={cta_y}:w={cta_w}:h={cta_h}:color={palette['panel']}:t=fill,"
+                    f"drawbox=x={header_x}:y={int(self.config.height * 0.12)}:w={int(self.config.width * 0.20)}:h=2:"
+                    f"color={palette['accent']}:t=fill[bookend_base]"
                 ),
             ]
 
             current_label = "bookend_base"
             if use_logo:
-                logo_width = int(self.config.width * 0.14)
-                filter_parts.append(f"[1:v]scale=w={logo_width}:h=-1[bookend_logo]")
+                logo_width = int(self.config.width * 0.12)
                 filter_parts.append(
-                    f"[{current_label}][bookend_logo]overlay=x={int(self.config.width * 0.08)}:y={int(self.config.height * 0.07)}:format=auto[bookend_logo_out]"
+                    f"[1:v]scale=w={logo_width}:h=-1,format=rgba,fade=t=in:st=0.05:d=0.22:alpha=1[bookend_logo]"
+                )
+                filter_parts.append(
+                    f"[{current_label}][bookend_logo]overlay=x={header_x}:y={logo_y}:format=auto[bookend_logo_out]"
                 )
                 current_label = "bookend_logo_out"
 
             if include_text:
-                filter_parts.append(
-                    (
-                        f"[{current_label}]drawtext=textfile='{outro_textfile}':fontcolor={palette['title_color']}:"
-                        f"fontsize={title_font}:x=(w-text_w)/2:y={title_y}:line_spacing=10:"
-                        "shadowcolor=black@0.85:shadowx=2:shadowy=2,"
+                text_parts = [
+                    f"drawtext=textfile='{brand_textfile}':fontcolor={palette['subtitle_color']}:fontsize={brand_font}:"
+                    f"x={header_x + int(self.config.width * 0.14)}:y={header_y}:alpha={text_alpha}:"
+                    "shadowcolor=black@0.70:shadowx=1:shadowy=1",
+                    f"drawtext=textfile='{outro_textfile}':fontcolor={palette['title_color']}:fontsize={title_font}:"
+                    f"x={header_x}:y={title_y}:line_spacing=8:alpha={text_alpha}:"
+                    "shadowcolor=black@0.85:shadowx=2:shadowy=2",
+                    f"drawtext=text='WATCH NEXT':fontcolor={palette['subtitle_color']}:fontsize={subtitle_font}:"
+                    f"x={left_box_x}:y={label_y}:alpha={text_alpha}",
+                    f"drawtext=text='MORE TO EXPLORE':fontcolor={palette['subtitle_color']}:fontsize={subtitle_font}:"
+                    f"x={right_box_x}:y={label_y}:alpha={text_alpha}",
+                ]
+                if outro_tagline:
+                    text_parts.append(
                         f"drawtext=textfile='{sub_textfile}':fontcolor={palette['subtitle_color']}:"
-                        f"fontsize={subtitle_font}:x=(w-text_w)/2:y={subtitle_y}[bookend_text]"
+                        f"fontsize={subtitle_font}:x=(w-text_w)/2:y={cta_y + int(cta_h * 0.25)}:alpha={text_alpha}:"
+                        "shadowcolor=black@0.68:shadowx=1:shadowy=1"
                     )
+                filter_parts.append(
+                    f"[{current_label}]{','.join(text_parts)}[bookend_text]"
                 )
                 current_label = "bookend_text"
 
@@ -4164,6 +4233,16 @@ class VideoPipeline:
             "title_color": "white",
             "subtitle_color": "white@0.82",
         }
+
+    def _bookend_channel_name(self) -> str:
+        normalized = re.sub(r"\s+", " ", str(self.config.channel_name or "").strip())
+        if not normalized:
+            return "IMAGINE"
+        return normalized[:40]
+
+    def _normalized_bookend_tagline(self, text: str | None) -> str:
+        normalized = re.sub(r"\s+", " ", str(text or "").strip())
+        return normalized[:80]
 
     def _wrap_bookend_text(self, text: str) -> str:
         normalized = re.sub(r"\s+", " ", (text or "").strip())
@@ -4342,6 +4421,9 @@ class VideoPipeline:
                 "intro_seconds": self.config.intro_seconds,
                 "outro_seconds": self.config.outro_seconds,
                 "outro_text": self.config.outro_text,
+                "channel_name": self.config.channel_name,
+                "intro_tagline": self.config.intro_tagline,
+                "outro_tagline": self.config.outro_tagline,
                 "bookend_style": self.config.bookend_style,
                 "brand_logo_path": self.config.brand_logo_path,
                 "brand_intro_image_path": self.config.brand_intro_image_path,

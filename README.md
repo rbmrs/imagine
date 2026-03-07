@@ -120,6 +120,9 @@ local-video-mvp run \
   --intro-seconds 2.8 \
   --outro-seconds 3.0 \
   --outro-text "Thanks for watching" \
+  --channel-name IMAGINE \
+  --intro-tagline "Explainers about AI systems and ideas" \
+  --outro-tagline "Watch next" \
   --bookend-style brand-image-motion \
   --brand-logo-path ./projects/brand-kit/logo-option-3-geometric.png \
   --brand-intro-image-path ./projects/brand-kit/channel-bg-intro.jpg \
@@ -172,6 +175,9 @@ Intro/outro options:
 - `--intro-seconds 2.8`
 - `--outro-seconds 3.0`
 - `--outro-text "Thanks for watching"`
+- `--channel-name IMAGINE`
+- `--intro-tagline "Explainers about AI systems and ideas"`
+- `--outro-tagline "Watch next"`
 - `--bookend-style minimal-clean` (default), `--bookend-style cinematic-subtle`, or `--bookend-style brand-image-motion`
 - `--brand-logo-path /path/to/logo.png` (supports png/jpg/webp; svg rasterized when possible)
 - `--brand-intro-image-path /path/to/intro-bg.jpg`
@@ -179,6 +185,12 @@ Intro/outro options:
 - `--brand-use-scene-fallback` / `--no-brand-use-scene-fallback`
 
 When `projects/brand-kit/` contains the standard channel assets, the CLI now auto-promotes the default bookend style to `brand-image-motion` and uses those assets unless you explicitly provide alternate brand paths or a different non-default style.
+
+In branded mode, the intro/outro renderer is logo-led and asymmetric by default:
+
+- intro uses channel name + optional tagline with a smaller left-aligned video title
+- outro uses a branded header, title, end-screen boxes, and an optional CTA tagline
+- scene-derived frozen frames stay fallback-only unless you enable `--brand-use-scene-fallback`
 
 If you use `--script-engine ollama`, make sure Ollama server is running:
 
@@ -240,6 +252,7 @@ Storage behavior with TUI defaults:
 
 - TUI auto-creates a run workspace under `~/.imagine/projects/<prompt-slug>-<timestamp>/`
 - after a successful run, TUI exports only the final MP4 to `~/Downloads/<prompt-slug>-<timestamp>.mp4`
+- when `projects/brand-kit/` is present, intro/outro default to branded bookends; otherwise the configured card style is used
 
 If you want custom startup values, you can still use:
 
