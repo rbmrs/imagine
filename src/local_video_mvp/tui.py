@@ -3988,6 +3988,7 @@ class LocalVideoMvpTui:
         changed = after != before
 
         if changed:
+            self._save_persisted_settings()
             self._append_log(
                 "Updated config: "
                 f"minutes={self.config.minutes}, "
@@ -4712,14 +4713,92 @@ class LocalVideoMvpTui:
         if isinstance(fast_mode_value, bool):
             self.config.fast_mode = fast_mode_value
 
+        prompt_value = payload.get("prompt")
+        if isinstance(prompt_value, str):
+            candidate = prompt_value.strip()
+            if candidate:
+                self.config.prompt = candidate
+
+        asset_keywords_value = payload.get("asset_keywords")
+        if isinstance(asset_keywords_value, list):
+            parsed_keywords = self._normalize_asset_keywords(
+                [str(item).strip() for item in asset_keywords_value if str(item).strip()]
+            )
+            self.config.asset_keywords = parsed_keywords
+
+        minutes_value = payload.get("minutes")
+        if minutes_value is not None:
+            try:
+                candidate_minutes = int(minutes_value)
+            except Exception:
+                candidate_minutes = 0
+            if candidate_minutes > 0:
+                self.config.minutes = candidate_minutes
+
+        tts_engine_value = payload.get("tts_engine")
+        if isinstance(tts_engine_value, str):
+            candidate_engine = tts_engine_value.strip().lower()
+            if candidate_engine in {"melo", "piper"}:
+                self.config.tts_engine = candidate_engine
+
+        piper_voice_value = payload.get("piper_voice_id")
+        if isinstance(piper_voice_value, str):
+            self.config.piper_voice_id = piper_voice_value.strip()
+
+        piper_speaker_value = payload.get("piper_speaker_id")
+        if piper_speaker_value is None:
+            self.config.piper_speaker_id = None
+        else:
+            try:
+                self.config.piper_speaker_id = int(piper_speaker_value)
+            except Exception:
+                pass
+
+        voice_profile_value = payload.get("voice_profile")
+        if isinstance(voice_profile_value, str):
+            candidate_profile = voice_profile_value.strip()
+            if candidate_profile in self.VOICE_PROFILE_CHOICES:
+                self.config.voice_profile = candidate_profile
+
+        voice_speed_value = payload.get("voice_speed")
+        if voice_speed_value is not None:
+            try:
+                candidate_speed = float(voice_speed_value)
+            except Exception:
+                candidate_speed = 0.0
+            if 0.5 <= candidate_speed <= 2.0:
+                self.config.voice_speed = candidate_speed
+
+        melo_language_value = payload.get("melo_language")
+        if isinstance(melo_language_value, str):
+            candidate_language = melo_language_value.strip().upper()
+            if candidate_language in self.MELO_LANGUAGE_CHOICES:
+                self.config.melo_language = candidate_language
+
+        melo_speaker_value = payload.get("melo_speaker")
+        if isinstance(melo_speaker_value, str):
+            candidate_speaker = melo_speaker_value.strip()
+            if candidate_speaker:
+                self.config.melo_speaker = candidate_speaker
+
     def _save_persisted_settings(self) -> None:
         settings_path = self._settings_path()
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "hitl_enabled": bool(self._hitl_enabled),
             "fast_mode": bool(self.config.fast_mode),
+            "prompt": self.config.prompt,
+            "asset_keywords": list(self.config.asset_keywords),
+            "minutes": int(self.config.minutes),
+            "tts_engine": self.config.tts_engine,
+            "piper_voice_id": self.config.piper_voice_id,
+            "piper_speaker_id": self.config.piper_speaker_id,
+            "voice_profile": self.config.voice_profile,
+            "voice_speed": round(float(self.config.voice_speed), 3),
+            "melo_language": self.config.melo_language,
+            "melo_speaker": self.config.melo_speaker,
         }
         settings_path.write_text(
             json.dumps(payload, indent=2, ensure_ascii=True, sort_keys=True) + "\n",

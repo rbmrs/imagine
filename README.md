@@ -264,6 +264,8 @@ Key bindings:
 - `C`: clean old auto-managed workspaces (mark with Space, delete with Enter)
 - `Q`: quit (stops active run first)
 
+The TUI persists the last values set through `Edit` and settings toggles in `~/.imagine/tui_settings.json`, and reuses them on next launch unless the saved file is missing or invalid.
+
 The TUI uses checkpoint modals between stages. After draft, it opens a scene review hub (pick scenes with Up/Down + Enter) and then a per-scene editor where you can:
 
 - edit/approve scene voiceover text directly,
