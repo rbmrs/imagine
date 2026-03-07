@@ -145,7 +145,7 @@ TUI shortcut focus for now:
 
 Checkpoint modals appear between stages so you can approve/review before continuing. After draft, TUI opens a scene review hub (Up/Down + Enter), then scene-by-scene HITL review (text -> narration -> clip), including clip replacement with same/new keywords before preview/finalize. Once preview is rendered, TUI offers Preview Actions (play preview in terminal, finalize now, or back). Finalize now reuses the approved preview render when inputs are unchanged; otherwise it re-renders.
 
-Fast mode is intended for cheap validation passes. It caps runs to roughly 1 minute, lowers render cost, switches captions to heuristic timing, disables intro/outro cards and burned subtitle burn-in, and allows placeholder assets so pipeline plumbing can be checked quickly.
+Fast mode is intended for cheap validation passes. It caps runs to roughly 1 minute, lowers render cost, switches captions to heuristic timing, keeps burned subtitles enabled, disables intro/outro cards, and allows placeholder assets so pipeline plumbing can be checked quickly.
 
 Scene review hub shortcut: press `G` to auto-approve remaining scenes and immediately generate preview.
 

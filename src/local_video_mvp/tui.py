@@ -2783,7 +2783,7 @@ class LocalVideoMvpTui:
                     self._set_status(f"Settings updated: fast mode {mode}.")
                     self._append_log(
                         "Settings: fast mode set to "
-                        f"{mode} (shorter run, lower resolution, no bookends, no burned subtitles)."
+                        f"{mode} (shorter run, lower resolution, no bookends, burned subtitles kept on)."
                     )
                     continue
 

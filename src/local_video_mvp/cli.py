@@ -115,7 +115,7 @@ def _apply_fast_mode_profile(config: PipelineConfig) -> None:
     config.include_intro = False
     config.include_outro = False
     config.caption_engine = "heuristic"
-    config.burn_subtitles = False
+    config.burn_subtitles = True
     config.max_duration_adjust_passes = 0
     config.require_external_assets = False
     config.max_scenes = min(config.max_scenes, 6)
