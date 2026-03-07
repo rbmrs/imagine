@@ -25,7 +25,8 @@ Current target defaults:
 - Python CLI package (`src/local_video_mvp`)
 - Local orchestration in one pipeline class (`VideoPipeline`)
 - Ollama for script generation (`qwen2.5:14b` default)
-- MeloTTS (primary) / macOS `say` (fallback, gated)
+- MeloTTS and Piper TTS
+- Piper voice previews in TUI debug (for local voice quality evaluation)
 - faster-whisper or heuristic captions
 - ffmpeg for audio/video rendering
 
@@ -81,7 +82,8 @@ Outputs per run are created under `projects/<project-id>/`.
 
 - Video effects presets: `clean`, `subtle-motion`, `dynamic`
 - Intro/outro support with configurable timing/text
-- Bookend style presets (`minimal-clean`, `cinematic-subtle`)
+- Bookend style presets (`minimal-clean`, `cinematic-subtle`, `brand-image-motion`)
+- Brand-driven bookends support logo + custom intro/outro background images
 - Intro/outro title wrapping + safer text rendering for punctuation-heavy titles
 
 ## CLI commands you should know
@@ -133,12 +135,33 @@ Default storage behavior:
 
 TUI shortcut focus for now:
 
-- `R` advances staged HITL flow for current workspace (`draft -> review -> preview -> finalize`).
+- `R` runs/continues staged HITL flow for current workspace (`draft (review-ready) -> scene review -> preview -> finalize`).
+- `S` opens settings (first setting is `HITL` On/Off).
 - `E` edits prompt/asset-keywords/duration/speed and uses list pickers for language/speaker/profile.
+- `D` opens debug menu (terminal preview playback test + unified `Test voices` list with `[Melo]` and `[Piper]` entries).
 - `C` opens workspace cleanup, where you mark folders and press Enter to delete.
 - `Q` exits the TUI.
 
-Checkpoint modals appear between stages so you can approve/review before continuing. After preview, TUI can open clip review so you can replace selected clip names from `review/clip_catalog.json` before finalize.
+Checkpoint modals appear between stages so you can approve/review before continuing. After draft, TUI opens a scene review hub (Up/Down + Enter), then scene-by-scene HITL review (text -> narration -> clip), including clip replacement with same/new keywords before preview/finalize. Once preview is rendered, TUI offers Preview Actions (play preview in terminal, finalize now, or back). Finalize now reuses the approved preview render when inputs are unchanged; otherwise it re-renders.
+
+Scene review hub shortcut: press `G` to auto-approve remaining scenes and immediately generate preview.
+
+For best in-terminal preview support, install `mpv`:
+
+```bash
+brew install mpv
+```
+
+Ghostty is supported through the kitty graphics path when available. Current Preview Actions playback is terminal-only and surfaces backend errors when unsupported.
+
+For Piper voice testing in debug mode, install runtime deps in the same environment used by TUI:
+
+```bash
+python -m pip install piper-tts
+python -m pip install pathvalidate
+```
+
+Current Piper debug catalog includes commercial-friendlier EN-US options (including high-tier LibriTTS/LJSpeech entries) for rapid auditioning.
 
 Current voice picker scope:
 
@@ -189,6 +212,7 @@ fi
 
 local-video-mvp run \
   --workflow-stage draft \
+  --prepare-scene-review \
   --prompt "Your topic" \
   --asset-keywords "cars, roads" \
   --project-dir ./projects/demo \
@@ -244,6 +268,11 @@ Important files in each project run:
 - `run_report.json` - status, timings, warnings, outputs, metrics
 - `review/script_approved.json` - approved script snapshot used by preview/finalize stages
 - `review/clip_catalog.json` - human-readable clip names + source metadata for quick review
+- `review/scene_review_state.json` - per-scene HITL approval state
+- `review/narration_state.json` - narration hash metadata used to detect stale narration after script edits
+- `review/captions_state.json` - caption input signature and cached caption stats
+- `review/timeline_state.json` - timeline input signature
+- `review/preview_render_state.json` - preview render signature used to fast-path finalize
 - `review/preview.mp4` / `review/preview.srt` - preview artifacts before finalization
 - `rights_manifest.json` - provenance and config snapshot
 - `timeline.json` - final clip structure
@@ -260,7 +289,7 @@ Current state: core MVP + subtitle/pacing/duration/effects/bookend improvements 
 
 Current active milestone:
 
-- Human-in-the-loop workflow (`draft -> review -> preview -> finalize`) with floating checkpoint modals and clip replacement loop before finalize.
+- Human-in-the-loop workflow (`draft -> scene review -> preview -> finalize`) with floating checkpoint modals and clip replacement loop before finalize.
 
 ## Contribution notes
 

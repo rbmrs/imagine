@@ -32,7 +32,6 @@ class PipelineConfig:
     target_speech_wpm: int = 145
     max_duration_adjust_passes: int = 2
     strict_commercial_safe: bool = True
-    allow_system_tts: bool = False
     pexels_api_key: str | None = None
     pixabay_api_key: str | None = None
     require_external_assets: bool = False
@@ -43,10 +42,18 @@ class PipelineConfig:
     outro_seconds: float = 3.0
     outro_text: str = "Thanks for watching"
     bookend_style: str = "minimal-clean"
+    brand_logo_path: str | None = None
+    brand_intro_image_path: str | None = None
+    brand_outro_image_path: str | None = None
+    brand_use_scene_fallback: bool = False
     voice_profile: str = "calm-documentary"
     voice_speed: float = 1.0
     melo_language: str = "EN"
     melo_speaker: str = "EN-US"
+    piper_voice_id: str | None = None
+    piper_speaker_id: int | None = None
+    piper_model_url: str | None = None
+    piper_config_url: str | None = None
     max_scenes: int = 40
     min_scene_seconds: float = 5.0
     verbose: bool = False

@@ -28,8 +28,10 @@ Pipeline stages:
 - macOS (Apple Silicon recommended)
 - Python 3.9+
 - `ffmpeg` and `ffprobe` in PATH
+  - `drawtext` support is required for intro/outro text rendering.
+  - `subtitles` support is required for burned subtitle output.
 - Optional for script generation: `ollama`
-- Optional for local TTS: `melo-tts`
+- Optional for local TTS: `melo-tts`, `piper-tts`
 - Optional for caption quality pass: `faster-whisper`
 
 Install `ffmpeg` via Homebrew:
@@ -37,6 +39,8 @@ Install `ffmpeg` via Homebrew:
 ```bash
 brew install ffmpeg
 ```
+
+If your `ffmpeg` build is missing `drawtext` or `subtitles`, install a build that includes those filters before running the pipeline.
 
 Create and install package:
 
@@ -116,7 +120,11 @@ local-video-mvp run \
   --intro-seconds 2.8 \
   --outro-seconds 3.0 \
   --outro-text "Thanks for watching" \
-  --bookend-style minimal-clean \
+  --bookend-style brand-image-motion \
+  --brand-logo-path ./projects/brand-kit/logo-option-3-geometric.png \
+  --brand-intro-image-path ./projects/brand-kit/channel-bg-intro.jpg \
+  --brand-outro-image-path ./projects/brand-kit/channel-bg-outro.jpg \
+  --no-brand-use-scene-fallback \
   --voice-profile calm-documentary \
   --caption-engine faster-whisper \
   --caption-style engagement \
@@ -156,7 +164,11 @@ Intro/outro options:
 - `--intro-seconds 2.8`
 - `--outro-seconds 3.0`
 - `--outro-text "Thanks for watching"`
-- `--bookend-style minimal-clean` (default) or `--bookend-style cinematic-subtle`
+- `--bookend-style minimal-clean` (default), `--bookend-style cinematic-subtle`, or `--bookend-style brand-image-motion`
+- `--brand-logo-path /path/to/logo.png` (supports png/jpg/webp; svg rasterized when possible)
+- `--brand-intro-image-path /path/to/intro-bg.jpg`
+- `--brand-outro-image-path /path/to/outro-bg.jpg`
+- `--brand-use-scene-fallback` / `--no-brand-use-scene-fallback`
 
 If you use `--script-engine ollama`, make sure Ollama server is running:
 
@@ -167,14 +179,14 @@ ollama serve
 In non-strict mode, when Ollama is unavailable the pipeline falls back to a local template script and logs a warning.
 To force a hard failure instead, add `--require-ollama`.
 
-If MeloTTS is not available yet, you can run a local system fallback for development:
+To run narration with Piper instead of Melo:
 
 ```bash
 local-video-mvp run \
   --prompt "Explain transformers in plain english" \
   --project-dir ./projects/transformers-v1 \
-  --tts-engine say \
-  --allow-system-tts
+  --tts-engine piper \
+  --piper-voice-id en_US-john-medium
 ```
 
 List available local Melo voices:
@@ -235,17 +247,37 @@ local-video-mvp tui \
 
 Key bindings:
 
-- `R`: advance HITL workflow stage (`draft -> review -> preview -> finalize`) for the active workspace
+- `R`: run/advance HITL flow (`draft (review-ready) -> scene review -> preview -> finalize`) for the active workspace
+- `S`: open settings (currently includes `HITL` On/Off toggle)
 - `E`: edit parameters (`prompt`, `asset keywords`, `minutes`, `voice speed`) and choose from lists for language/speaker/profile
+- `D`: open debug menu (terminal video playback test + unified `Test voices` list with Melo and Piper entries)
 - `C`: clean old auto-managed workspaces (mark with Space, delete with Enter)
 - `Q`: quit (stops active run first)
 
-The TUI uses floating checkpoint modals between stages so you can approve/review before continuing. After preview, it can open clip review from `review/clip_catalog.json` so you can replace mismatched visuals before finalize.
+The TUI uses checkpoint modals between stages. After draft, it opens a scene review hub (pick scenes with Up/Down + Enter) and then a per-scene editor where you can:
+
+- edit/approve scene voiceover text directly,
+- preview narration (scene segment or regenerated scene sample),
+- preview scene clip (in-terminal when supported),
+- replace a rejected clip with same or expanded keywords.
+
+Preview is prompted only after all scene checkpoints are approved. After preview rendering, TUI opens a Preview Actions modal so you can play `review/preview.mp4` in terminal before finalizing.
+
+From the scene review hub, press `G` to auto-approve all remaining scenes and generate preview immediately.
+
+Install `mpv` for in-terminal scene playback:
+
+```bash
+brew install mpv
+```
+
+Ghostty works with the kitty graphics path (`mpv --vo=kitty`) on compatible setups. Current Preview Actions playback is terminal-only and reports an in-terminal backend error if unsupported.
 
 Current MVP voice picker scope:
 
 - language picker supports `EN` only for now
-- speaker picker is loaded from available EN speakers on your machine
+- Melo speaker picker is loaded from available EN speakers on your machine
+- Piper picker uses curated built-in voices (same catalog used by Debug -> Test voices)
 
 If Ollama is not already running, the TUI tries to start `ollama serve` automatically and stops it on exit when it was started by the TUI.
 
@@ -312,18 +344,20 @@ local-video-mvp replace-clips \
 Run staged workflow from CLI (same `run` command, different stage):
 
 ```bash
-# 1) draft (script + narration)
-local-video-mvp run --workflow-stage draft --prompt "Your topic" --project-dir ./projects/demo
+# 1) draft (script + narration + review-ready clip catalog/timeline)
+local-video-mvp run --workflow-stage draft --prepare-scene-review --prompt "Your topic" --project-dir ./projects/demo
 
-# 2) review (approve current script.json, or pass reviewed JSON)
+# 2) review (optional: approve current script.json, or pass reviewed JSON)
 local-video-mvp run --workflow-stage review --prompt "Your topic" --project-dir ./projects/demo
 
 # 3) preview (renders review/preview.mp4)
 local-video-mvp run --workflow-stage preview --prompt "Your topic" --project-dir ./projects/demo
 
-# 4) finalize (renders output/final.mp4)
+# 4) finalize (promotes preview to output/final.mp4 when inputs are unchanged; otherwise re-renders)
 local-video-mvp run --workflow-stage finalize --prompt "Your topic" --project-dir ./projects/demo
 ```
+
+TUI uses the same stage primitives but follows: `draft --prepare-scene-review -> scene review hub -> preview -> finalize`.
 
 If stock API keys are missing, the report warns that placeholder visuals were used.
 
@@ -342,6 +376,11 @@ projects/<project>/
   review/
     script_approved.json
     clip_catalog.json
+    scene_review_state.json
+    narration_state.json
+    captions_state.json
+    timeline_state.json
+    preview_render_state.json
     preview.mp4
     preview.srt
   rights_manifest.json

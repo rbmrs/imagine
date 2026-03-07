@@ -109,6 +109,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional JSON file used when --workflow-stage review",
     )
     run.add_argument(
+        "--prepare-scene-review",
+        action="store_true",
+        help="When workflow-stage=draft, also prepare clip catalog/timeline for immediate scene review",
+    )
+    run.add_argument(
         "--asset-keywords",
         default="",
         help="Comma-separated keywords to constrain stock footage search queries",
@@ -133,10 +138,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     run.add_argument(
         "--tts-engine",
-        choices=["melo", "say"],
+        choices=["melo", "piper"],
         default="melo",
         help="Narration engine",
     )
+    run.add_argument("--piper-voice-id", help="Piper voice id when --tts-engine piper")
+    run.add_argument("--piper-speaker-id", type=int, help="Optional Piper speaker id")
+    run.add_argument("--piper-model-url", help="Optional Piper model URL override")
+    run.add_argument("--piper-config-url", help="Optional Piper config URL override")
     run.add_argument(
         "--video-effects",
         choices=["clean", "subtle-motion", "dynamic"],
@@ -160,9 +169,18 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--outro-text", default="Thanks for watching", help="Outro card text")
     run.add_argument(
         "--bookend-style",
-        choices=["minimal-clean", "cinematic-subtle"],
+        choices=["minimal-clean", "cinematic-subtle", "brand-image-motion"],
         default="minimal-clean",
         help="Visual style preset for intro/outro cards",
+    )
+    run.add_argument("--brand-logo-path", help="Optional brand logo image path for intro/outro overlays")
+    run.add_argument("--brand-intro-image-path", help="Optional intro background image path")
+    run.add_argument("--brand-outro-image-path", help="Optional outro background image path")
+    run.add_argument(
+        "--brand-use-scene-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow intro/outro to fallback to scene-derived backgrounds when brand backgrounds are missing",
     )
     run.add_argument(
         "--voice-profile",
@@ -225,12 +243,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Enable strict commercial-safe policy checks (default: true)",
     )
-    run.add_argument(
-        "--allow-system-tts",
-        action="store_true",
-        help="Allow macOS say fallback when strict mode is enabled",
-    )
-
     run.add_argument("--pexels-api-key", default=os.environ.get("PEXELS_API_KEY"), help="Pexels API key")
     run.add_argument("--pixabay-api-key", default=os.environ.get("PIXABAY_API_KEY"), help="Pixabay API key")
     run.add_argument(
@@ -314,6 +326,9 @@ def build_parser() -> argparse.ArgumentParser:
     tui.add_argument("--voice-speed", type=float, default=1.0, help="Initial voice speed")
     tui.add_argument("--melo-language", choices=["EN"], default="EN", help="Initial Melo language")
     tui.add_argument("--melo-speaker", default="EN-US", help="Initial Melo speaker")
+    tui.add_argument("--tts-engine", choices=["melo", "piper"], default="melo", help="Initial TTS engine")
+    tui.add_argument("--piper-voice-id", default="", help="Initial Piper voice id")
+    tui.add_argument("--piper-speaker-id", type=int, help="Initial Piper speaker id")
 
     return parser
 
@@ -342,6 +357,10 @@ def run_command(args: argparse.Namespace) -> int:
         ollama_model=args.ollama_model,
         require_ollama=bool(args.require_ollama),
         tts_engine=args.tts_engine,
+        piper_voice_id=(str(args.piper_voice_id).strip() or None),
+        piper_speaker_id=args.piper_speaker_id,
+        piper_model_url=(str(args.piper_model_url).strip() or None),
+        piper_config_url=(str(args.piper_config_url).strip() or None),
         caption_engine=args.caption_engine,
         caption_style=args.caption_style,
         burn_subtitles=bool(args.burn_subtitles),
@@ -356,7 +375,6 @@ def run_command(args: argparse.Namespace) -> int:
         target_speech_wpm=max(90, min(220, int(args.target_speech_wpm))),
         max_duration_adjust_passes=max(0, int(args.max_duration_adjust_passes)),
         strict_commercial_safe=bool(args.strict_commercial_safe),
-        allow_system_tts=bool(args.allow_system_tts),
         pexels_api_key=args.pexels_api_key,
         pixabay_api_key=args.pixabay_api_key,
         require_external_assets=bool(args.require_external_assets),
@@ -367,6 +385,10 @@ def run_command(args: argparse.Namespace) -> int:
         outro_seconds=outro_seconds,
         outro_text=str(args.outro_text).strip() or "Thanks for watching",
         bookend_style=args.bookend_style,
+        brand_logo_path=str(args.brand_logo_path).strip() if args.brand_logo_path else None,
+        brand_intro_image_path=str(args.brand_intro_image_path).strip() if args.brand_intro_image_path else None,
+        brand_outro_image_path=str(args.brand_outro_image_path).strip() if args.brand_outro_image_path else None,
+        brand_use_scene_fallback=bool(args.brand_use_scene_fallback),
         voice_profile=args.voice_profile,
         voice_speed=max(0.5, min(2.0, float(args.voice_speed))),
         melo_language=args.melo_language,
@@ -382,7 +404,7 @@ def run_command(args: argparse.Namespace) -> int:
         outputs = pipeline.run()
         heading = "Pipeline completed successfully"
     elif workflow_stage == "draft":
-        outputs = pipeline.run_draft()
+        outputs = pipeline.run_draft(prepare_scene_review=bool(args.prepare_scene_review))
         heading = "Draft stage completed successfully"
     elif workflow_stage == "review":
         review_json_path = Path(args.review_script_json).expanduser().resolve() if args.review_script_json else None
@@ -496,6 +518,10 @@ def replace_clips_command(args: argparse.Namespace) -> int:
         outro_seconds=max(0.0, _coerce_float(manifest_config.get("outro_seconds"), 0.0)),
         outro_text=_coerce_str(manifest_config.get("outro_text"), "Thanks for watching"),
         bookend_style=_coerce_str(manifest_config.get("bookend_style"), "minimal-clean"),
+        brand_logo_path=_coerce_str(manifest_config.get("brand_logo_path"), "") or None,
+        brand_intro_image_path=_coerce_str(manifest_config.get("brand_intro_image_path"), "") or None,
+        brand_outro_image_path=_coerce_str(manifest_config.get("brand_outro_image_path"), "") or None,
+        brand_use_scene_fallback=_coerce_bool(manifest_config.get("brand_use_scene_fallback"), False),
         verbose=bool(args.verbose),
     )
 
@@ -577,6 +603,12 @@ def inspect_command(args: argparse.Namespace) -> int:
     if isinstance(asset_stats, dict) and asset_stats:
         print("- asset_stats:")
         for key, value in asset_stats.items():
+            print(f"  - {key}: {value}")
+
+    optimization_stats = payload.get("optimization_stats", {})
+    if isinstance(optimization_stats, dict) and optimization_stats:
+        print("- optimization_stats:")
+        for key, value in optimization_stats.items():
             print(f"  - {key}: {value}")
 
     outputs = payload.get("outputs", {})
@@ -725,7 +757,6 @@ def voice_ab_command(args: argparse.Namespace) -> int:
         target_speech_wpm=145,
         max_duration_adjust_passes=1,
         strict_commercial_safe=True,
-        allow_system_tts=False,
         pexels_api_key=None,
         pixabay_api_key=None,
         voice_profile=args.voice_profile,
@@ -766,6 +797,11 @@ def tui_command(args: argparse.Namespace) -> int:
     voice_speed = max(0.5, min(2.0, float(args.voice_speed)))
     melo_language = str(args.melo_language).strip().upper() or "EN"
     melo_speaker = str(args.melo_speaker).strip() or "EN-US"
+    tts_engine = str(args.tts_engine).strip().lower() or "melo"
+    if tts_engine not in {"melo", "piper"}:
+        tts_engine = "melo"
+    piper_voice_id = str(args.piper_voice_id).strip()
+    piper_speaker_id = args.piper_speaker_id
     return run_tui(
         prompt=prompt,
         asset_keywords=asset_keywords,
@@ -775,6 +811,9 @@ def tui_command(args: argparse.Namespace) -> int:
         voice_speed=voice_speed,
         melo_language=melo_language,
         melo_speaker=melo_speaker,
+        tts_engine=tts_engine,
+        piper_voice_id=piper_voice_id,
+        piper_speaker_id=piper_speaker_id,
     )
 
 
@@ -790,6 +829,9 @@ def imagine_entry() -> int:
         voice_speed=1.0,
         melo_language="EN",
         melo_speaker="EN-US",
+        tts_engine="melo",
+        piper_voice_id="",
+        piper_speaker_id=None,
     )
 
 

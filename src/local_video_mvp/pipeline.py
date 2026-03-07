@@ -8,9 +8,12 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 from typing import Any
+from urllib import error as urlerror
+from urllib import request as urlrequest
 from urllib.parse import quote_plus, urlparse
 
 import requests
@@ -61,6 +64,57 @@ FUNCTION_WORDS = {
     "without",
 }
 
+PIPER_VOICE_PRESETS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "en_US-libritts-high",
+        "speaker_id": 0,
+        "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/libritts/high/en_US-libritts-high.onnx?download=true",
+        "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/libritts/high/en_US-libritts-high.onnx.json?download=true",
+    },
+    {
+        "id": "en_US-libritts-high",
+        "speaker_id": 120,
+        "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/libritts/high/en_US-libritts-high.onnx?download=true",
+        "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/libritts/high/en_US-libritts-high.onnx.json?download=true",
+    },
+    {
+        "id": "en_US-libritts-high",
+        "speaker_id": 360,
+        "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/libritts/high/en_US-libritts-high.onnx?download=true",
+        "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/libritts/high/en_US-libritts-high.onnx.json?download=true",
+    },
+    {
+        "id": "en_US-libritts-high",
+        "speaker_id": 700,
+        "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/libritts/high/en_US-libritts-high.onnx?download=true",
+        "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/libritts/high/en_US-libritts-high.onnx.json?download=true",
+    },
+    {
+        "id": "en_US-ljspeech-high",
+        "speaker_id": None,
+        "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/ljspeech/high/en_US-ljspeech-high.onnx?download=true",
+        "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/ljspeech/high/en_US-ljspeech-high.onnx.json?download=true",
+    },
+    {
+        "id": "en_US-joe-medium",
+        "speaker_id": None,
+        "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/joe/medium/en_US-joe-medium.onnx?download=true",
+        "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/joe/medium/en_US-joe-medium.onnx.json?download=true",
+    },
+    {
+        "id": "en_US-john-medium",
+        "speaker_id": None,
+        "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/john/medium/en_US-john-medium.onnx?download=true",
+        "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/john/medium/en_US-john-medium.onnx.json?download=true",
+    },
+    {
+        "id": "en_US-norman-medium",
+        "speaker_id": None,
+        "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/norman/medium/en_US-norman-medium.onnx?download=true",
+        "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/norman/medium/en_US-norman-medium.onnx.json?download=true",
+    },
+)
+
 
 class AssetUniquenessError(RuntimeError):
     def __init__(self, message: str, *, shortfall_scene_ids: list[str], keywords: list[str]):
@@ -81,9 +135,14 @@ class VideoPipeline:
         self.duration_stats: dict[str, Any] = {}
         self.pacing_stats: dict[str, Any] = {}
         self.asset_stats: dict[str, Any] = {}
+        self.optimization_stats: dict[str, Any] = {}
         self.used_template_fallback = False
         self._intro_bookend_background: Path | None = None
         self._outro_bookend_background: Path | None = None
+        self._bookend_logo_overlay: Path | None = None
+        self._ffmpeg_drawtext_available: bool | None = None
+        self._ffmpeg_subtitles_available: bool | None = None
+        self._piper_command: list[str] | None = None
         self._ollama_ready = False
         self._started_at: dt.datetime | None = None
         self._finished_at: dt.datetime | None = None
@@ -95,7 +154,9 @@ class VideoPipeline:
         self.duration_stats = {}
         self.pacing_stats = {}
         self.asset_stats = {}
+        self.optimization_stats = {}
         self.used_template_fallback = False
+        self._piper_command = None
 
     def run(self) -> dict[str, str]:
         self._reset_run_state()
@@ -199,6 +260,7 @@ class VideoPipeline:
             break
 
         self._write_json(self.paths["script"], plan.to_dict())
+        self._write_narration_state(plan)
         return plan
 
     def run_review_stage(self, plan: ScriptPlan) -> ScriptPlan:
@@ -210,27 +272,8 @@ class VideoPipeline:
         self._prepare_bookend_backgrounds(plan)
         self._write_clip_catalog(plan, rights)
 
-        captions = self._run_stage(
-            "captions",
-            "Stage 4/7: Building captions",
-            lambda: self._generate_captions(plan, self.paths["narration_wav"]),
-        )
-        intro_shift = self._intro_bookend_seconds()
-        if intro_shift > 0.0:
-            captions = self._shift_captions(captions, intro_shift)
-        self._write_srt(self.paths["captions"], captions)
-        self._write_ass(self.paths["captions_ass"], captions)
-
-        timeline = self._run_stage("timeline", "Stage 5/7: Building timeline", lambda: self._build_timeline(plan))
-        self._write_json(
-            self.paths["timeline"],
-            {
-                "title": plan.title,
-                "summary": plan.summary,
-                "clips": [clip.to_dict() for clip in timeline],
-                "total_seconds": round(sum(clip.seconds for clip in timeline), 3),
-            },
-        )
+        self._ensure_captions(plan)
+        timeline = self._ensure_timeline(plan)
 
         return {
             "rights": rights,
@@ -239,8 +282,15 @@ class VideoPipeline:
 
     def run_finalize_stage(self, plan: ScriptPlan, *, rights: list[AssetRight], timeline: list[TimelineClip]) -> dict[str, str]:
         def render_stage() -> None:
+            if self._promote_preview_render_if_unchanged(timeline):
+                return
+
             self._render_video(timeline, self.paths["narration_wav"], self.paths["final_mp4"])
             shutil.copy2(self.paths["captions"], self.paths["final_srt"])
+            self.optimization_stats["render"] = {
+                "mode": "rerendered-finalize",
+                "reused_preview": False,
+            }
 
         self._run_stage("render", "Stage 6/7: Rendering final video", render_stage)
 
@@ -262,7 +312,7 @@ class VideoPipeline:
             "run_report": str(self.paths["run_report"].resolve()),
         }
 
-    def run_draft(self) -> dict[str, str]:
+    def run_draft(self, *, prepare_scene_review: bool = False) -> dict[str, str]:
         self._reset_run_state()
         self._started_at = dt.datetime.now(dt.timezone.utc)
         self._prepare_dirs()
@@ -275,6 +325,17 @@ class VideoPipeline:
             plan = self.run_draft_stage()
             self._write_json(self.paths["approved_script"], plan.to_dict())
 
+            if prepare_scene_review:
+                stage = self.run_preview_stage(plan)
+                rights = list(stage["rights"])
+                self._write_json(self.paths["approved_script"], plan.to_dict())
+                manifest = self._run_stage(
+                    "manifest",
+                    "Stage 6/7: Writing rights manifest",
+                    lambda: self._build_manifest(plan, rights),
+                )
+                self._write_json(self.paths["manifest"], manifest)
+
             outputs = {
                 "project_dir": str(self.config.project_dir.resolve()),
                 "script": str(self.paths["script"].resolve()),
@@ -284,6 +345,13 @@ class VideoPipeline:
                 "run_log": str(self.paths["run_log"].resolve()),
                 "run_report": str(self.paths["run_report"].resolve()),
             }
+
+            if prepare_scene_review:
+                outputs["timeline"] = str(self.paths["timeline"].resolve())
+                outputs["clip_catalog"] = str(self.paths["clip_catalog"].resolve())
+                outputs["captions"] = str(self.paths["captions"].resolve())
+                outputs["captions_ass"] = str(self.paths["captions_ass"].resolve())
+                outputs["manifest"] = str(self.paths["manifest"].resolve())
 
             self._finished_at = dt.datetime.now(dt.timezone.utc)
             self._write_run_report(status="success", outputs=outputs)
@@ -349,15 +417,23 @@ class VideoPipeline:
             self._write_json(self.paths["script"], plan.to_dict())
             self._ensure_narration_for_plan(plan)
 
-            stage = self.run_preview_stage(plan)
-            rights = list(stage["rights"])
-            timeline = list(stage["timeline"])
+            rights = self._load_existing_rights()
+            can_reuse_assets = bool(rights) and all(
+                scene.asset_path and Path(scene.asset_path).exists() for scene in plan.scenes
+            )
 
-            def render_preview_stage() -> None:
-                self._render_video(timeline, self.paths["narration_wav"], self.paths["preview_mp4"])
-                shutil.copy2(self.paths["captions"], self.paths["preview_srt"])
+            if can_reuse_assets:
+                self._prepare_bookend_backgrounds(plan)
+                self._write_clip_catalog(plan, rights)
 
-            self._run_stage("preview_render", "Stage 6/7: Rendering preview video", render_preview_stage)
+                self._ensure_captions(plan)
+                timeline = self._ensure_timeline(plan)
+            else:
+                stage = self.run_preview_stage(plan)
+                rights = list(stage["rights"])
+                timeline = list(stage["timeline"])
+
+            self._ensure_preview_render(timeline)
             manifest = self._run_stage(
                 "manifest",
                 "Stage 7/7: Writing rights manifest",
@@ -404,6 +480,7 @@ class VideoPipeline:
 
             plan = self._load_preferred_script_plan()
             self._write_json(self.paths["script"], plan.to_dict())
+            self._validate_scene_review_gate(plan)
             self._ensure_narration_for_plan(plan)
 
             rights = self._load_existing_rights()
@@ -412,31 +489,9 @@ class VideoPipeline:
             )
 
             if can_reuse_assets:
-                captions = self._run_stage(
-                    "captions",
-                    "Stage 4/7: Building captions",
-                    lambda: self._generate_captions(plan, self.paths["narration_wav"]),
-                )
-                intro_shift = self._intro_bookend_seconds()
-                if intro_shift > 0.0:
-                    captions = self._shift_captions(captions, intro_shift)
-                self._write_srt(self.paths["captions"], captions)
-                self._write_ass(self.paths["captions_ass"], captions)
-
-                timeline = self._run_stage(
-                    "timeline",
-                    "Stage 5/7: Building timeline",
-                    lambda: self._build_timeline(plan),
-                )
-                self._write_json(
-                    self.paths["timeline"],
-                    {
-                        "title": plan.title,
-                        "summary": plan.summary,
-                        "clips": [clip.to_dict() for clip in timeline],
-                        "total_seconds": round(sum(clip.seconds for clip in timeline), 3),
-                    },
-                )
+                self._prepare_bookend_backgrounds(plan)
+                self._ensure_captions(plan)
+                timeline = self._ensure_timeline(plan)
             else:
                 stage = self.run_preview_stage(plan)
                 rights = list(stage["rights"])
@@ -462,8 +517,13 @@ class VideoPipeline:
 
     def _ensure_narration_for_plan(self, plan: ScriptPlan) -> None:
         narration_wav = self.paths["narration_wav"]
+        expected_hash = self._narration_text_hash(plan)
         if narration_wav.exists() and narration_wav.stat().st_size > 0:
-            return
+            existing_hash = self._load_narration_state_hash()
+            if existing_hash and existing_hash == expected_hash:
+                return
+
+            self._warn("Approved script changed since narration generation; re-synthesizing narration audio.")
 
         self._initialize_duration_stats(plan)
         narration_text = self._clean_narration_text(plan.narration_text())
@@ -479,6 +539,394 @@ class VideoPipeline:
         self._update_duration_post_tts(plan, audio_duration, adjust_passes=0)
         self._update_pacing_post_tts(narration_text, audio_duration, adjust_passes=0)
         self._write_json(self.paths["script"], plan.to_dict())
+        self._write_narration_state(plan)
+
+    def _validate_scene_review_gate(self, plan: ScriptPlan) -> None:
+        state_path = self.paths.get("scene_review_state")
+        if not isinstance(state_path, Path) or not state_path.exists():
+            return
+
+        try:
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Scene review state is invalid: {exc}") from exc
+
+        scenes_state = payload.get("scenes") if isinstance(payload, dict) else None
+        if not isinstance(scenes_state, dict):
+            raise RuntimeError("Scene review state is missing 'scenes' map.")
+
+        blocked: list[str] = []
+        for scene in plan.scenes:
+            value = scenes_state.get(scene.scene_id)
+            if not isinstance(value, dict):
+                blocked.append(scene.scene_id)
+                continue
+
+            text_ok = bool(value.get("text_approved"))
+            narration_ok = bool(value.get("narration_approved"))
+            clip_ok = bool(value.get("clip_approved"))
+            if not (text_ok and narration_ok and clip_ok):
+                blocked.append(scene.scene_id)
+
+        if blocked:
+            hint = ", ".join(blocked[:8])
+            raise RuntimeError(
+                "Finalize blocked: not all scenes are approved in review state. "
+                f"Pending scenes: {hint}"
+            )
+
+    def synthesize_scene_narration_preview(self, scene_id: str, text: str) -> dict[str, str]:
+        cleaned_scene_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", scene_id.strip())
+        if not cleaned_scene_id:
+            cleaned_scene_id = "scene"
+
+        narration_text = self._clean_narration_text(text)
+        if not narration_text:
+            raise RuntimeError("Scene narration text is empty after normalization.")
+
+        self._prepare_dirs()
+        self._require_binary("ffmpeg")
+
+        scene_dir = self.paths["scene_narration_dir"]
+        scene_dir.mkdir(parents=True, exist_ok=True)
+
+        raw_path = scene_dir / f"{cleaned_scene_id}.raw.wav"
+        wav_path = scene_dir / f"{cleaned_scene_id}.wav"
+
+        self._synthesize_narration(narration_text, raw_path)
+        self._normalize_audio(raw_path, wav_path)
+
+        return {
+            "scene_id": cleaned_scene_id,
+            "raw_path": str(raw_path.resolve()),
+            "wav_path": str(wav_path.resolve()),
+        }
+
+    def _narration_text_hash(self, plan: ScriptPlan) -> str:
+        joined = self._clean_narration_text(plan.narration_text())
+        digest = hashlib.sha256(joined.encode("utf-8")).hexdigest()
+        return digest
+
+    def _load_narration_state_hash(self) -> str | None:
+        state_path = self.paths.get("narration_state")
+        if not isinstance(state_path, Path) or not state_path.exists():
+            return None
+
+        try:
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        value = payload.get("narration_text_sha256")
+        if not isinstance(value, str):
+            return None
+        value = value.strip().lower()
+        if not value:
+            return None
+        return value
+
+    def _write_narration_state(self, plan: ScriptPlan) -> None:
+        payload = {
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "narration_text_sha256": self._narration_text_hash(plan),
+            "narration_file": str(self.paths["narration_wav"].resolve()),
+            "script_file": str(self.paths["script"].resolve()),
+        }
+        self._write_json(self.paths["narration_state"], payload)
+
+    def _ensure_captions(self, plan: ScriptPlan) -> None:
+        signature = self._captions_signature()
+        state = self._load_json_state(self.paths["captions_state"])
+        captions_path = self.paths["captions"]
+        captions_ass_path = self.paths["captions_ass"]
+
+        can_reuse = (
+            isinstance(state, dict)
+            and str(state.get("captions_signature") or "") == signature
+            and captions_path.exists()
+            and captions_path.stat().st_size > 0
+            and captions_ass_path.exists()
+            and captions_ass_path.stat().st_size > 0
+        )
+        if can_reuse:
+            self._log("Stage 4/7: Reusing captions")
+            self.stage_times["captions"] = 0.0
+            self._log("captions completed in 0.00s")
+            cached_stats = state.get("caption_stats") if isinstance(state, dict) else None
+            if isinstance(cached_stats, dict):
+                self.caption_stats = dict(cached_stats)
+            self.optimization_stats["captions"] = {
+                "mode": "reused",
+                "captions_signature": signature,
+            }
+            return
+
+        captions = self._run_stage(
+            "captions",
+            "Stage 4/7: Building captions",
+            lambda: self._generate_captions(plan, self.paths["narration_wav"]),
+        )
+        intro_shift = self._intro_bookend_seconds()
+        if intro_shift > 0.0:
+            captions = self._shift_captions(captions, intro_shift)
+        self._write_srt(captions_path, captions)
+        self._write_ass(captions_ass_path, captions)
+        self._write_json(
+            self.paths["captions_state"],
+            {
+                "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "captions_signature": signature,
+                "captions_file": str(captions_path.resolve()),
+                "captions_ass_file": str(captions_ass_path.resolve()),
+                "caption_stats": dict(self.caption_stats),
+            },
+        )
+        self.optimization_stats["captions"] = {
+            "mode": "generated",
+            "captions_signature": signature,
+        }
+
+    def _ensure_timeline(self, plan: ScriptPlan) -> list[TimelineClip]:
+        signature = self._timeline_signature(plan)
+        state = self._load_json_state(self.paths["timeline_state"])
+        can_reuse = isinstance(state, dict) and str(state.get("timeline_signature") or "") == signature
+        if can_reuse:
+            timeline = self._load_timeline_from_json(self.paths["timeline"])
+            if timeline:
+                self._log("Stage 5/7: Reusing timeline")
+                self.stage_times["timeline"] = 0.0
+                self._log("timeline completed in 0.00s")
+                self.optimization_stats["timeline"] = {
+                    "mode": "reused",
+                    "timeline_signature": signature,
+                }
+                return timeline
+
+        timeline = self._run_stage("timeline", "Stage 5/7: Building timeline", lambda: self._build_timeline(plan))
+        self._write_timeline_json(plan, timeline)
+        self._write_json(
+            self.paths["timeline_state"],
+            {
+                "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "timeline_signature": signature,
+                "timeline_file": str(self.paths["timeline"].resolve()),
+                "clip_count": len(timeline),
+            },
+        )
+        self.optimization_stats["timeline"] = {
+            "mode": "generated",
+            "timeline_signature": signature,
+        }
+        return timeline
+
+    def _ensure_preview_render(self, timeline: list[TimelineClip]) -> None:
+        render_signature = self._render_signature(timeline)
+        if self._preview_render_cache_valid(render_signature):
+            preview_srt = self.paths["preview_srt"]
+            if not preview_srt.exists() and self.paths["captions"].exists():
+                shutil.copy2(self.paths["captions"], preview_srt)
+            self._log("Stage 6/7: Reusing preview video")
+            self.stage_times["preview_render"] = 0.0
+            self._log("preview_render completed in 0.00s")
+            self.optimization_stats["preview_render"] = {
+                "mode": "reused",
+                "render_signature": render_signature,
+            }
+            return
+
+        def render_preview_stage() -> None:
+            self._render_video(timeline, self.paths["narration_wav"], self.paths["preview_mp4"])
+            shutil.copy2(self.paths["captions"], self.paths["preview_srt"])
+
+        self._run_stage("preview_render", "Stage 6/7: Rendering preview video", render_preview_stage)
+        self._write_json(
+            self.paths["preview_render_state"],
+            {
+                "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "render_signature": render_signature,
+                "preview_mp4": str(self.paths["preview_mp4"].resolve()),
+                "preview_srt": str(self.paths["preview_srt"].resolve()),
+            },
+        )
+        self.optimization_stats["preview_render"] = {
+            "mode": "generated",
+            "render_signature": render_signature,
+        }
+
+    def _promote_preview_render_if_unchanged(self, timeline: list[TimelineClip]) -> bool:
+        render_signature = self._render_signature(timeline)
+        if not self._preview_render_cache_valid(render_signature):
+            return False
+
+        preview_mp4 = self.paths["preview_mp4"]
+        preview_srt = self.paths["preview_srt"]
+        final_mp4 = self.paths["final_mp4"]
+        final_srt = self.paths["final_srt"]
+        captions = self.paths["captions"]
+
+        if not preview_mp4.exists() or preview_mp4.stat().st_size == 0:
+            return False
+
+        srt_source: Path | None = None
+        if preview_srt.exists() and preview_srt.stat().st_size > 0:
+            srt_source = preview_srt
+        elif captions.exists() and captions.stat().st_size > 0:
+            srt_source = captions
+        if srt_source is None:
+            return False
+
+        shutil.copy2(preview_mp4, final_mp4)
+        shutil.copy2(srt_source, final_srt)
+
+        self._log("Stage 6/7: Reusing approved preview as final output")
+        self.optimization_stats["render"] = {
+            "mode": "reused-preview",
+            "reused_preview": True,
+            "render_signature": render_signature,
+        }
+        return True
+
+    def _captions_signature(self) -> str:
+        payload = {
+            "narration_sha256": self._safe_file_sha256(self.paths["narration_wav"]),
+            "caption_engine": self.config.caption_engine,
+            "caption_style": self.config.caption_style,
+            "caption_words_min": self.config.caption_words_min,
+            "caption_words_max": self.config.caption_words_max,
+            "caption_max_chars": self.config.caption_max_chars,
+            "caption_min_seconds": self.config.caption_min_seconds,
+            "caption_max_seconds": self.config.caption_max_seconds,
+            "caption_font_scale": self.config.caption_font_scale,
+            "caption_bottom_ratio": self.config.caption_bottom_ratio,
+            "intro_seconds": self._intro_bookend_seconds(),
+        }
+        return self._stable_payload_hash(payload)
+
+    def _timeline_signature(self, plan: ScriptPlan) -> str:
+        payload = {
+            "plan": plan.to_dict(),
+            "include_intro": self.config.include_intro,
+            "include_outro": self.config.include_outro,
+            "intro_seconds": self.config.intro_seconds,
+            "outro_seconds": self.config.outro_seconds,
+            "outro_text": self.config.outro_text,
+        }
+        return self._stable_payload_hash(payload)
+
+    def _render_signature(self, timeline: list[TimelineClip]) -> str:
+        payload = {
+            "clips": [clip.to_dict() for clip in timeline],
+            "narration_sha256": self._safe_file_sha256(self.paths["narration_wav"]),
+            "captions_ass_sha256": self._safe_file_sha256(self.paths["captions_ass"]) if self.config.burn_subtitles else "",
+            "render": {
+                "width": self.config.width,
+                "height": self.config.height,
+                "fps": self.config.fps,
+                "video_effects": self.config.video_effects,
+                "burn_subtitles": self.config.burn_subtitles,
+                "include_intro": self.config.include_intro,
+                "include_outro": self.config.include_outro,
+                "intro_seconds": self.config.intro_seconds,
+                "outro_seconds": self.config.outro_seconds,
+                "outro_text": self.config.outro_text,
+                "bookend_style": self.config.bookend_style,
+                "brand_logo_path": self.config.brand_logo_path,
+                "brand_intro_image_path": self.config.brand_intro_image_path,
+                "brand_outro_image_path": self.config.brand_outro_image_path,
+                "brand_use_scene_fallback": self.config.brand_use_scene_fallback,
+            },
+        }
+        return self._stable_payload_hash(payload)
+
+    def _preview_render_cache_valid(self, render_signature: str) -> bool:
+        state = self._load_json_state(self.paths["preview_render_state"])
+        if not isinstance(state, dict):
+            return False
+        if str(state.get("render_signature") or "") != render_signature:
+            return False
+
+        preview_mp4 = self.paths["preview_mp4"]
+        return preview_mp4.exists() and preview_mp4.stat().st_size > 0
+
+    def _load_timeline_from_json(self, timeline_path: Path) -> list[TimelineClip]:
+        if not timeline_path.exists():
+            return []
+
+        try:
+            payload = json.loads(timeline_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+
+        raw_clips = payload.get("clips") if isinstance(payload, dict) else None
+        if not isinstance(raw_clips, list):
+            return []
+
+        clips: list[TimelineClip] = []
+        for item in raw_clips:
+            if not isinstance(item, dict):
+                continue
+            scene_id = str(item.get("scene_id") or "").strip()
+            clip_name = str(item.get("clip_name") or "").strip()
+            heading = str(item.get("heading") or "").strip()
+            if not scene_id or not clip_name:
+                continue
+            try:
+                start = float(item.get("start") or 0.0)
+                end = float(item.get("end") or 0.0)
+                seconds = float(item.get("seconds") or max(0.0, end - start))
+            except (TypeError, ValueError):
+                continue
+            source_raw = item.get("source_path")
+            source_path = str(source_raw).strip() if source_raw is not None else None
+            clips.append(
+                TimelineClip(
+                    scene_id=scene_id,
+                    clip_name=clip_name,
+                    start=start,
+                    end=end,
+                    seconds=seconds,
+                    source_path=source_path or None,
+                    heading=heading,
+                )
+            )
+        return clips
+
+    def _write_timeline_json(self, plan: ScriptPlan, timeline: list[TimelineClip]) -> None:
+        self._write_json(
+            self.paths["timeline"],
+            {
+                "title": plan.title,
+                "summary": plan.summary,
+                "clips": [clip.to_dict() for clip in timeline],
+                "total_seconds": round(sum(clip.seconds for clip in timeline), 3),
+            },
+        )
+
+    def _safe_file_sha256(self, path: Path) -> str:
+        if not path.exists() or path.stat().st_size <= 0:
+            return ""
+        try:
+            return self._file_sha256(path)
+        except Exception:
+            return ""
+
+    def _stable_payload_hash(self, payload: dict[str, Any]) -> str:
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _load_json_state(self, path: Path) -> dict[str, Any] | None:
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
 
     def replace_clips_by_name(self, clip_names: list[str]) -> dict[str, str]:
         self._reset_run_state()
@@ -490,6 +938,7 @@ class VideoPipeline:
         try:
             self._require_binary("ffmpeg")
             self._require_binary("ffprobe")
+            self._validate_render_filter_requirements()
 
             plan = self._run_stage(
                 "load_script",
@@ -623,8 +1072,14 @@ class VideoPipeline:
             "timeline": project_dir / "timeline.json",
             "clip_catalog": project_dir / "review" / "clip_catalog.json",
             "approved_script": project_dir / "review" / "script_approved.json",
+            "scene_review_state": project_dir / "review" / "scene_review_state.json",
+            "narration_state": project_dir / "review" / "narration_state.json",
+            "captions_state": project_dir / "review" / "captions_state.json",
+            "timeline_state": project_dir / "review" / "timeline_state.json",
+            "preview_render_state": project_dir / "review" / "preview_render_state.json",
             "preview_mp4": project_dir / "review" / "preview.mp4",
             "preview_srt": project_dir / "review" / "preview.srt",
+            "scene_narration_dir": project_dir / "review" / "narration" / "scenes",
             "manifest": project_dir / "rights_manifest.json",
             "run_log": project_dir / "run.log",
             "run_report": project_dir / "run_report.json",
@@ -639,6 +1094,7 @@ class VideoPipeline:
     def _check_dependencies(self) -> None:
         self._require_binary("ffmpeg")
         self._require_binary("ffprobe")
+        self._validate_render_filter_requirements()
         if self.config.script_engine == "ollama":
             self._require_binary("ollama")
             self._ollama_ready = self._ollama_server_ready()
@@ -647,18 +1103,30 @@ class VideoPipeline:
                 if self.config.require_ollama:
                     raise RuntimeError(message)
                 self._warn(message + ". Falling back to template script mode.")
-        if self.config.tts_engine == "say":
-            self._require_binary("say")
-
-        if self.config.strict_commercial_safe and self.config.tts_engine == "say" and not self.config.allow_system_tts:
-            raise RuntimeError(
-                "Strict commercial-safe mode blocks system TTS fallback by default. "
-                "Use --tts-engine melo or pass --allow-system-tts explicitly."
-            )
+        if self.config.tts_engine == "piper":
+            command = self._resolve_piper_command()
+            if command is None:
+                raise RuntimeError(
+                    "Piper runtime not found. Install with: python -m pip install piper-tts"
+                )
 
     def _require_binary(self, binary_name: str) -> None:
         if shutil.which(binary_name) is None:
             raise RuntimeError(f"Missing required binary: {binary_name}")
+
+    def _validate_render_filter_requirements(self) -> None:
+        requires_bookend_text = self._intro_bookend_seconds() > 0.0 or self._outro_bookend_seconds() > 0.0
+        if requires_bookend_text and not self._ffmpeg_supports_drawtext():
+            raise RuntimeError(
+                "ffmpeg drawtext filter is required for intro/outro text rendering. "
+                "Install an ffmpeg build with drawtext support or disable intro/outro bookends."
+            )
+
+        if self.config.burn_subtitles and not self._ffmpeg_supports_subtitles_filter():
+            raise RuntimeError(
+                "ffmpeg subtitles filter is required for burned subtitles. "
+                "Install an ffmpeg build with libass/subtitles support or disable burned subtitles."
+            )
 
     def _generate_script_plan(self) -> ScriptPlan:
         raw_plan: dict[str, Any] | None = None
@@ -1331,10 +1799,8 @@ class VideoPipeline:
             self._tts_with_melo(chunks, output_raw_wav)
             return
 
-        if self.config.tts_engine == "say":
-            if self.config.strict_commercial_safe and not self.config.allow_system_tts:
-                raise RuntimeError("System TTS fallback is blocked in strict mode unless --allow-system-tts is set")
-            self._tts_with_say(chunks, output_raw_wav)
+        if self.config.tts_engine == "piper":
+            self._tts_with_piper(chunks, output_raw_wav)
             return
 
         raise RuntimeError(f"Unsupported TTS engine: {self.config.tts_engine}")
@@ -1619,31 +2085,63 @@ class VideoPipeline:
         if not output_raw_wav.exists() or output_raw_wav.stat().st_size == 0:
             raise RuntimeError("MeloTTS did not produce audio output")
 
-    def _tts_with_say(self, chunks: list[dict[str, Any]], output_raw_wav: Path) -> None:
+    def _tts_with_piper(self, chunks: list[dict[str, Any]], output_raw_wav: Path) -> None:
+        piper_command = self._piper_command or self._resolve_piper_command()
+        if piper_command is None:
+            raise RuntimeError("Piper runtime not found. Install with: python -m pip install piper-tts")
+
+        voice_meta = self._resolve_piper_voice_meta()
+        model_path, config_path = self._ensure_piper_voice_assets(voice_meta)
         parts_dir = self.paths["tmp"] / "tts_parts"
         parts_dir.mkdir(parents=True, exist_ok=True)
         part_files: list[Path] = []
+        settings = self._voice_profile_settings()
+        effective_speed = max(0.5, min(2.0, float(self.config.voice_speed) * float(settings["speed_multiplier"])))
+        length_scale = max(0.1, min(2.5, 1.0 / effective_speed))
+        speaker_id = voice_meta.get("speaker_id")
 
         for idx, chunk in enumerate(chunks):
             text = str(chunk.get("text") or "").strip()
             if not text:
                 continue
 
-            temp_txt = parts_dir / f"say_{idx:04d}.txt"
-            temp_aiff = parts_dir / f"say_{idx:04d}.aiff"
-            temp_wav = parts_dir / f"say_{idx:04d}.wav"
-            self._write_text(temp_txt, text)
-
-            result = self._run_command(
-                ["say", "-f", str(temp_txt), "-o", str(temp_aiff)],
-                timeout=600,
-                check=False,
+            raw_wav = parts_dir / f"piper_{idx:04d}.raw.wav"
+            wav_path = parts_dir / f"piper_{idx:04d}.wav"
+            command = list(piper_command)
+            command.extend(
+                [
+                    "--model",
+                    str(model_path),
+                    "--config",
+                    str(config_path),
+                    "--output_file",
+                    str(raw_wav),
+                    "--length_scale",
+                    f"{length_scale:.4f}",
+                ]
             )
-            if result.returncode != 0:
-                raise RuntimeError(f"say command failed: {result.stderr.strip()}")
+            if speaker_id is not None:
+                command.extend(["--speaker", str(int(speaker_id))])
 
-            self._standardize_wav(temp_aiff, temp_wav)
-            part_files.append(temp_wav)
+            result = subprocess.run(
+                command,
+                check=False,
+                input=text,
+                text=True,
+                capture_output=True,
+                timeout=180,
+            )
+            if int(result.returncode or 0) != 0:
+                stderr_text = str(result.stderr or "").strip()
+                if "No module named 'pathvalidate'" in stderr_text:
+                    raise RuntimeError(
+                        "Piper dependency missing. Install with: "
+                        f"{sys.executable} -m pip install pathvalidate"
+                    )
+                raise RuntimeError(f"Piper synthesis failed: {stderr_text}")
+
+            self._standardize_wav(raw_wav, wav_path)
+            part_files.append(wav_path)
 
             pause_seconds = float(chunk.get("pause_after") or 0.0)
             if pause_seconds > 0.0:
@@ -1652,9 +2150,139 @@ class VideoPipeline:
                 part_files.append(pause_path)
 
         if not part_files:
-            raise RuntimeError("System TTS did not produce any audio parts")
+            raise RuntimeError("Piper TTS did not produce any audio parts")
 
         self._concat_wav_parts(part_files, output_raw_wav)
+
+    def _resolve_piper_command(self) -> list[str] | None:
+        direct_candidates: list[Path] = []
+        from_path = shutil.which("piper")
+        if from_path:
+            direct_candidates.append(Path(from_path).expanduser().resolve())
+
+        venv_piper = (Path(__file__).resolve().parents[2] / ".venv" / "bin" / "piper").resolve()
+        if venv_piper.exists() and os.access(str(venv_piper), os.X_OK):
+            direct_candidates.append(venv_piper)
+
+        seen: set[str] = set()
+        for candidate in direct_candidates:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                probe = subprocess.run(
+                    [key, "--help"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if int(probe.returncode or 0) == 0:
+                    self._piper_command = [key]
+                    return [key]
+            except Exception:
+                continue
+
+        python_candidates: list[Path] = []
+        venv_python = os.environ.get("VIRTUAL_ENV")
+        if venv_python:
+            python_candidates.append((Path(venv_python) / "bin" / "python").resolve())
+        python_candidates.append(Path(sys.executable).resolve())
+
+        seen_python: set[str] = set()
+        for py in python_candidates:
+            py_str = str(py)
+            if py_str in seen_python:
+                continue
+            seen_python.add(py_str)
+            if not py.exists() or not os.access(py_str, os.X_OK):
+                continue
+            try:
+                probe = subprocess.run(
+                    [py_str, "-m", "piper", "--help"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if int(probe.returncode or 0) == 0:
+                    self._piper_command = [py_str, "-m", "piper"]
+                    return [py_str, "-m", "piper"]
+            except Exception:
+                continue
+
+        return None
+
+    def _resolve_piper_voice_meta(self) -> dict[str, Any]:
+        speaker_id = self.config.piper_speaker_id
+        if self.config.piper_model_url and self.config.piper_config_url:
+            voice_id = str(self.config.piper_voice_id or "custom-piper").strip() or "custom-piper"
+            return {
+                "id": voice_id,
+                "speaker_id": speaker_id,
+                "model_url": str(self.config.piper_model_url).strip(),
+                "config_url": str(self.config.piper_config_url).strip(),
+            }
+
+        voice_id = str(self.config.piper_voice_id or "").strip()
+        if not voice_id:
+            raise RuntimeError("Piper voice id is required when --tts-engine piper is selected")
+
+        matches = [item for item in PIPER_VOICE_PRESETS if str(item.get("id") or "") == voice_id]
+        if not matches:
+            available_ids = sorted({str(item.get("id") or "").strip() for item in PIPER_VOICE_PRESETS if item.get("id")})
+            raise RuntimeError(
+                "Unknown Piper voice id: "
+                f"{voice_id}. Available ids: {', '.join(available_ids)}"
+            )
+
+        if speaker_id is not None:
+            for item in matches:
+                item_speaker = item.get("speaker_id")
+                if item_speaker is not None and int(item_speaker) == int(speaker_id):
+                    return dict(item)
+
+        return dict(matches[0])
+
+    def _ensure_piper_voice_assets(self, voice_meta: dict[str, Any]) -> tuple[Path, Path]:
+        voice_id = str(voice_meta.get("id") or "voice").strip() or "voice"
+        model_url = str(voice_meta.get("model_url") or "").strip()
+        config_url = str(voice_meta.get("config_url") or "").strip()
+        if not model_url or not config_url:
+            raise RuntimeError(f"Piper voice `{voice_id}` missing model/config URL")
+
+        safe_voice_id = self._safe_filename_token(voice_id)
+        voice_dir = (Path.home() / ".imagine" / "models" / "piper" / safe_voice_id).resolve()
+        voice_dir.mkdir(parents=True, exist_ok=True)
+        model_path = voice_dir / f"{safe_voice_id}.onnx"
+        config_path = voice_dir / f"{safe_voice_id}.onnx.json"
+
+        if not model_path.exists() or model_path.stat().st_size <= 0:
+            self._download_url_to_file(model_url, model_path)
+        if not config_path.exists() or config_path.stat().st_size <= 0:
+            self._download_url_to_file(config_url, config_path)
+
+        return model_path, config_path
+
+    def _download_url_to_file(self, url: str, destination: Path) -> None:
+        try:
+            with urlrequest.urlopen(url, timeout=120) as response:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with destination.open("wb") as handle:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+        except urlerror.URLError as exc:
+            raise RuntimeError(f"Failed to download Piper asset {url}: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Failed to download Piper asset {url}: {exc}") from exc
+
+    def _safe_filename_token(self, value: str) -> str:
+        token = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip()).strip("_")
+        return token or "sample"
 
     def _standardize_wav(self, input_audio: Path, output_wav: Path) -> None:
         convert = self._run_command(
@@ -2774,9 +3402,118 @@ class VideoPipeline:
         else:
             shutil.copy2(mixed_mp4, final_mp4)
 
+    def _resolve_optional_input_path(self, raw_path: str | None, *, purpose: str) -> Path | None:
+        if not raw_path:
+            return None
+
+        path = Path(str(raw_path).strip()).expanduser()
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        else:
+            path = path.resolve()
+
+        if not path.exists():
+            self._warn(f"Configured {purpose} path does not exist: {path}")
+            return None
+        if path.stat().st_size <= 0:
+            self._warn(f"Configured {purpose} path is empty: {path}")
+            return None
+        return path
+
+    def _resolve_bookend_logo_overlay(self) -> Path | None:
+        logo_path = self._resolve_optional_input_path(self.config.brand_logo_path, purpose="brand logo")
+        if logo_path is None:
+            return None
+
+        ext = logo_path.suffix.lower()
+        if ext in {".png", ".jpg", ".jpeg", ".webp"}:
+            return logo_path
+
+        if ext != ".svg":
+            self._warn(f"Unsupported brand logo format ({ext}); expected png/jpg/webp/svg.")
+            return None
+
+        target_dir = self.paths["tmp"] / "bookends"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha1(str(logo_path).encode("utf-8")).hexdigest()[:12]
+        rasterized = target_dir / f"brand-logo-{digest}.png"
+        if rasterized.exists() and rasterized.stat().st_size > 0:
+            return rasterized
+
+        result = self._run_command(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(logo_path),
+                "-frames:v",
+                "1",
+                str(rasterized),
+            ],
+            timeout=120,
+            check=False,
+        )
+        if result.returncode == 0 and rasterized.exists() and rasterized.stat().st_size > 0:
+            return rasterized
+
+        if shutil.which("sips") is not None:
+            sips_result = self._run_command(
+                [
+                    "sips",
+                    "-s",
+                    "format",
+                    "png",
+                    str(logo_path),
+                    "--out",
+                    str(rasterized),
+                ],
+                timeout=60,
+                check=False,
+            )
+            if sips_result.returncode == 0 and rasterized.exists() and rasterized.stat().st_size > 0:
+                return rasterized
+
+        self._warn(
+            f"Could not rasterize brand logo SVG ({logo_path.name}); "
+            "intro/outro will render without logo overlay."
+        )
+        return None
+
+    def _bookend_allows_scene_background_fallback(self) -> bool:
+        style = self._normalized_bookend_style()
+        if style == "brand-image-motion":
+            return bool(self.config.brand_use_scene_fallback)
+        return True
+
     def _prepare_bookend_backgrounds(self, plan: ScriptPlan) -> None:
         self._intro_bookend_background = None
         self._outro_bookend_background = None
+        self._bookend_logo_overlay = self._resolve_bookend_logo_overlay()
+
+        configured_intro = self._resolve_optional_input_path(
+            self.config.brand_intro_image_path,
+            purpose="brand intro background",
+        )
+        configured_outro = self._resolve_optional_input_path(
+            self.config.brand_outro_image_path,
+            purpose="brand outro background",
+        )
+        if configured_intro is not None:
+            self._intro_bookend_background = configured_intro
+        if configured_outro is not None:
+            self._outro_bookend_background = configured_outro
+        if self._outro_bookend_background is None and self._intro_bookend_background is not None:
+            self._outro_bookend_background = self._intro_bookend_background
+
+        if (
+            self._intro_bookend_background is not None
+            and self._outro_bookend_background is not None
+            and not self._bookend_allows_scene_background_fallback()
+        ):
+            return
+
+        if not self._bookend_allows_scene_background_fallback():
+            return
 
         scene_assets: list[Path] = []
         for scene in plan.scenes:
@@ -2789,8 +3526,10 @@ class VideoPipeline:
         if not scene_assets:
             return
 
-        self._intro_bookend_background = self._resolve_bookend_background(scene_assets[0], "intro")
-        self._outro_bookend_background = self._resolve_bookend_background(scene_assets[-1], "outro")
+        if self._intro_bookend_background is None:
+            self._intro_bookend_background = self._resolve_bookend_background(scene_assets[0], "intro")
+        if self._outro_bookend_background is None:
+            self._outro_bookend_background = self._resolve_bookend_background(scene_assets[-1], "outro")
 
         if self._outro_bookend_background is None and self._intro_bookend_background is not None:
             self._outro_bookend_background = self._intro_bookend_background
@@ -2861,25 +3600,43 @@ class VideoPipeline:
     def _render_single_clip(self, clip: TimelineClip, output_clip: Path, index: int) -> None:
         duration = max(0.3, clip.seconds)
         if clip.scene_id == "__intro":
+            include_text = True
             command = self._intro_clip_command(
                 output_clip=output_clip,
                 duration=duration,
                 title=clip.heading,
                 background_image=self._intro_bookend_background,
+                logo_image=self._bookend_logo_overlay,
+                include_text=include_text,
             )
             result = self._run_command(command, timeout=900, check=False)
+            if result.returncode != 0 and self._is_drawtext_missing_error(result.stderr):
+                self._ffmpeg_drawtext_available = False
+                raise RuntimeError(
+                    "ffmpeg drawtext filter is required for intro/outro text rendering. "
+                    "Install an ffmpeg build with drawtext support or disable intro/outro bookends."
+                )
             if result.returncode != 0:
                 raise RuntimeError(f"Failed to render intro clip: {result.stderr.strip()}")
             return
 
         if clip.scene_id == "__outro":
+            include_text = True
             command = self._outro_clip_command(
                 output_clip=output_clip,
                 duration=duration,
                 text=clip.heading,
                 background_image=self._outro_bookend_background,
+                logo_image=self._bookend_logo_overlay,
+                include_text=include_text,
             )
             result = self._run_command(command, timeout=900, check=False)
+            if result.returncode != 0 and self._is_drawtext_missing_error(result.stderr):
+                self._ffmpeg_drawtext_available = False
+                raise RuntimeError(
+                    "ffmpeg drawtext filter is required for intro/outro text rendering. "
+                    "Install an ffmpeg build with drawtext support or disable intro/outro bookends."
+                )
             if result.returncode != 0:
                 raise RuntimeError(f"Failed to render outro clip: {result.stderr.strip()}")
             return
@@ -2984,6 +3741,8 @@ class VideoPipeline:
         duration: float,
         title: str,
         background_image: Path | None = None,
+        logo_image: Path | None = None,
+        include_text: bool = True,
     ) -> list[str]:
         style = self._normalized_bookend_style()
         palette = self._bookend_palette(style=style, is_intro=True)
@@ -3006,6 +3765,87 @@ class VideoPipeline:
         fade = min(0.45, max(0.2, duration * 0.2))
         fade_out_start = max(0.0, duration - fade)
 
+        if style == "brand-image-motion":
+            subtitle_font = max(18, int(self.config.height * 0.028))
+            title_y = int(self.config.height * 0.46)
+            subtitle_y = int(self.config.height * 0.72)
+
+            input_args: list[str] = []
+            if background_image and background_image.exists():
+                input_args.extend(["-loop", "1", "-i", str(background_image)])
+            else:
+                input_args.extend(
+                    [
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        f"color=c={palette['base']}:s={self.config.width}x{self.config.height}:r={self.config.fps}",
+                    ]
+                )
+
+            use_logo = bool(logo_image and logo_image.exists())
+            if use_logo:
+                input_args.extend(["-loop", "1", "-i", str(logo_image)])
+
+            filter_parts: list[str] = [
+                (
+                    f"[0:v]scale={self.config.width}:{self.config.height}:force_original_aspect_ratio=increase,"
+                    f"crop={self.config.width}:{self.config.height},"
+                    "zoompan=z='min(zoom+0.0008,1.07)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+                    f"d=1:s={self.config.width}x{self.config.height}:fps={self.config.fps},"
+                    "eq=contrast=1.05:saturation=1.08:brightness=0.015,"
+                    f"drawbox=x=0:y=0:w=iw:h=ih:color={palette['overlay']}:t=fill,"
+                    f"drawbox=x=iw*0.08:y=ih*0.20:w=iw*0.84:h=ih*0.62:color={palette['panel']}:t=fill[bookend_base]"
+                ),
+            ]
+
+            current_label = "bookend_base"
+            if use_logo:
+                logo_width = int(self.config.width * 0.24)
+                filter_parts.append(f"[1:v]scale=w={logo_width}:h=-1[bookend_logo]")
+                filter_parts.append(
+                    f"[{current_label}][bookend_logo]overlay=x=(W-w)/2:y={int(self.config.height * 0.12)}:format=auto[bookend_logo_out]"
+                )
+                current_label = "bookend_logo_out"
+
+            if include_text:
+                filter_parts.append(
+                    (
+                        f"[{current_label}]drawtext=textfile='{title_textfile}':fontcolor={palette['title_color']}:"
+                        f"fontsize={title_font}:x=(w-text_w)/2:y={title_y}:line_spacing=10:"
+                        "shadowcolor=black@0.85:shadowx=2:shadowy=2,"
+                        f"drawtext=textfile='{subtitle_textfile}':fontcolor={palette['subtitle_color']}:"
+                        f"fontsize={subtitle_font}:x=(w-text_w)/2:y={subtitle_y}[bookend_text]"
+                    )
+                )
+                current_label = "bookend_text"
+
+            filter_parts.append(
+                f"[{current_label}]fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f}[v]"
+            )
+
+            return [
+                "ffmpeg",
+                "-y",
+                *input_args,
+                "-t",
+                f"{duration:.3f}",
+                "-filter_complex",
+                ";".join(filter_parts),
+                "-map",
+                "[v]",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "20",
+                "-pix_fmt",
+                "yuv420p",
+                str(output_clip),
+            ]
+
         input_args: list[str]
         visual_prefix = ""
         if background_image and background_image.exists():
@@ -3022,6 +3862,15 @@ class VideoPipeline:
                 f"color=c={palette['base']}:s={self.config.width}x{self.config.height}:r={self.config.fps}",
             ]
 
+        text_overlay = ""
+        if include_text:
+            text_overlay = (
+                f"drawtext=textfile='{title_textfile}':fontcolor={palette['title_color']}:fontsize={title_font}:"
+                f"x=(w-text_w)/2:y={title_y}:line_spacing=10:shadowcolor=black@0.9:shadowx=2:shadowy=2,"
+                f"drawtext=textfile='{subtitle_textfile}':fontcolor={palette['subtitle_color']}:fontsize={subtitle_font}:"
+                f"x=(w-text_w)/2:y={subtitle_y},"
+            )
+
         return [
             "ffmpeg",
             "-y",
@@ -3034,10 +3883,7 @@ class VideoPipeline:
                 f"drawbox=x=0:y=0:w=iw:h=ih:color={palette['overlay']}:t=fill,"
                 f"drawbox=x=iw*0.11:y=ih*0.22:w=iw*0.78:h=ih*0.56:color={palette['panel']}:t=fill,"
                 f"drawbox=x=iw*0.16:y=ih*0.245:w=iw*0.68:h=2:color={palette['accent']}:t=fill,"
-                f"drawtext=textfile='{title_textfile}':fontcolor={palette['title_color']}:fontsize={title_font}:"
-                f"x=(w-text_w)/2:y={title_y}:line_spacing=10:shadowcolor=black@0.9:shadowx=2:shadowy=2,"
-                f"drawtext=textfile='{subtitle_textfile}':fontcolor={palette['subtitle_color']}:fontsize={subtitle_font}:"
-                f"x=(w-text_w)/2:y={subtitle_y},"
+                f"{text_overlay}"
                 f"fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f}"
             ),
             "-an",
@@ -3058,6 +3904,8 @@ class VideoPipeline:
         duration: float,
         text: str,
         background_image: Path | None = None,
+        logo_image: Path | None = None,
+        include_text: bool = True,
     ) -> list[str]:
         style = self._normalized_bookend_style()
         palette = self._bookend_palette(style=style, is_intro=False)
@@ -3080,6 +3928,89 @@ class VideoPipeline:
         fade = min(0.45, max(0.2, duration * 0.2))
         fade_out_start = max(0.0, duration - fade)
 
+        if style == "brand-image-motion":
+            subtitle_font = max(18, int(self.config.height * 0.028))
+            title_y = int(self.config.height * 0.12)
+            subtitle_y = int(self.config.height * 0.20)
+
+            input_args: list[str] = []
+            if background_image and background_image.exists():
+                input_args.extend(["-loop", "1", "-i", str(background_image)])
+            else:
+                input_args.extend(
+                    [
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        f"color=c={palette['base']}:s={self.config.width}x{self.config.height}:r={self.config.fps}",
+                    ]
+                )
+
+            use_logo = bool(logo_image and logo_image.exists())
+            if use_logo:
+                input_args.extend(["-loop", "1", "-i", str(logo_image)])
+
+            filter_parts: list[str] = [
+                (
+                    f"[0:v]scale={self.config.width}:{self.config.height}:force_original_aspect_ratio=increase,"
+                    f"crop={self.config.width}:{self.config.height},"
+                    "zoompan=z='min(zoom+0.0007,1.06)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+                    f"d=1:s={self.config.width}x{self.config.height}:fps={self.config.fps},"
+                    "eq=contrast=1.04:saturation=1.05:brightness=0.01,"
+                    f"drawbox=x=0:y=0:w=iw:h=ih:color={palette['overlay']}:t=fill,"
+                    f"drawbox=x=iw*0.06:y=ih*0.28:w=iw*0.40:h=ih*0.46:color={palette['accent']}:t=4,"
+                    f"drawbox=x=iw*0.54:y=ih*0.28:w=iw*0.40:h=ih*0.46:color={palette['accent']}:t=4,"
+                    f"drawbox=x=iw*0.34:y=ih*0.80:w=iw*0.32:h=ih*0.11:color={palette['panel']}:t=fill[bookend_base]"
+                ),
+            ]
+
+            current_label = "bookend_base"
+            if use_logo:
+                logo_width = int(self.config.width * 0.14)
+                filter_parts.append(f"[1:v]scale=w={logo_width}:h=-1[bookend_logo]")
+                filter_parts.append(
+                    f"[{current_label}][bookend_logo]overlay=x={int(self.config.width * 0.08)}:y={int(self.config.height * 0.07)}:format=auto[bookend_logo_out]"
+                )
+                current_label = "bookend_logo_out"
+
+            if include_text:
+                filter_parts.append(
+                    (
+                        f"[{current_label}]drawtext=textfile='{outro_textfile}':fontcolor={palette['title_color']}:"
+                        f"fontsize={title_font}:x=(w-text_w)/2:y={title_y}:line_spacing=10:"
+                        "shadowcolor=black@0.85:shadowx=2:shadowy=2,"
+                        f"drawtext=textfile='{sub_textfile}':fontcolor={palette['subtitle_color']}:"
+                        f"fontsize={subtitle_font}:x=(w-text_w)/2:y={subtitle_y}[bookend_text]"
+                    )
+                )
+                current_label = "bookend_text"
+
+            filter_parts.append(
+                f"[{current_label}]fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f}[v]"
+            )
+
+            return [
+                "ffmpeg",
+                "-y",
+                *input_args,
+                "-t",
+                f"{duration:.3f}",
+                "-filter_complex",
+                ";".join(filter_parts),
+                "-map",
+                "[v]",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "20",
+                "-pix_fmt",
+                "yuv420p",
+                str(output_clip),
+            ]
+
         input_args: list[str]
         visual_prefix = ""
         if background_image and background_image.exists():
@@ -3096,6 +4027,15 @@ class VideoPipeline:
                 f"color=c={palette['base']}:s={self.config.width}x{self.config.height}:r={self.config.fps}",
             ]
 
+        text_overlay = ""
+        if include_text:
+            text_overlay = (
+                f"drawtext=textfile='{outro_textfile}':fontcolor={palette['title_color']}:fontsize={title_font}:"
+                f"x=(w-text_w)/2:y={title_y}:line_spacing=10:shadowcolor=black@0.9:shadowx=2:shadowy=2,"
+                f"drawtext=textfile='{sub_textfile}':fontcolor={palette['subtitle_color']}:fontsize={subtitle_font}:"
+                f"x=(w-text_w)/2:y={subtitle_y},"
+            )
+
         return [
             "ffmpeg",
             "-y",
@@ -3108,10 +4048,7 @@ class VideoPipeline:
                 f"drawbox=x=0:y=0:w=iw:h=ih:color={palette['overlay']}:t=fill,"
                 f"drawbox=x=iw*0.10:y=ih*0.26:w=iw*0.80:h=ih*0.50:color={palette['panel']}:t=fill,"
                 f"drawbox=x=iw*0.16:y=ih*0.735:w=iw*0.68:h=2:color={palette['accent']}:t=fill,"
-                f"drawtext=textfile='{outro_textfile}':fontcolor={palette['title_color']}:fontsize={title_font}:"
-                f"x=(w-text_w)/2:y={title_y}:line_spacing=10:shadowcolor=black@0.9:shadowx=2:shadowy=2,"
-                f"drawtext=textfile='{sub_textfile}':fontcolor={palette['subtitle_color']}:fontsize={subtitle_font}:"
-                f"x=(w-text_w)/2:y={subtitle_y},"
+                f"{text_overlay}"
                 f"fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f}"
             ),
             "-an",
@@ -3128,11 +4065,56 @@ class VideoPipeline:
 
     def _normalized_bookend_style(self) -> str:
         style = str(self.config.bookend_style or "minimal-clean").strip().lower()
-        if style not in {"minimal-clean", "cinematic-subtle"}:
+        if style not in {"minimal-clean", "cinematic-subtle", "brand-image-motion"}:
             return "minimal-clean"
         return style
 
+    def _ffmpeg_supports_drawtext(self) -> bool:
+        cached = self._ffmpeg_drawtext_available
+        if cached is not None:
+            return bool(cached)
+
+        result = self._run_command(["ffmpeg", "-hide_banner", "-filters"], timeout=30, check=False)
+        catalog = f"{result.stdout}\n{result.stderr}".lower()
+        available = "drawtext" in catalog
+        self._ffmpeg_drawtext_available = available
+        return available
+
+    def _is_drawtext_missing_error(self, error_text: str) -> bool:
+        text = (error_text or "").lower()
+        return "no such filter" in text and "drawtext" in text
+
+    def _ffmpeg_supports_subtitles_filter(self) -> bool:
+        cached = self._ffmpeg_subtitles_available
+        if cached is not None:
+            return bool(cached)
+
+        result = self._run_command(["ffmpeg", "-hide_banner", "-filters"], timeout=30, check=False)
+        catalog = f"{result.stdout}\n{result.stderr}".lower()
+        available = bool(re.search(r"\bsubtitles\b", catalog))
+        self._ffmpeg_subtitles_available = available
+        return available
+
     def _bookend_palette(self, style: str, is_intro: bool) -> dict[str, str]:
+        if style == "brand-image-motion":
+            if is_intro:
+                return {
+                    "base": "#0c1018",
+                    "overlay": "#05080f@0.42",
+                    "panel": "#111827@0.58",
+                    "accent": "#4dc0ff@0.85",
+                    "title_color": "white",
+                    "subtitle_color": "white@0.86",
+                }
+            return {
+                "base": "#0d1118",
+                "overlay": "#060a10@0.40",
+                "panel": "#111827@0.72",
+                "accent": "#73f3c6@0.86",
+                "title_color": "white",
+                "subtitle_color": "white@0.86",
+            }
+
         if style == "cinematic-subtle":
             if is_intro:
                 return {
@@ -3244,6 +4226,12 @@ class VideoPipeline:
             shutil.copy2(input_mp4, output_mp4)
             return
 
+        if not self._ffmpeg_supports_subtitles_filter():
+            raise RuntimeError(
+                "ffmpeg subtitles filter is required for burned subtitles. "
+                "Install an ffmpeg build with libass/subtitles support or disable burned subtitles."
+            )
+
         filter_value = self._ffmpeg_subtitles_filter(subtitles_ass)
         command = [
             "ffmpeg",
@@ -3266,6 +4254,13 @@ class VideoPipeline:
         ]
         result = self._run_command(command, timeout=2400, check=False)
         if result.returncode != 0:
+            lowered = (result.stderr or "").lower()
+            if "no such filter" in lowered and "subtitles" in lowered:
+                self._ffmpeg_subtitles_available = False
+                raise RuntimeError(
+                    "ffmpeg subtitles filter is required for burned subtitles. "
+                    "Install an ffmpeg build with libass/subtitles support or disable burned subtitles."
+                )
             self._warn(f"Subtitle burn-in failed; shipping video without burned subtitles. Details: {result.stderr.strip()}")
             shutil.copy2(input_mp4, output_mp4)
 
@@ -3274,7 +4269,9 @@ class VideoPipeline:
         value = value.replace("\\", "\\\\")
         value = value.replace(":", "\\:")
         value = value.replace("'", "\\'")
-        return f"subtitles='{value}':charenc=UTF-8"
+        value = value.replace(",", "\\,")
+        value = value.replace(";", "\\;")
+        return f"subtitles=filename='{value}'"
 
     def _build_manifest(self, plan: ScriptPlan, rights: list[AssetRight]) -> dict[str, Any]:
         out_files = [
@@ -3332,6 +4329,10 @@ class VideoPipeline:
                 "outro_seconds": self.config.outro_seconds,
                 "outro_text": self.config.outro_text,
                 "bookend_style": self.config.bookend_style,
+                "brand_logo_path": self.config.brand_logo_path,
+                "brand_intro_image_path": self.config.brand_intro_image_path,
+                "brand_outro_image_path": self.config.brand_outro_image_path,
+                "brand_use_scene_fallback": self.config.brand_use_scene_fallback,
                 "strict_commercial_safe": self.config.strict_commercial_safe,
                 "script_engine": self.config.script_engine,
                 "tts_engine": self.config.tts_engine,
@@ -3344,6 +4345,8 @@ class VideoPipeline:
                 "target_speech_wpm": self.config.target_speech_wpm,
                 "voice_profile": self.config.voice_profile,
                 "voice_speed": self.config.voice_speed,
+                "piper_voice_id": self.config.piper_voice_id,
+                "piper_speaker_id": self.config.piper_speaker_id,
                 "ollama_model": self.config.ollama_model,
             },
             "inputs": {
@@ -3491,6 +4494,7 @@ class VideoPipeline:
             "duration_stats": self.duration_stats,
             "pacing_stats": self.pacing_stats,
             "asset_stats": self.asset_stats,
+            "optimization_stats": self.optimization_stats,
             "fallbacks": {
                 "used_template_script": self.used_template_fallback,
             },
