@@ -1,6 +1,8 @@
 .venv/
 __pycache__/
 *.pyc
+*.egg-info/
 projects/
 *.DS_Store
 .env
+*.mp4
