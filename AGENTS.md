@@ -51,6 +51,9 @@ Next milestone:
 - Default to action; do not ask permission for safe, reversible work.
 - Ask exactly one targeted question only when blocked by material ambiguity, irreversible risk, or missing secret/credential.
 - Finish non-blocked work first; keep changes minimal and focused.
+- Treat the TUI as the primary product surface. For user-facing features, prefer TUI support first or in the same change as CLI support.
+- Do not consider a new workflow complete when it is available only through the CLI unless the user explicitly requests CLI-only scope.
+- When a temporary CLI-only path is introduced for technical reasons, call it out as an explicit gap and make TUI follow-up the next priority.
 
 ## 7) Non-negotiable invariants
 ### MUST
