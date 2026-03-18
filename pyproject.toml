@@ -9,11 +9,18 @@ description = "Local-first long-form explainer video generator MVP"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
+  "feedparser>=6.0.11",
+  "playwright>=1.52.0",
+  "pytrends>=4.9.0",
   "requests>=2.32.0",
+  "trafilatura>=1.9.0",
 ]
 
 [project.optional-dependencies]
-voice = ["MeloTTS @ git+https://github.com/myshell-ai/MeloTTS.git"]
+voice = [
+  "MeloTTS @ git+https://github.com/myshell-ai/MeloTTS.git",
+  "kokoro>=0.7.16",
+]
 captions = ["faster-whisper>=1.1.0"]
 
 [project.scripts]
