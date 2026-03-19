@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -612,6 +613,7 @@ class VideoPipeline:
         self._coverr_requests_this_run = 0
         self._vecteezy_usage_state: dict[str, Any] | None = None
         self._vecteezy_downloads_this_run = 0
+        self._duration_cache: dict[tuple[str, int, int], float] = {}
 
     def _reset_run_state(self) -> None:
         self.stage_times = {}
@@ -673,6 +675,7 @@ class VideoPipeline:
         self._coverr_requests_this_run = 0
         self._vecteezy_usage_state = None
         self._vecteezy_downloads_this_run = 0
+        self._duration_cache = {}
 
     def run(self) -> dict[str, str]:
         self._reset_run_state()
@@ -1251,12 +1254,19 @@ class VideoPipeline:
             if self._promote_preview_render_if_unchanged(timeline):
                 return
 
-            self._render_video(timeline, self.paths["narration_wav"], self.paths["final_mp4"])
+            self._render_video(
+                timeline,
+                self.paths["narration_wav"],
+                self.paths["final_mp4"],
+                metrics_section="render",
+            )
             shutil.copy2(self.paths["captions"], self.paths["final_srt"])
-            self.optimization_stats["render"] = {
-                "mode": "rerendered-finalize",
-                "reused_preview": False,
-            }
+            self._optimization_section("render").update(
+                {
+                    "mode": "rerendered-finalize",
+                    "reused_preview": False,
+                }
+            )
 
         self._run_stage(
             "render",
@@ -1624,8 +1634,10 @@ class VideoPipeline:
         self._write_text(self.paths["narration_txt"], narration_text + "\n")
 
         def voice_stage() -> None:
-            self._synthesize_narration(narration_text, self.paths["narration_raw"])
-            self._normalize_audio(self.paths["narration_raw"], narration_wav)
+            with self._timed_optimization_block("narration", "tts_synthesis_seconds"):
+                self._synthesize_narration(narration_text, self.paths["narration_raw"])
+            with self._timed_optimization_block("narration", "normalize_seconds"):
+                self._normalize_audio(self.paths["narration_raw"], narration_wav)
 
         self._run_stage(
             "narration",
@@ -1700,8 +1712,11 @@ class VideoPipeline:
         raw_path = scene_dir / f"{cleaned_scene_id}.raw.wav"
         wav_path = scene_dir / f"{cleaned_scene_id}.wav"
 
-        self._synthesize_narration(narration_text, raw_path)
-        self._normalize_audio(raw_path, wav_path)
+        self._increment_optimization_counter("shot_preview", "preview_count")
+        with self._timed_optimization_block("shot_preview", "narration_synthesis_seconds"):
+            self._synthesize_narration(narration_text, raw_path)
+        with self._timed_optimization_block("shot_preview", "narration_normalize_seconds"):
+            self._normalize_audio(raw_path, wav_path)
 
         return {
             "scene_id": cleaned_scene_id,
@@ -1765,10 +1780,12 @@ class VideoPipeline:
             cached_stats = state.get("caption_stats") if isinstance(state, dict) else None
             if isinstance(cached_stats, dict):
                 self.caption_stats = dict(cached_stats)
-            self.optimization_stats["captions"] = {
-                "mode": "reused",
-                "captions_signature": signature,
-            }
+            self._optimization_section("captions").update(
+                {
+                    "mode": "reused",
+                    "captions_signature": signature,
+                }
+            )
             return
 
         captions = self._run_stage(
@@ -1791,10 +1808,12 @@ class VideoPipeline:
                 "caption_stats": dict(self.caption_stats),
             },
         )
-        self.optimization_stats["captions"] = {
-            "mode": "generated",
-            "captions_signature": signature,
-        }
+        self._optimization_section("captions").update(
+            {
+                "mode": "generated",
+                "captions_signature": signature,
+            }
+        )
 
     def _ensure_timeline(self, plan: ScriptPlan) -> list[TimelineClip]:
         signature = self._timeline_signature(plan)
@@ -1806,10 +1825,12 @@ class VideoPipeline:
                 self._log(self._stage_label(7 if self._news_mode_enabled() else 6, "Reusing timeline"))
                 self.stage_times["timeline"] = 0.0
                 self._log("timeline completed in 0.00s")
-                self.optimization_stats["timeline"] = {
-                    "mode": "reused",
-                    "timeline_signature": signature,
-                }
+                self._optimization_section("timeline").update(
+                    {
+                        "mode": "reused",
+                        "timeline_signature": signature,
+                    }
+                )
                 return timeline
 
         timeline = self._run_stage(
@@ -1827,10 +1848,12 @@ class VideoPipeline:
                 "clip_count": len(timeline),
             },
         )
-        self.optimization_stats["timeline"] = {
-            "mode": "generated",
-            "timeline_signature": signature,
-        }
+        self._optimization_section("timeline").update(
+            {
+                "mode": "generated",
+                "timeline_signature": signature,
+            }
+        )
         return timeline
 
     def _ensure_preview_render(self, timeline: list[TimelineClip]) -> None:
@@ -1842,14 +1865,21 @@ class VideoPipeline:
             self._log(self._stage_label(7 if self._news_mode_enabled() else 6, "Reusing preview video"))
             self.stage_times["preview_render"] = 0.0
             self._log("preview_render completed in 0.00s")
-            self.optimization_stats["preview_render"] = {
-                "mode": "reused",
-                "render_signature": render_signature,
-            }
+            self._optimization_section("preview_render").update(
+                {
+                    "mode": "reused",
+                    "render_signature": render_signature,
+                }
+            )
             return
 
         def render_preview_stage() -> None:
-            self._render_video(timeline, self.paths["narration_wav"], self.paths["preview_mp4"])
+            self._render_video(
+                timeline,
+                self.paths["narration_wav"],
+                self.paths["preview_mp4"],
+                metrics_section="preview_render",
+            )
             shutil.copy2(self.paths["captions"], self.paths["preview_srt"])
 
         self._run_stage(
@@ -1866,10 +1896,12 @@ class VideoPipeline:
                 "preview_srt": str(self.paths["preview_srt"].resolve()),
             },
         )
-        self.optimization_stats["preview_render"] = {
-            "mode": "generated",
-            "render_signature": render_signature,
-        }
+        self._optimization_section("preview_render").update(
+            {
+                "mode": "generated",
+                "render_signature": render_signature,
+            }
+        )
 
     def _promote_preview_render_if_unchanged(self, timeline: list[TimelineClip]) -> bool:
         render_signature = self._render_signature(timeline)
@@ -1897,11 +1929,13 @@ class VideoPipeline:
         shutil.copy2(srt_source, final_srt)
 
         self._log(self._stage_label(7 if self._news_mode_enabled() else 6, "Reusing approved preview as final output"))
-        self.optimization_stats["render"] = {
-            "mode": "reused-preview",
-            "reused_preview": True,
-            "render_signature": render_signature,
-        }
+        self._optimization_section("render").update(
+            {
+                "mode": "reused-preview",
+                "reused_preview": True,
+                "render_signature": render_signature,
+            }
+        )
         return True
 
     def _captions_signature(self) -> str:
@@ -2378,7 +2412,12 @@ class VideoPipeline:
             )
 
             def render_stage() -> None:
-                self._render_video(timeline, narration_wav, self.paths["final_mp4"])
+                self._render_video(
+                    timeline,
+                    narration_wav,
+                    self.paths["final_mp4"],
+                    metrics_section="render",
+                )
                 shutil.copy2(captions_srt, self.paths["final_srt"])
 
             self._run_stage("render", "Stage 4/5: Rendering updated video", render_stage)
@@ -5789,7 +5828,9 @@ class VideoPipeline:
                     continue
 
                 try:
-                    local_path, resolved_candidate = self._download_candidate_asset(candidate)
+                    self._increment_optimization_counter("asset_resolution", "download_attempts")
+                    with self._timed_optimization_block("asset_resolution", "download_seconds"):
+                        local_path, resolved_candidate = self._download_candidate_asset(candidate)
                     actual_duration = self._downloaded_asset_duration_seconds(
                         local_path,
                         scene.scene_id,
@@ -5844,6 +5885,7 @@ class VideoPipeline:
                         attribution_text=resolved_candidate.attribution_text,
                     )
                     rights.append(right)
+                    self._increment_optimization_counter("asset_resolution", "download_successes")
                     if resolved_candidate.media_type == "image":
                         resolved_image_scenes += 1
                     else:
@@ -5886,6 +5928,9 @@ class VideoPipeline:
                 rights,
             )
 
+        asset_optimization_stats = self.optimization_stats.get("asset_resolution")
+        if not isinstance(asset_optimization_stats, dict):
+            asset_optimization_stats = {}
         self.asset_stats = {
             "resolved_scene_count": len(rights),
             "resolved_video_scene_count": resolved_video_scenes,
@@ -5913,6 +5958,12 @@ class VideoPipeline:
             "asset_mode": self._normalized_asset_mode(),
             "image_motion_style": self._normalized_image_motion_style(),
             "provider_usage": provider_usage,
+            "query_cache_hits": int(asset_optimization_stats.get("query_cache_hits") or 0),
+            "query_cache_misses": int(asset_optimization_stats.get("query_cache_misses") or 0),
+            "download_attempts": int(asset_optimization_stats.get("download_attempts") or 0),
+            "download_successes": int(asset_optimization_stats.get("download_successes") or 0),
+            "montage_download_attempts": int(asset_optimization_stats.get("montage_download_attempts") or 0),
+            "montage_download_successes": int(asset_optimization_stats.get("montage_download_successes") or 0),
         }
 
         if download_failures > 0:
@@ -6243,6 +6294,7 @@ class VideoPipeline:
                 intro_seconds=0.0,
                 outro_seconds=0.0,
                 render_subdir=f"shot-{shot.shot_id}",
+                metrics_section="shot_preview",
             )
 
     def _montage_motion_profile(self, style: str | None = None) -> dict[str, float | str]:
@@ -6335,7 +6387,9 @@ class VideoPipeline:
                         continue
 
                     try:
-                        local_path, resolved_candidate = self._download_candidate_asset(candidate)
+                        self._increment_optimization_counter("asset_resolution", "montage_download_attempts")
+                        with self._timed_optimization_block("asset_resolution", "montage_download_seconds"):
+                            local_path, resolved_candidate = self._download_candidate_asset(candidate)
                     except Exception as exc:
                         montage_download_failures += 1
                         self._log(
@@ -6344,6 +6398,7 @@ class VideoPipeline:
                         )
                         continue
 
+                    self._increment_optimization_counter("asset_resolution", "montage_download_successes")
                     component_right = AssetRight(
                         scene_id=scene.scene_id,
                         source_platform=resolved_candidate.source_platform or "unknown",
@@ -6396,12 +6451,16 @@ class VideoPipeline:
                     cache_key = (provider_name, query.lower())
                     candidates = query_cache.get(cache_key)
                     if cache_key not in query_cache:
+                        self._increment_optimization_counter("asset_resolution", "query_cache_misses")
                         try:
-                            candidates = self._search_provider_candidates(provider_name, query)
+                            with self._timed_optimization_block("asset_resolution", "search_seconds"):
+                                candidates = self._search_provider_candidates(provider_name, query)
                         except Exception as exc:
                             self._log(f"{provider_name} search failed for {scene.scene_id} ({query}): {exc}")
                             candidates = []
                         query_cache[cache_key] = list(candidates)
+                    else:
+                        self._increment_optimization_counter("asset_resolution", "query_cache_hits")
 
                     for base_candidate in query_cache.get(cache_key, []):
                         quality_score = self._candidate_quality_score(base_candidate, scene)
@@ -8644,6 +8703,7 @@ class VideoPipeline:
         intro_seconds: float | None = None,
         outro_seconds: float | None = None,
         render_subdir: str = "render",
+        metrics_section: str = "render",
     ) -> None:
         render_dir = self.paths["tmp"] / render_subdir
         render_dir.mkdir(parents=True, exist_ok=True)
@@ -8652,81 +8712,86 @@ class VideoPipeline:
         outro_pad = self._outro_bookend_seconds() if outro_seconds is None else max(0.0, float(outro_seconds))
 
         render_audio = render_dir / "narration_with_bookends.wav"
-        self._build_render_audio_track(
-            narration_wav=narration_wav,
-            output_audio=render_audio,
-            intro_seconds=intro_pad,
-            outro_seconds=outro_pad,
-        )
+        with self._timed_optimization_block(metrics_section, "build_audio_seconds"):
+            self._build_render_audio_track(
+                narration_wav=narration_wav,
+                output_audio=render_audio,
+                intro_seconds=intro_pad,
+                outro_seconds=outro_pad,
+            )
 
         clip_files: list[Path] = []
         for idx, clip in enumerate(timeline):
             clip_path = render_dir / f"clip_{idx:04d}.mp4"
-            self._render_single_clip(clip, clip_path, idx)
+            with self._timed_optimization_block(metrics_section, "clip_render_seconds"):
+                self._render_single_clip(clip, clip_path, idx)
             clip_files.append(clip_path)
+        self._increment_optimization_counter(metrics_section, "rendered_clip_count", amount=len(clip_files))
 
         concat_list = render_dir / "concat.txt"
         concat_lines = [f"file '{path.resolve()}'" for path in clip_files]
         self._write_text(concat_list, "\n".join(concat_lines) + "\n")
 
         visuals_mp4 = render_dir / "visuals.mp4"
-        concat = self._run_command(
-            [
-                "ffmpeg",
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                str(concat_list),
-                "-c:v",
-                "libx264",
-                "-preset",
-                "slow",
-                "-crf",
-                "18",
-                "-pix_fmt",
-                "yuv420p",
-                "-an",
-                str(visuals_mp4),
-            ],
-            timeout=3600,
-            check=False,
-        )
+        with self._timed_optimization_block(metrics_section, "concat_seconds"):
+            concat = self._run_command(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(concat_list),
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "slow",
+                    "-crf",
+                    "18",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-an",
+                    str(visuals_mp4),
+                ],
+                timeout=3600,
+                check=False,
+            )
         if concat.returncode != 0:
             raise RuntimeError(f"Failed to concat clips: {concat.stderr.strip()}")
 
         mixed_mp4 = render_dir / "master_with_audio.mp4"
-        mux = self._run_command(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(visuals_mp4),
-                "-i",
-                str(render_audio),
-                "-map",
-                "0:v:0",
-                "-map",
-                "1:a:0",
-                "-c:v",
-                "copy",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                "-shortest",
-                str(mixed_mp4),
-            ],
-            timeout=1200,
-            check=False,
-        )
+        with self._timed_optimization_block(metrics_section, "mux_seconds"):
+            mux = self._run_command(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(visuals_mp4),
+                    "-i",
+                    str(render_audio),
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-shortest",
+                    str(mixed_mp4),
+                ],
+                timeout=1200,
+                check=False,
+            )
         if mux.returncode != 0:
             raise RuntimeError(f"Failed to mux narration and video: {mux.stderr.strip()}")
 
         if self.config.burn_subtitles and subtitle_path.exists():
-            self._burn_subtitles(mixed_mp4, subtitle_path, final_mp4)
+            self._burn_subtitles(mixed_mp4, subtitle_path, final_mp4, metrics_section=metrics_section)
         else:
             shutil.copy2(mixed_mp4, final_mp4)
 
@@ -10216,7 +10281,14 @@ class VideoPipeline:
             str(output_clip),
         ]
 
-    def _burn_subtitles(self, input_mp4: Path, subtitles_ass: Path, output_mp4: Path) -> None:
+    def _burn_subtitles(
+        self,
+        input_mp4: Path,
+        subtitles_ass: Path,
+        output_mp4: Path,
+        *,
+        metrics_section: str = "render",
+    ) -> None:
         if not subtitles_ass.exists() or subtitles_ass.stat().st_size == 0:
             self._warn("Subtitle burn-in skipped because captions.ass is missing or empty.")
             shutil.copy2(input_mp4, output_mp4)
@@ -10248,7 +10320,8 @@ class VideoPipeline:
             "copy",
             str(output_mp4),
         ]
-        result = self._run_command(command, timeout=2400, check=False)
+        with self._timed_optimization_block(metrics_section, "subtitle_burn_seconds"):
+            result = self._run_command(command, timeout=2400, check=False)
         if result.returncode != 0:
             lowered = (result.stderr or "").lower()
             if "no such filter" in lowered and "subtitles" in lowered:
@@ -10681,6 +10754,44 @@ class VideoPipeline:
         self.stage_times[key] = round(elapsed, 3)
         self._log(f"{key} completed in {elapsed:.2f}s")
         return result
+
+    def _optimization_section(self, key: str) -> dict[str, Any]:
+        section = self.optimization_stats.get(key)
+        if isinstance(section, dict):
+            return section
+        section = {}
+        self.optimization_stats[key] = section
+        return section
+
+    def _increment_optimization_counter(self, section: str, key: str, amount: int = 1) -> None:
+        bucket = self._optimization_section(section)
+        current = bucket.get(key)
+        try:
+            base = int(current)
+        except (TypeError, ValueError):
+            base = 0
+        bucket[key] = base + int(amount)
+
+    def _record_optimization_time(self, section: str, key: str, elapsed: float) -> None:
+        bucket = self._optimization_section(section)
+        current = bucket.get(key)
+        try:
+            base = float(current)
+        except (TypeError, ValueError):
+            base = 0.0
+        bucket[key] = round(base + max(0.0, float(elapsed)), 3)
+
+    def _set_optimization_value(self, section: str, key: str, value: Any) -> None:
+        bucket = self._optimization_section(section)
+        bucket[key] = value
+
+    @contextmanager
+    def _timed_optimization_block(self, section: str, key: str) -> Any:
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._record_optimization_time(section, key, time.perf_counter() - started)
 
     def _update_pacing_post_tts(self, narration_text: str, audio_duration: float, adjust_passes: int) -> None:
         words = self._word_count_text(narration_text)
@@ -11200,27 +11311,44 @@ class VideoPipeline:
         self._write_json(self.paths["run_report"], payload)
 
     def _media_duration(self, media_path: Path) -> float:
-        result = self._run_command(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                str(media_path),
-            ],
-            timeout=60,
-            check=False,
-        )
+        cache_key: tuple[str, int, int] | None = None
+        try:
+            resolved_path = media_path.expanduser().resolve()
+            stat = resolved_path.stat()
+            cache_key = (str(resolved_path), int(stat.st_size), int(stat.st_mtime_ns))
+        except OSError:
+            resolved_path = media_path
+
+        if cache_key is not None and cache_key in self._duration_cache:
+            self._increment_optimization_counter("media_probe", "cache_hits")
+            return self._duration_cache[cache_key]
+
+        self._increment_optimization_counter("media_probe", "cache_misses")
+        with self._timed_optimization_block("media_probe", "ffprobe_seconds"):
+            result = self._run_command(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(resolved_path),
+                ],
+                timeout=60,
+                check=False,
+            )
         if result.returncode != 0:
             raise RuntimeError(f"ffprobe failed: {result.stderr.strip()}")
 
         try:
-            return float((result.stdout or "0").strip())
+            duration = float((result.stdout or "0").strip())
         except ValueError as exc:
             raise RuntimeError("Could not parse media duration") from exc
+        if cache_key is not None:
+            self._duration_cache[cache_key] = duration
+        return duration
 
     def _tool_version(self, command: list[str]) -> str | None:
         if not command:
