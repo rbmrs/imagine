@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import math
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import wave
 from dataclasses import dataclass, replace
@@ -581,6 +583,9 @@ class VideoPipeline:
         self.paths = self._build_paths(config.project_dir)
         self.http = requests.Session()
         self.http.headers.update({"User-Agent": "local-video-mvp/0.1"})
+        http_adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8)
+        self.http.mount("http://", http_adapter)
+        self.http.mount("https://", http_adapter)
         self.stage_times: dict[str, float] = {}
         self.warnings: list[str] = []
         self.caption_stats: dict[str, Any] = {}
@@ -615,6 +620,12 @@ class VideoPipeline:
         self._vecteezy_usage_state: dict[str, Any] | None = None
         self._vecteezy_downloads_this_run = 0
         self._duration_cache: dict[tuple[str, int, int], float] = {}
+        self._log_lock = threading.Lock()
+        self._warnings_lock = threading.Lock()
+        self._provider_usage_lock = threading.Lock()
+        self._asset_cache_registry_lock = threading.Lock()
+        self._asset_cache_locks: dict[str, threading.Lock] = {}
+        self._stats_lock = threading.Lock()
 
     def _reset_run_state(self) -> None:
         self.stage_times = {}
@@ -2220,6 +2231,24 @@ class VideoPipeline:
         }
         self._write_json(path, payload)
 
+    def _new_http_session(self) -> requests.Session:
+        session = requests.Session()
+        session.headers.update(dict(self.http.headers))
+        adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
+
+    def _asset_cache_lock(self, output: Path) -> threading.Lock:
+        cache_key = str(output.resolve())
+        with self._asset_cache_registry_lock:
+            existing = self._asset_cache_locks.get(cache_key)
+            if existing is not None:
+                return existing
+            lock = threading.Lock()
+            self._asset_cache_locks[cache_key] = lock
+            return lock
+
     def _http_get_with_retries(
         self,
         url: str,
@@ -2227,16 +2256,18 @@ class VideoPipeline:
         headers: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
         timeout: tuple[int, int] = (5, 15),
+        session: requests.Session | None = None,
     ) -> requests.Response:
         delays = (0.0, 1.0, 2.0, 4.0)
         last_error: Exception | None = None
+        active_session = session or self.http
 
         for attempt_index, delay in enumerate(delays):
             if attempt_index > 0:
                 self._increment_optimization_counter("asset_resolution", "provider_retry_attempts")
                 time.sleep(delay)
             try:
-                response = self.http.get(url, headers=headers, params=params, timeout=timeout)
+                response = active_session.get(url, headers=headers, params=params, timeout=timeout)
             except requests.exceptions.Timeout as exc:
                 last_error = exc
                 if attempt_index == len(delays) - 1:
@@ -6479,9 +6510,8 @@ class VideoPipeline:
             shortlist = self._scene_asset_shortlists.get(scene.scene_id, [])
 
             if target_count > 1:
+                eligible_candidates: list[AssetCandidate] = []
                 for candidate in shortlist:
-                    if len(component_payloads) >= target_count:
-                        break
                     if candidate.media_type != "image":
                         continue
                     unique_key = self._asset_uniqueness_key(candidate)
@@ -6490,43 +6520,81 @@ class VideoPipeline:
                     policy_block_reason = self._candidate_policy_block_reason(candidate)
                     if policy_block_reason is not None:
                         continue
+                    eligible_candidates.append(candidate)
 
-                    try:
-                        self._increment_optimization_counter("asset_resolution", "montage_download_attempts")
-                        with self._timed_optimization_block("asset_resolution", "montage_download_seconds"):
-                            local_path, resolved_candidate = self._download_candidate_asset(candidate)
-                    except Exception as exc:
-                        montage_download_failures += 1
-                        self._log(
-                            f"Montage asset download failed for {scene.scene_id} "
-                            f"({candidate.source_platform}, {candidate.query or 'shortlist'}): {exc}"
-                        )
+                candidate_index = 0
+                while len(component_payloads) < target_count and candidate_index < len(eligible_candidates):
+                    batch: list[AssetCandidate] = []
+                    remaining_vecteezy_downloads = self._vecteezy_estimated_remaining_downloads()
+                    while len(batch) < 4 and candidate_index < len(eligible_candidates):
+                        candidate = eligible_candidates[candidate_index]
+                        candidate_index += 1
+                        if candidate.source_platform == "vecteezy" and remaining_vecteezy_downloads is not None:
+                            if remaining_vecteezy_downloads <= 0:
+                                continue
+                            remaining_vecteezy_downloads -= 1
+                        batch.append(candidate)
+
+                    if not batch:
                         continue
 
-                    self._increment_optimization_counter("asset_resolution", "montage_download_successes")
-                    component_right = AssetRight(
-                        scene_id=scene.scene_id,
-                        source_platform=resolved_candidate.source_platform or "unknown",
-                        source_asset_id=resolved_candidate.source_asset_id,
-                        source_url=resolved_candidate.source_url or resolved_candidate.download_url,
-                        creator_name=resolved_candidate.creator_name,
-                        creator_profile_url=resolved_candidate.creator_profile_url,
-                        license_name=resolved_candidate.license_name,
-                        license_url=resolved_candidate.license_url,
-                        downloaded_at=dt.datetime.now(dt.timezone.utc).isoformat(),
-                        local_path=str(local_path.resolve()),
-                        sha256=self._file_sha256(local_path),
-                        media_type=resolved_candidate.media_type,
-                        width=resolved_candidate.width,
-                        height=resolved_candidate.height,
-                        duration_seconds=resolved_candidate.duration_seconds,
-                        restriction_flags=list(resolved_candidate.restriction_flags),
-                        attribution_required=bool(resolved_candidate.attribution_required),
-                        attribution_text=resolved_candidate.attribution_text,
-                    )
-                    component_payloads.append(self._asset_component_payload_from_right(component_right))
-                    scene_keys.add(unique_key)
-                    used_asset_keys.add(unique_key)
+                    def download_montage_candidate(
+                        candidate: AssetCandidate,
+                    ) -> tuple[Path | None, AssetCandidate | None, Exception | None]:
+                        session = self._new_http_session()
+                        try:
+                            self._increment_optimization_counter("asset_resolution", "montage_download_attempts")
+                            with self._timed_optimization_block("asset_resolution", "montage_download_seconds"):
+                                local_path, resolved_candidate = self._download_candidate_asset(candidate, session=session)
+                            return local_path, resolved_candidate, None
+                        except Exception as exc:
+                            return None, None, exc
+                        finally:
+                            session.close()
+
+                    with ThreadPoolExecutor(max_workers=min(4, len(batch))) as executor:
+                        futures = [executor.submit(download_montage_candidate, candidate) for candidate in batch]
+
+                    for candidate, future in zip(batch, futures):
+                        local_path, resolved_candidate, error = future.result()
+                        if error is not None or local_path is None or resolved_candidate is None:
+                            montage_download_failures += 1
+                            self._log(
+                                f"Montage asset download failed for {scene.scene_id} "
+                                f"({candidate.source_platform}, {candidate.query or 'shortlist'}): {error}"
+                            )
+                            continue
+
+                        resolved_key = self._asset_uniqueness_key(resolved_candidate)
+                        if resolved_key in scene_keys or resolved_key in used_asset_keys:
+                            continue
+
+                        self._increment_optimization_counter("asset_resolution", "montage_download_successes")
+                        component_right = AssetRight(
+                            scene_id=scene.scene_id,
+                            source_platform=resolved_candidate.source_platform or "unknown",
+                            source_asset_id=resolved_candidate.source_asset_id,
+                            source_url=resolved_candidate.source_url or resolved_candidate.download_url,
+                            creator_name=resolved_candidate.creator_name,
+                            creator_profile_url=resolved_candidate.creator_profile_url,
+                            license_name=resolved_candidate.license_name,
+                            license_url=resolved_candidate.license_url,
+                            downloaded_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+                            local_path=str(local_path.resolve()),
+                            sha256=self._file_sha256(local_path),
+                            media_type=resolved_candidate.media_type,
+                            width=resolved_candidate.width,
+                            height=resolved_candidate.height,
+                            duration_seconds=resolved_candidate.duration_seconds,
+                            restriction_flags=list(resolved_candidate.restriction_flags),
+                            attribution_required=bool(resolved_candidate.attribution_required),
+                            attribution_text=resolved_candidate.attribution_text,
+                        )
+                        component_payloads.append(self._asset_component_payload_from_right(component_right))
+                        scene_keys.add(resolved_key)
+                        used_asset_keys.add(resolved_key)
+                        if len(component_payloads) >= target_count:
+                            break
 
             right.scene_components = component_payloads
             self._scene_montage_assets[scene.scene_id] = [dict(item) for item in component_payloads]
@@ -6547,6 +6615,8 @@ class VideoPipeline:
         queries = self._queries_for_scene(scene)
 
         def collect_from_providers(provider_names: list[str], *, provider_index_offset: int) -> None:
+            ordered_searches: list[tuple[int, int, str, str, tuple[str, str]]] = []
+            pending_searches: list[tuple[str, str, tuple[str, str]]] = []
             for provider_offset, provider_name in enumerate(provider_names):
                 if not self._provider_is_configured(provider_name):
                     continue
@@ -6554,46 +6624,99 @@ class VideoPipeline:
                 provider_index = provider_index_offset + provider_offset
                 for query_index, query in enumerate(queries):
                     cache_key = (provider_name, query.lower())
+                    ordered_searches.append((provider_index, query_index, provider_name, query, cache_key))
+                    if cache_key in query_cache:
+                        self._increment_optimization_counter("asset_resolution", "query_cache_hits")
+                        continue
+
                     candidates = query_cache.get(cache_key)
-                    if cache_key not in query_cache:
+                    if candidates is None:
                         self._increment_optimization_counter("asset_resolution", "query_cache_misses")
                         cached_candidates = self._load_persistent_query_cache(provider_name, query)
                         if cached_candidates is not None:
                             self._increment_optimization_counter("asset_resolution", "persistent_query_cache_hits")
                             candidates = list(cached_candidates)
+                            query_cache[cache_key] = list(candidates)
                         else:
                             self._increment_optimization_counter("asset_resolution", "persistent_query_cache_misses")
-                            try:
-                                with self._timed_optimization_block("asset_resolution", "search_seconds"):
-                                    candidates = self._search_provider_candidates(provider_name, query)
-                            except Exception as exc:
-                                self._log(f"{provider_name} search failed for {scene.scene_id} ({query}): {exc}")
-                                candidates = []
-                            else:
-                                self._write_persistent_query_cache(provider_name, query, list(candidates))
-                        query_cache[cache_key] = list(candidates)
-                    else:
-                        self._increment_optimization_counter("asset_resolution", "query_cache_hits")
+                            pending_searches.append((provider_name, query, cache_key))
 
-                    for base_candidate in query_cache.get(cache_key, []):
-                        quality_score = self._candidate_quality_score(base_candidate, scene)
-                        ranking_score = self._candidate_ranking_score(
-                            base_candidate,
-                            scene,
-                            quality_score=quality_score,
-                            provider_rank=provider_index,
-                            query_rank=query_index,
+            def run_search_task(
+                provider_name: str,
+                query: str,
+            ) -> tuple[list[AssetCandidate], float, Exception | None]:
+                session = self._new_http_session()
+                started_at = time.perf_counter()
+                try:
+                    candidates = self._search_provider_candidates(provider_name, query, session=session)
+                    return list(candidates), time.perf_counter() - started_at, None
+                except Exception as exc:
+                    return [], time.perf_counter() - started_at, exc
+                finally:
+                    session.close()
+
+            if pending_searches:
+                parallel_pending = [
+                    (provider_name, query, cache_key)
+                    for provider_name, query, cache_key in pending_searches
+                    if provider_name != "coverr"
+                ]
+                serial_pending = [
+                    (provider_name, query, cache_key)
+                    for provider_name, query, cache_key in pending_searches
+                    if provider_name == "coverr"
+                ]
+
+                future_entries = []
+                if parallel_pending:
+                    with ThreadPoolExecutor(max_workers=min(4, len(parallel_pending))) as executor:
+                        future_entries.extend(
+                            [
+                                (provider_name, query, cache_key, executor.submit(run_search_task, provider_name, query))
+                                for provider_name, query, cache_key in parallel_pending
+                            ]
                         )
-                        ranked_candidate = replace(
-                            base_candidate,
-                            query=query,
-                            quality_score=quality_score,
-                            ranking_score=ranking_score,
-                        )
-                        unique_key = self._asset_uniqueness_key(ranked_candidate)
-                        existing = ranked_by_key.get(unique_key)
-                        if existing is None or ranked_candidate.ranking_score > existing.ranking_score:
-                            ranked_by_key[unique_key] = ranked_candidate
+
+                for provider_name, query, cache_key in serial_pending:
+                    candidates, elapsed_seconds, error = run_search_task(provider_name, query)
+                    self._record_optimization_time("asset_resolution", "search_seconds", elapsed_seconds)
+                    if error is not None:
+                        self._log(f"{provider_name} search failed for {scene.scene_id} ({query}): {error}")
+                        query_cache[cache_key] = []
+                        continue
+                    query_cache[cache_key] = list(candidates)
+                    self._write_persistent_query_cache(provider_name, query, list(candidates))
+
+                for provider_name, query, cache_key, future in future_entries:
+                    candidates, elapsed_seconds, error = future.result()
+                    self._record_optimization_time("asset_resolution", "search_seconds", elapsed_seconds)
+                    if error is not None:
+                        self._log(f"{provider_name} search failed for {scene.scene_id} ({query}): {error}")
+                        query_cache[cache_key] = []
+                        continue
+                    query_cache[cache_key] = list(candidates)
+                    self._write_persistent_query_cache(provider_name, query, list(candidates))
+
+            for provider_index, query_index, _, query, cache_key in ordered_searches:
+                for base_candidate in query_cache.get(cache_key, []):
+                    quality_score = self._candidate_quality_score(base_candidate, scene)
+                    ranking_score = self._candidate_ranking_score(
+                        base_candidate,
+                        scene,
+                        quality_score=quality_score,
+                        provider_rank=provider_index,
+                        query_rank=query_index,
+                    )
+                    ranked_candidate = replace(
+                        base_candidate,
+                        query=query,
+                        quality_score=quality_score,
+                        ranking_score=ranking_score,
+                    )
+                    unique_key = self._asset_uniqueness_key(ranked_candidate)
+                    existing = ranked_by_key.get(unique_key)
+                    if existing is None or ranked_candidate.ranking_score > existing.ranking_score:
+                        ranked_by_key[unique_key] = ranked_candidate
 
         primary_providers = self._primary_provider_order(provider_order)
         fallback_providers = self._fallback_provider_order(provider_order)
@@ -6653,7 +6776,13 @@ class VideoPipeline:
         remaining = [candidate for candidate in scene_candidates if self._asset_uniqueness_key(candidate) != preferred_key]
         return [pinned_candidate, *remaining]
 
-    def _search_provider_candidates(self, provider_name: str, query: str) -> list[AssetCandidate]:
+    def _search_provider_candidates(
+        self,
+        provider_name: str,
+        query: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> list[AssetCandidate]:
         candidates: list[AssetCandidate] = []
         asset_mode = self._normalized_asset_mode()
         image_assets_enabled = self._image_assets_enabled()
@@ -6663,17 +6792,17 @@ class VideoPipeline:
             if not api_key:
                 return []
             if not image_only:
-                candidates.extend(self._search_pexels_videos(api_key, query=query))
+                candidates.extend(self._search_pexels_videos(api_key, query=query, session=session))
             if image_assets_enabled:
-                candidates.extend(self._search_pexels_images(api_key, query=query))
+                candidates.extend(self._search_pexels_images(api_key, query=query, session=session))
         elif provider_name == "pixabay":
             api_key = self._coerce_str_or_none(self.config.pixabay_api_key)
             if not api_key:
                 return []
             if not image_only:
-                candidates.extend(self._search_pixabay_videos(api_key, query=query))
+                candidates.extend(self._search_pixabay_videos(api_key, query=query, session=session))
             if image_assets_enabled:
-                candidates.extend(self._search_pixabay_images(api_key, query=query))
+                candidates.extend(self._search_pixabay_images(api_key, query=query, session=session))
         elif provider_name == "coverr":
             api_key = self._coerce_str_or_none(self.config.coverr_api_key)
             if not api_key:
@@ -6683,16 +6812,16 @@ class VideoPipeline:
             remaining_requests = self._coverr_estimated_remaining_requests()
             if remaining_requests is not None and remaining_requests <= 0:
                 return []
-            candidates.extend(self._search_coverr_videos(api_key, query=query))
+            candidates.extend(self._search_coverr_videos(api_key, query=query, session=session))
         elif provider_name == "vecteezy":
             api_key = self._coerce_str_or_none(self.config.vecteezy_api_key)
             account_id = self._coerce_str_or_none(self.config.vecteezy_account_id)
             if not api_key or not account_id:
                 return []
             if not image_only:
-                candidates.extend(self._search_vecteezy_videos(account_id, api_key, query=query))
+                candidates.extend(self._search_vecteezy_videos(account_id, api_key, query=query, session=session))
             if image_assets_enabled:
-                candidates.extend(self._search_vecteezy_images(account_id, api_key, query=query))
+                candidates.extend(self._search_vecteezy_images(account_id, api_key, query=query, session=session))
         return candidates
 
     def _candidate_quality_score(self, candidate: AssetCandidate, scene: Scene) -> float:
@@ -6966,9 +7095,20 @@ class VideoPipeline:
         pivot = self._stable_pivot(seed, len(ordered))
         return ordered[pivot:] + ordered[:pivot]
 
-    def _search_pexels_videos(self, api_key: str, query: str) -> list[AssetCandidate]:
+    def _search_pexels_videos(
+        self,
+        api_key: str,
+        query: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> list[AssetCandidate]:
         url = f"https://api.pexels.com/videos/search?query={quote_plus(query)}&orientation=landscape&per_page=20"
-        response = self._http_get_with_retries(url, headers={"Authorization": api_key}, timeout=(5, 15))
+        response = self._http_get_with_retries(
+            url,
+            headers={"Authorization": api_key},
+            timeout=(5, 15),
+            session=session,
+        )
         if response.status_code != 200:
             return []
 
@@ -7028,9 +7168,20 @@ class VideoPipeline:
 
         return self._stable_rotate_candidates(candidates, seed=f"pexels:{query.lower()}")
 
-    def _search_pexels_images(self, api_key: str, query: str) -> list[AssetCandidate]:
+    def _search_pexels_images(
+        self,
+        api_key: str,
+        query: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> list[AssetCandidate]:
         url = f"https://api.pexels.com/v1/search?query={quote_plus(query)}&orientation=landscape&per_page=20"
-        response = self._http_get_with_retries(url, headers={"Authorization": api_key}, timeout=(5, 15))
+        response = self._http_get_with_retries(
+            url,
+            headers={"Authorization": api_key},
+            timeout=(5, 15),
+            session=session,
+        )
         if response.status_code != 200:
             return []
 
@@ -7081,12 +7232,18 @@ class VideoPipeline:
 
         return self._stable_rotate_candidates(candidates, seed=f"pexels-images:{query.lower()}")
 
-    def _search_pixabay_videos(self, api_key: str, query: str) -> list[AssetCandidate]:
+    def _search_pixabay_videos(
+        self,
+        api_key: str,
+        query: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> list[AssetCandidate]:
         url = (
             "https://pixabay.com/api/videos/"
             f"?key={quote_plus(api_key)}&q={quote_plus(query)}&safesearch=true&per_page=20"
         )
-        response = self._http_get_with_retries(url, timeout=(5, 15))
+        response = self._http_get_with_retries(url, timeout=(5, 15), session=session)
         if response.status_code != 200:
             return []
 
@@ -7153,13 +7310,19 @@ class VideoPipeline:
 
         return self._stable_rotate_candidates(candidates, seed=f"pixabay:{query.lower()}")
 
-    def _search_pixabay_images(self, api_key: str, query: str) -> list[AssetCandidate]:
+    def _search_pixabay_images(
+        self,
+        api_key: str,
+        query: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> list[AssetCandidate]:
         url = (
             "https://pixabay.com/api/"
             f"?key={quote_plus(api_key)}&q={quote_plus(query)}&image_type=photo&orientation=horizontal"
             "&safesearch=true&per_page=20"
         )
-        response = self._http_get_with_retries(url, timeout=(5, 15))
+        response = self._http_get_with_retries(url, timeout=(5, 15), session=session)
         if response.status_code != 200:
             return []
 
@@ -7207,7 +7370,13 @@ class VideoPipeline:
 
         return self._stable_rotate_candidates(candidates, seed=f"pixabay-images:{query.lower()}")
 
-    def _search_coverr_videos(self, api_key: str, query: str) -> list[AssetCandidate]:
+    def _search_coverr_videos(
+        self,
+        api_key: str,
+        query: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> list[AssetCandidate]:
         url = "https://api.coverr.co/videos"
         response = self._http_get_with_retries(
             url,
@@ -7218,6 +7387,7 @@ class VideoPipeline:
                 "urls": "true",
             },
             timeout=(5, 15),
+            session=session,
         )
         self._record_coverr_request_event(endpoint="videos", query=query)
         if response.status_code != 200:
@@ -7287,13 +7457,25 @@ class VideoPipeline:
 
         return self._stable_rotate_candidates(candidates, seed=f"coverr:{query.lower()}")
 
-    def _search_vecteezy_videos(self, account_id: str, api_key: str, query: str) -> list[AssetCandidate]:
+    def _search_vecteezy_videos(
+        self,
+        account_id: str,
+        api_key: str,
+        query: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> list[AssetCandidate]:
         url = (
             f"https://api.vecteezy.com/v2/{quote_plus(account_id)}/resources"
             f"?term={quote_plus(query)}&content_type=video&license_type=commercial"
             "&family_friendly=true&sort_by=relevance&per_page=20"
         )
-        response = self._http_get_with_retries(url, headers=self._vecteezy_headers(api_key), timeout=(5, 15))
+        response = self._http_get_with_retries(
+            url,
+            headers=self._vecteezy_headers(api_key),
+            timeout=(5, 15),
+            session=session,
+        )
         if response.status_code != 200:
             return []
 
@@ -7371,13 +7553,25 @@ class VideoPipeline:
 
         return self._stable_rotate_candidates(candidates, seed=f"vecteezy:{query.lower()}")
 
-    def _search_vecteezy_images(self, account_id: str, api_key: str, query: str) -> list[AssetCandidate]:
+    def _search_vecteezy_images(
+        self,
+        account_id: str,
+        api_key: str,
+        query: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> list[AssetCandidate]:
         url = (
             f"https://api.vecteezy.com/v2/{quote_plus(account_id)}/resources"
             f"?term={quote_plus(query)}&content_type=photo&license_type=commercial"
             "&orientation=horizontal&family_friendly=true&sort_by=relevance&per_page=20"
         )
-        response = self._http_get_with_retries(url, headers=self._vecteezy_headers(api_key), timeout=(5, 15))
+        response = self._http_get_with_retries(
+            url,
+            headers=self._vecteezy_headers(api_key),
+            timeout=(5, 15),
+            session=session,
+        )
         if response.status_code != 200:
             return []
 
@@ -7509,53 +7703,54 @@ class VideoPipeline:
         return self._coerce_optional_int(hour_payload.get("request_count")) or 0
 
     def _record_coverr_request_event(self, *, endpoint: str, query: str | None = None) -> None:
-        subject = self._coverr_usage_subject()
-        payload = self._load_coverr_usage_ledger()
-        apps = payload.setdefault("apps", {})
-        if not isinstance(apps, dict):
-            payload["apps"] = {}
-            apps = payload["apps"]
+        with self._provider_usage_lock:
+            subject = self._coverr_usage_subject()
+            payload = self._load_coverr_usage_ledger()
+            apps = payload.setdefault("apps", {})
+            if not isinstance(apps, dict):
+                payload["apps"] = {}
+                apps = payload["apps"]
 
-        app_payload = apps.setdefault(subject, {})
-        if not isinstance(app_payload, dict):
-            app_payload = {}
-            apps[subject] = app_payload
+            app_payload = apps.setdefault(subject, {})
+            if not isinstance(app_payload, dict):
+                app_payload = {}
+                apps[subject] = app_payload
 
-        hours = app_payload.setdefault("hours", {})
-        if not isinstance(hours, dict):
-            app_payload["hours"] = {}
-            hours = app_payload["hours"]
+            hours = app_payload.setdefault("hours", {})
+            if not isinstance(hours, dict):
+                app_payload["hours"] = {}
+                hours = app_payload["hours"]
 
-        hour_key = self._current_hour_key()
-        hour_payload = hours.setdefault(hour_key, {})
-        if not isinstance(hour_payload, dict):
-            hour_payload = {}
-            hours[hour_key] = hour_payload
+            hour_key = self._current_hour_key()
+            hour_payload = hours.setdefault(hour_key, {})
+            if not isinstance(hour_payload, dict):
+                hour_payload = {}
+                hours[hour_key] = hour_payload
 
-        events = hour_payload.setdefault("events", [])
-        if not isinstance(events, list):
-            hour_payload["events"] = []
-            events = hour_payload["events"]
+            events = hour_payload.setdefault("events", [])
+            if not isinstance(events, list):
+                hour_payload["events"] = []
+                events = hour_payload["events"]
 
-        events.append(
-            {
-                "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                "project_id": self.config.project_dir.name,
-                "endpoint": endpoint,
-                "query": self._coerce_str_or_none(query),
-            }
-        )
-        hour_payload["request_count"] = len(events)
-        self._save_coverr_usage_ledger(payload)
+            events.append(
+                {
+                    "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "project_id": self.config.project_dir.name,
+                    "endpoint": endpoint,
+                    "query": self._coerce_str_or_none(query),
+                }
+            )
+            hour_payload["request_count"] = len(events)
+            self._save_coverr_usage_ledger(payload)
 
-        self._coverr_requests_this_run += 1
-        if isinstance(self._coverr_usage_state, dict):
-            local_count = self._coerce_optional_int(self._coverr_usage_state.get("local_hour_request_count")) or 0
-            self._coverr_usage_state["local_hour_request_count"] = local_count + 1
-            self._coverr_usage_state["requests_this_run"] = int(self._coverr_requests_this_run)
-            remaining = self._coerce_optional_int(self._coverr_usage_state.get("estimated_remaining_requests"))
-            if remaining is not None:
-                self._coverr_usage_state["estimated_remaining_requests"] = max(0, remaining - 1)
+            self._coverr_requests_this_run += 1
+            if isinstance(self._coverr_usage_state, dict):
+                local_count = self._coerce_optional_int(self._coverr_usage_state.get("local_hour_request_count")) or 0
+                self._coverr_usage_state["local_hour_request_count"] = local_count + 1
+                self._coverr_usage_state["requests_this_run"] = int(self._coverr_requests_this_run)
+                remaining = self._coerce_optional_int(self._coverr_usage_state.get("estimated_remaining_requests"))
+                if remaining is not None:
+                    self._coverr_usage_state["estimated_remaining_requests"] = max(0, remaining - 1)
 
     def _refresh_coverr_usage_state(self) -> dict[str, Any]:
         subject = self._coverr_usage_subject()
@@ -7577,19 +7772,20 @@ class VideoPipeline:
         return snapshot
 
     def _coverr_estimated_remaining_requests(self) -> int | None:
-        if self._coverr_usage_state is None:
-            self._refresh_coverr_usage_state()
+        with self._provider_usage_lock:
+            if self._coverr_usage_state is None:
+                self._refresh_coverr_usage_state()
 
-        if not isinstance(self._coverr_usage_state, dict):
-            return None
+            if not isinstance(self._coverr_usage_state, dict):
+                return None
 
-        remaining = self._coverr_usage_state.get("estimated_remaining_requests")
-        if remaining is None:
-            return None
-        try:
-            return int(remaining)
-        except (TypeError, ValueError):
-            return None
+            remaining = self._coverr_usage_state.get("estimated_remaining_requests")
+            if remaining is None:
+                return None
+            try:
+                return int(remaining)
+            except (TypeError, ValueError):
+                return None
 
     def _vecteezy_headers(self, api_key: str) -> dict[str, str]:
         return {
@@ -7642,47 +7838,48 @@ class VideoPipeline:
         return self._coerce_optional_int(month_payload.get("download_count")) or 0
 
     def _record_vecteezy_download_event(self, asset_id: str, source_url: str | None) -> None:
-        account_id = self._coerce_str_or_none(self.config.vecteezy_account_id)
-        if not account_id:
-            return
+        with self._provider_usage_lock:
+            account_id = self._coerce_str_or_none(self.config.vecteezy_account_id)
+            if not account_id:
+                return
 
-        payload = self._load_vecteezy_usage_ledger()
-        accounts = payload.setdefault("accounts", {})
-        if not isinstance(accounts, dict):
-            payload["accounts"] = {}
-            accounts = payload["accounts"]
+            payload = self._load_vecteezy_usage_ledger()
+            accounts = payload.setdefault("accounts", {})
+            if not isinstance(accounts, dict):
+                payload["accounts"] = {}
+                accounts = payload["accounts"]
 
-        account_payload = accounts.setdefault(account_id, {})
-        if not isinstance(account_payload, dict):
-            account_payload = {}
-            accounts[account_id] = account_payload
+            account_payload = accounts.setdefault(account_id, {})
+            if not isinstance(account_payload, dict):
+                account_payload = {}
+                accounts[account_id] = account_payload
 
-        months = account_payload.setdefault("months", {})
-        if not isinstance(months, dict):
-            account_payload["months"] = {}
-            months = account_payload["months"]
+            months = account_payload.setdefault("months", {})
+            if not isinstance(months, dict):
+                account_payload["months"] = {}
+                months = account_payload["months"]
 
-        month_key = self._current_month_key()
-        month_payload = months.setdefault(month_key, {})
-        if not isinstance(month_payload, dict):
-            month_payload = {}
-            months[month_key] = month_payload
+            month_key = self._current_month_key()
+            month_payload = months.setdefault(month_key, {})
+            if not isinstance(month_payload, dict):
+                month_payload = {}
+                months[month_key] = month_payload
 
-        events = month_payload.setdefault("events", [])
-        if not isinstance(events, list):
-            month_payload["events"] = []
-            events = month_payload["events"]
+            events = month_payload.setdefault("events", [])
+            if not isinstance(events, list):
+                month_payload["events"] = []
+                events = month_payload["events"]
 
-        events.append(
-            {
-                "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                "project_id": self.config.project_dir.name,
-                "asset_id": asset_id,
-                "source_url": source_url or "",
-            }
-        )
-        month_payload["download_count"] = len(events)
-        self._save_vecteezy_usage_ledger(payload)
+            events.append(
+                {
+                    "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "project_id": self.config.project_dir.name,
+                    "asset_id": asset_id,
+                    "source_url": source_url or "",
+                }
+            )
+            month_payload["download_count"] = len(events)
+            self._save_vecteezy_usage_ledger(payload)
 
     def _fetch_vecteezy_account_info(self, account_id: str, api_key: str) -> dict[str, Any]:
         url = f"https://api.vecteezy.com/v2/{quote_plus(account_id)}/account/info"
@@ -7749,19 +7946,20 @@ class VideoPipeline:
         return snapshot
 
     def _vecteezy_estimated_remaining_downloads(self) -> int | None:
-        if self._vecteezy_usage_state is None:
-            self._refresh_vecteezy_usage_state()
+        with self._provider_usage_lock:
+            if self._vecteezy_usage_state is None:
+                self._refresh_vecteezy_usage_state()
 
-        if not isinstance(self._vecteezy_usage_state, dict):
-            return None
+            if not isinstance(self._vecteezy_usage_state, dict):
+                return None
 
-        remaining = self._vecteezy_usage_state.get("estimated_remaining_downloads")
-        if remaining is None:
-            return None
-        try:
-            return int(remaining)
-        except (TypeError, ValueError):
-            return None
+            remaining = self._vecteezy_usage_state.get("estimated_remaining_downloads")
+            if remaining is None:
+                return None
+            try:
+                return int(remaining)
+            except (TypeError, ValueError):
+                return None
 
     def _merge_restriction_flags(self, existing_flags: list[str], extra_flags: list[str]) -> list[str]:
         merged: list[str] = []
@@ -7793,22 +7991,33 @@ class VideoPipeline:
         cache_path = self._candidate_cache_path(candidate)
         return cache_path.exists() and cache_path.stat().st_size > 0
 
-    def _download_candidate_asset(self, candidate: AssetCandidate) -> tuple[Path, AssetCandidate]:
+    def _download_candidate_asset(
+        self,
+        candidate: AssetCandidate,
+        *,
+        session: requests.Session | None = None,
+    ) -> tuple[Path, AssetCandidate]:
         if self._candidate_is_cached(candidate):
             return self._candidate_cache_path(candidate), candidate
 
         if candidate.source_platform == "vecteezy":
-            download_url, resolved_candidate = self._resolve_vecteezy_download(candidate)
+            download_url, resolved_candidate = self._resolve_vecteezy_download(candidate, session=session)
             local_path = self._download_asset(
                 download_url,
                 cache_key=self._candidate_cache_key(resolved_candidate),
                 suffix_hint=resolved_candidate.download_extension,
+                session=session,
             )
             return local_path, resolved_candidate
 
-        return self._download_asset(candidate.download_url), candidate
+        return self._download_asset(candidate.download_url, session=session), candidate
 
-    def _resolve_vecteezy_download(self, candidate: AssetCandidate) -> tuple[str, AssetCandidate]:
+    def _resolve_vecteezy_download(
+        self,
+        candidate: AssetCandidate,
+        *,
+        session: requests.Session | None = None,
+    ) -> tuple[str, AssetCandidate]:
         account_id = self._coerce_str_or_none(self.config.vecteezy_account_id)
         api_key = self._coerce_str_or_none(self.config.vecteezy_api_key)
         asset_id = self._coerce_str_or_none(candidate.source_asset_id)
@@ -7820,7 +8029,12 @@ class VideoPipeline:
         if file_extension:
             url += f"?file_type={quote_plus(file_extension)}"
 
-        response = self.http.get(url, headers=self._vecteezy_headers(api_key), timeout=(5, 20))
+        response = self._http_get_with_retries(
+            url,
+            headers=self._vecteezy_headers(api_key),
+            timeout=(5, 20),
+            session=session,
+        )
         if response.status_code == 402:
             raise RuntimeError("Vecteezy monthly download quota exceeded")
         if response.status_code != 200:
@@ -7833,7 +8047,7 @@ class VideoPipeline:
         download_url = self._coerce_str_or_none(payload.get("url")) or self._coerce_str_or_none(payload.get("inline_url"))
         download_status_url = self._coerce_str_or_none(payload.get("download_status_url"))
         if not download_url and download_status_url:
-            download_url = self._poll_vecteezy_download_status(download_status_url, api_key)
+            download_url = self._poll_vecteezy_download_status(download_status_url, api_key, session=session)
         if not download_url:
             raise RuntimeError("Vecteezy download response did not include a usable URL")
 
@@ -7862,19 +8076,27 @@ class VideoPipeline:
             ),
         )
         self._record_vecteezy_download_event(asset_id, resolved_candidate.source_url)
-        self._vecteezy_downloads_this_run += 1
-        if isinstance(self._vecteezy_usage_state, dict):
-            current_tracked = self._coerce_optional_int(self._vecteezy_usage_state.get("tracked_download_count")) or 0
-            self._vecteezy_usage_state["tracked_download_count"] = current_tracked + 1
-            self._vecteezy_usage_state["downloads_this_run"] = int(self._vecteezy_downloads_this_run)
-            remaining = self._coerce_optional_int(self._vecteezy_usage_state.get("estimated_remaining_downloads"))
-            if remaining is not None:
-                self._vecteezy_usage_state["estimated_remaining_downloads"] = max(0, remaining - 1)
+        with self._provider_usage_lock:
+            self._vecteezy_downloads_this_run += 1
+            if isinstance(self._vecteezy_usage_state, dict):
+                current_tracked = self._coerce_optional_int(self._vecteezy_usage_state.get("tracked_download_count")) or 0
+                self._vecteezy_usage_state["tracked_download_count"] = current_tracked + 1
+                self._vecteezy_usage_state["downloads_this_run"] = int(self._vecteezy_downloads_this_run)
+                remaining = self._coerce_optional_int(self._vecteezy_usage_state.get("estimated_remaining_downloads"))
+                if remaining is not None:
+                    self._vecteezy_usage_state["estimated_remaining_downloads"] = max(0, remaining - 1)
         return download_url, resolved_candidate
 
-    def _poll_vecteezy_download_status(self, status_url: str, api_key: str) -> str:
+    def _poll_vecteezy_download_status(
+        self,
+        status_url: str,
+        api_key: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> str:
+        active_session = session or self.http
         for _ in range(12):
-            response = self.http.get(status_url, headers=self._vecteezy_headers(api_key), timeout=(5, 20))
+            response = active_session.get(status_url, headers=self._vecteezy_headers(api_key), timeout=(5, 20))
             if response.status_code != 200:
                 raise RuntimeError(f"Vecteezy download status failed, status={response.status_code}")
             payload = response.json()
@@ -7985,22 +8207,50 @@ class VideoPipeline:
         *,
         cache_key: str | None = None,
         suffix_hint: str | None = None,
+        session: requests.Session | None = None,
     ) -> Path:
         output = self._asset_cache_path(url, cache_key=cache_key, suffix_hint=suffix_hint)
         if output.exists() and output.stat().st_size > 0:
             return output
 
-        with self.http.get(url, stream=True, timeout=(8, 20)) as response:
-            if response.status_code != 200:
-                raise RuntimeError(f"Failed to download asset, status={response.status_code}")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        active_session = session or self.http
+        cache_lock = self._asset_cache_lock(output)
+        with cache_lock:
+            if output.exists() and output.stat().st_size > 0:
+                return output
+            if output.exists():
+                try:
+                    output.unlink()
+                except FileNotFoundError:
+                    pass
 
-            with output.open("wb") as handle:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        handle.write(chunk)
+            temp_output = output.with_name(f".{output.name}.part-{os.getpid()}-{threading.get_ident()}")
+            try:
+                if temp_output.exists():
+                    temp_output.unlink()
 
-        if output.stat().st_size == 0:
-            raise RuntimeError("Downloaded asset is empty")
+                try:
+                    with active_session.get(url, stream=True, timeout=(8, 20)) as response:
+                        if response.status_code != 200:
+                            raise RuntimeError(f"Failed to download asset, status={response.status_code}")
+
+                        with temp_output.open("wb") as handle:
+                            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                                if chunk:
+                                    handle.write(chunk)
+                except requests.exceptions.RequestException as exc:
+                    raise RuntimeError(f"Failed to download asset from {url}: {exc}") from exc
+
+                if not temp_output.exists() or temp_output.stat().st_size == 0:
+                    raise RuntimeError("Downloaded asset is empty")
+                temp_output.replace(output)
+            finally:
+                if temp_output.exists():
+                    try:
+                        temp_output.unlink()
+                    except FileNotFoundError:
+                        pass
         return output
 
     def _generate_captions(self, plan: ScriptPlan, narration_wav: Path) -> list[CaptionCue]:
@@ -10869,34 +11119,47 @@ class VideoPipeline:
         return result
 
     def _optimization_section(self, key: str) -> dict[str, Any]:
-        section = self.optimization_stats.get(key)
-        if isinstance(section, dict):
+        with self._stats_lock:
+            section = self.optimization_stats.get(key)
+            if isinstance(section, dict):
+                return section
+            section = {}
+            self.optimization_stats[key] = section
             return section
-        section = {}
-        self.optimization_stats[key] = section
-        return section
 
     def _increment_optimization_counter(self, section: str, key: str, amount: int = 1) -> None:
-        bucket = self._optimization_section(section)
-        current = bucket.get(key)
-        try:
-            base = int(current)
-        except (TypeError, ValueError):
-            base = 0
-        bucket[key] = base + int(amount)
+        with self._stats_lock:
+            bucket = self.optimization_stats.get(section)
+            if not isinstance(bucket, dict):
+                bucket = {}
+                self.optimization_stats[section] = bucket
+            current = bucket.get(key)
+            try:
+                base = int(current)
+            except (TypeError, ValueError):
+                base = 0
+            bucket[key] = base + int(amount)
 
     def _record_optimization_time(self, section: str, key: str, elapsed: float) -> None:
-        bucket = self._optimization_section(section)
-        current = bucket.get(key)
-        try:
-            base = float(current)
-        except (TypeError, ValueError):
-            base = 0.0
-        bucket[key] = round(base + max(0.0, float(elapsed)), 3)
+        with self._stats_lock:
+            bucket = self.optimization_stats.get(section)
+            if not isinstance(bucket, dict):
+                bucket = {}
+                self.optimization_stats[section] = bucket
+            current = bucket.get(key)
+            try:
+                base = float(current)
+            except (TypeError, ValueError):
+                base = 0.0
+            bucket[key] = round(base + max(0.0, float(elapsed)), 3)
 
     def _set_optimization_value(self, section: str, key: str, value: Any) -> None:
-        bucket = self._optimization_section(section)
-        bucket[key] = value
+        with self._stats_lock:
+            bucket = self.optimization_stats.get(section)
+            if not isinstance(bucket, dict):
+                bucket = {}
+                self.optimization_stats[section] = bucket
+            bucket[key] = value
 
     @contextmanager
     def _timed_optimization_block(self, section: str, key: str) -> Any:
@@ -11568,18 +11831,21 @@ class VideoPipeline:
         self._log_with_level(message, level="INFO")
 
     def _warn(self, message: str) -> None:
-        self.warnings.append(message)
+        with self._warnings_lock:
+            self.warnings.append(message)
         self._log_with_level(message, level="WARN")
 
     def _log_with_level(self, message: str, level: str) -> None:
         timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
         line = f"{timestamp} [{level}] {message}"
         try:
-            self.paths["run_log"].parent.mkdir(parents=True, exist_ok=True)
-            with self.paths["run_log"].open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
+            with self._log_lock:
+                self.paths["run_log"].parent.mkdir(parents=True, exist_ok=True)
+                with self.paths["run_log"].open("a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
         except Exception:
             pass
 
         if self.config.verbose or level in {"WARN", "ERROR"}:
-            print(f"[local-video-mvp] {message}")
+            with self._log_lock:
+                print(f"[local-video-mvp] {message}")
