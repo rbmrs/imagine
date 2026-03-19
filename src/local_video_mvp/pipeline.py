@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import math
@@ -10,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import wave
 from dataclasses import dataclass, replace
@@ -533,6 +536,7 @@ STRICT_SAFE_BLOCKING_FLAGS = {
 }
 
 COVERR_HOURLY_REQUEST_LIMIT = 50
+ASSET_QUERY_CACHE_TTL_SECONDS = 24 * 60 * 60
 
 FALLBACK_ONLY_ASSET_PROVIDERS = {"coverr", "vecteezy"}
 ASSET_MODE_CHOICES = {"prefer-video", "balanced", "prefer-images", "images-only"}
@@ -579,6 +583,9 @@ class VideoPipeline:
         self.paths = self._build_paths(config.project_dir)
         self.http = requests.Session()
         self.http.headers.update({"User-Agent": "local-video-mvp/0.1"})
+        http_adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8)
+        self.http.mount("http://", http_adapter)
+        self.http.mount("https://", http_adapter)
         self.stage_times: dict[str, float] = {}
         self.warnings: list[str] = []
         self.caption_stats: dict[str, Any] = {}
@@ -603,6 +610,8 @@ class VideoPipeline:
         self._bookend_logo_overlay: Path | None = None
         self._ffmpeg_drawtext_available: bool | None = None
         self._ffmpeg_subtitles_available: bool | None = None
+        self._hw_encoder: str | None = None
+        self._hw_encoder_checked = False
         self._piper_command: list[str] | None = None
         self._kokoro_pipelines: dict[str, Any] = {}
         self._ollama_ready = False
@@ -612,6 +621,13 @@ class VideoPipeline:
         self._coverr_requests_this_run = 0
         self._vecteezy_usage_state: dict[str, Any] | None = None
         self._vecteezy_downloads_this_run = 0
+        self._duration_cache: dict[tuple[str, int, int], float] = {}
+        self._log_lock = threading.Lock()
+        self._warnings_lock = threading.Lock()
+        self._provider_usage_lock = threading.Lock()
+        self._asset_cache_registry_lock = threading.Lock()
+        self._asset_cache_locks: dict[str, threading.Lock] = {}
+        self._stats_lock = threading.Lock()
 
     def _reset_run_state(self) -> None:
         self.stage_times = {}
@@ -644,6 +660,7 @@ class VideoPipeline:
             "subtitle_outline": bool(self.config.subtitle_outline),
             "include_intro": self.config.include_intro,
             "include_outro": self.config.include_outro,
+            "outro_spoken_text": self.config.outro_spoken_text,
             "require_external_assets": self.config.require_external_assets,
             "enable_pexels_provider": self.config.enable_pexels_provider,
             "enable_pixabay_provider": self.config.enable_pixabay_provider,
@@ -672,6 +689,7 @@ class VideoPipeline:
         self._coverr_requests_this_run = 0
         self._vecteezy_usage_state = None
         self._vecteezy_downloads_this_run = 0
+        self._duration_cache = {}
 
     def run(self) -> dict[str, str]:
         self._reset_run_state()
@@ -1250,12 +1268,19 @@ class VideoPipeline:
             if self._promote_preview_render_if_unchanged(timeline):
                 return
 
-            self._render_video(timeline, self.paths["narration_wav"], self.paths["final_mp4"])
+            self._render_video(
+                timeline,
+                self.paths["narration_wav"],
+                self.paths["final_mp4"],
+                metrics_section="render",
+            )
             shutil.copy2(self.paths["captions"], self.paths["final_srt"])
-            self.optimization_stats["render"] = {
-                "mode": "rerendered-finalize",
-                "reused_preview": False,
-            }
+            self._optimization_section("render").update(
+                {
+                    "mode": "rerendered-finalize",
+                    "reused_preview": False,
+                }
+            )
 
         self._run_stage(
             "render",
@@ -1613,6 +1638,7 @@ class VideoPipeline:
         if narration_wav.exists() and narration_wav.stat().st_size > 0:
             existing_hash = self._load_narration_state_hash()
             if existing_hash and existing_hash == expected_hash:
+                self._ensure_outro_narration_audio()
                 return
 
             self._warn("Approved script changed since narration generation; re-synthesizing narration audio.")
@@ -1622,14 +1648,17 @@ class VideoPipeline:
         self._write_text(self.paths["narration_txt"], narration_text + "\n")
 
         def voice_stage() -> None:
-            self._synthesize_narration(narration_text, self.paths["narration_raw"])
-            self._normalize_audio(self.paths["narration_raw"], narration_wav)
+            with self._timed_optimization_block("narration", "tts_synthesis_seconds"):
+                self._synthesize_narration(narration_text, self.paths["narration_raw"])
+            with self._timed_optimization_block("narration", "normalize_seconds"):
+                self._normalize_audio(self.paths["narration_raw"], narration_wav)
 
         self._run_stage(
             "narration",
             self._stage_label(3 if self._news_mode_enabled() else 2, "Synthesizing narration audio"),
             voice_stage,
         )
+        self._ensure_outro_narration_audio()
         audio_duration = self._media_duration(narration_wav)
         self._rebalance_scene_durations(plan, audio_duration)
         self._update_duration_post_tts(plan, audio_duration, adjust_passes=0)
@@ -1697,8 +1726,11 @@ class VideoPipeline:
         raw_path = scene_dir / f"{cleaned_scene_id}.raw.wav"
         wav_path = scene_dir / f"{cleaned_scene_id}.wav"
 
-        self._synthesize_narration(narration_text, raw_path)
-        self._normalize_audio(raw_path, wav_path)
+        self._increment_optimization_counter("shot_preview", "preview_count")
+        with self._timed_optimization_block("shot_preview", "narration_synthesis_seconds"):
+            self._synthesize_narration(narration_text, raw_path)
+        with self._timed_optimization_block("shot_preview", "narration_normalize_seconds"):
+            self._normalize_audio(raw_path, wav_path)
 
         return {
             "scene_id": cleaned_scene_id,
@@ -1762,10 +1794,12 @@ class VideoPipeline:
             cached_stats = state.get("caption_stats") if isinstance(state, dict) else None
             if isinstance(cached_stats, dict):
                 self.caption_stats = dict(cached_stats)
-            self.optimization_stats["captions"] = {
-                "mode": "reused",
-                "captions_signature": signature,
-            }
+            self._optimization_section("captions").update(
+                {
+                    "mode": "reused",
+                    "captions_signature": signature,
+                }
+            )
             return
 
         captions = self._run_stage(
@@ -1788,10 +1822,12 @@ class VideoPipeline:
                 "caption_stats": dict(self.caption_stats),
             },
         )
-        self.optimization_stats["captions"] = {
-            "mode": "generated",
-            "captions_signature": signature,
-        }
+        self._optimization_section("captions").update(
+            {
+                "mode": "generated",
+                "captions_signature": signature,
+            }
+        )
 
     def _ensure_timeline(self, plan: ScriptPlan) -> list[TimelineClip]:
         signature = self._timeline_signature(plan)
@@ -1803,10 +1839,12 @@ class VideoPipeline:
                 self._log(self._stage_label(7 if self._news_mode_enabled() else 6, "Reusing timeline"))
                 self.stage_times["timeline"] = 0.0
                 self._log("timeline completed in 0.00s")
-                self.optimization_stats["timeline"] = {
-                    "mode": "reused",
-                    "timeline_signature": signature,
-                }
+                self._optimization_section("timeline").update(
+                    {
+                        "mode": "reused",
+                        "timeline_signature": signature,
+                    }
+                )
                 return timeline
 
         timeline = self._run_stage(
@@ -1824,10 +1862,12 @@ class VideoPipeline:
                 "clip_count": len(timeline),
             },
         )
-        self.optimization_stats["timeline"] = {
-            "mode": "generated",
-            "timeline_signature": signature,
-        }
+        self._optimization_section("timeline").update(
+            {
+                "mode": "generated",
+                "timeline_signature": signature,
+            }
+        )
         return timeline
 
     def _ensure_preview_render(self, timeline: list[TimelineClip]) -> None:
@@ -1839,14 +1879,21 @@ class VideoPipeline:
             self._log(self._stage_label(7 if self._news_mode_enabled() else 6, "Reusing preview video"))
             self.stage_times["preview_render"] = 0.0
             self._log("preview_render completed in 0.00s")
-            self.optimization_stats["preview_render"] = {
-                "mode": "reused",
-                "render_signature": render_signature,
-            }
+            self._optimization_section("preview_render").update(
+                {
+                    "mode": "reused",
+                    "render_signature": render_signature,
+                }
+            )
             return
 
         def render_preview_stage() -> None:
-            self._render_video(timeline, self.paths["narration_wav"], self.paths["preview_mp4"])
+            self._render_video(
+                timeline,
+                self.paths["narration_wav"],
+                self.paths["preview_mp4"],
+                metrics_section="preview_render",
+            )
             shutil.copy2(self.paths["captions"], self.paths["preview_srt"])
 
         self._run_stage(
@@ -1863,10 +1910,12 @@ class VideoPipeline:
                 "preview_srt": str(self.paths["preview_srt"].resolve()),
             },
         )
-        self.optimization_stats["preview_render"] = {
-            "mode": "generated",
-            "render_signature": render_signature,
-        }
+        self._optimization_section("preview_render").update(
+            {
+                "mode": "generated",
+                "render_signature": render_signature,
+            }
+        )
 
     def _promote_preview_render_if_unchanged(self, timeline: list[TimelineClip]) -> bool:
         render_signature = self._render_signature(timeline)
@@ -1894,11 +1943,13 @@ class VideoPipeline:
         shutil.copy2(srt_source, final_srt)
 
         self._log(self._stage_label(7 if self._news_mode_enabled() else 6, "Reusing approved preview as final output"))
-        self.optimization_stats["render"] = {
-            "mode": "reused-preview",
-            "reused_preview": True,
-            "render_signature": render_signature,
-        }
+        self._optimization_section("render").update(
+            {
+                "mode": "reused-preview",
+                "reused_preview": True,
+                "render_signature": render_signature,
+            }
+        )
         return True
 
     def _captions_signature(self) -> str:
@@ -1959,6 +2010,7 @@ class VideoPipeline:
             "intro_seconds": self.config.intro_seconds,
             "outro_seconds": self.config.outro_seconds,
             "outro_text": self.config.outro_text,
+            "outro_spoken_text": self.config.outro_spoken_text,
         }
         return self._stable_payload_hash(payload)
 
@@ -1992,6 +2044,7 @@ class VideoPipeline:
                 "intro_seconds": self.config.intro_seconds,
                 "outro_seconds": self.config.outro_seconds,
                 "outro_text": self.config.outro_text,
+                "outro_spoken_text": self.config.outro_spoken_text,
                 "channel_name": self.config.channel_name,
                 "intro_tagline": self.config.intro_tagline,
                 "outro_tagline": self.config.outro_tagline,
@@ -2114,6 +2167,127 @@ class VideoPipeline:
         if not isinstance(payload, dict):
             return None
         return payload
+
+    def _asset_query_cache_root(self) -> Path:
+        return (Path.home() / ".imagine" / "asset_query_cache").resolve()
+
+    def _asset_query_cache_path(self, provider_name: str, query: str) -> Path:
+        provider_key = str(provider_name or "").strip().lower() or "unknown"
+        normalized_query = str(query or "").strip().lower()
+        digest = hashlib.sha1(normalized_query.encode("utf-8")).hexdigest()
+        return self._asset_query_cache_root() / provider_key / f"{digest}.json"
+
+    def _query_cache_entry_fresh(self, fetched_at: str, ttl_seconds: int) -> bool:
+        if not fetched_at:
+            return False
+        try:
+            timestamp = dt.datetime.fromisoformat(fetched_at)
+        except ValueError:
+            return False
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=dt.timezone.utc)
+        age_seconds = (dt.datetime.now(dt.timezone.utc) - timestamp.astimezone(dt.timezone.utc)).total_seconds()
+        return age_seconds <= max(0, int(ttl_seconds))
+
+    def _load_persistent_query_cache(self, provider_name: str, query: str) -> list[AssetCandidate] | None:
+        payload = self._load_json_state(self._asset_query_cache_path(provider_name, query))
+        if not isinstance(payload, dict):
+            return None
+
+        fetched_at = str(payload.get("fetched_at") or "").strip()
+        ttl_seconds = self._coerce_optional_int(payload.get("ttl_seconds")) or ASSET_QUERY_CACHE_TTL_SECONDS
+        if not self._query_cache_entry_fresh(fetched_at, ttl_seconds):
+            return None
+
+        raw_candidates = payload.get("candidates")
+        if not isinstance(raw_candidates, list):
+            return None
+
+        candidates: list[AssetCandidate] = []
+        for item in raw_candidates:
+            if not isinstance(item, dict):
+                continue
+            candidate = self._asset_candidate_from_payload(item)
+            if candidate is not None:
+                candidates.append(candidate)
+        return candidates
+
+    def _write_persistent_query_cache(
+        self,
+        provider_name: str,
+        query: str,
+        candidates: list[AssetCandidate],
+    ) -> None:
+        if not candidates:
+            return
+
+        path = self._asset_query_cache_path(provider_name, query)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "provider": str(provider_name or "").strip().lower(),
+            "query": str(query or "").strip(),
+            "fetched_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "ttl_seconds": ASSET_QUERY_CACHE_TTL_SECONDS,
+            "candidate_count": len(candidates),
+            "candidates": [candidate.to_dict() for candidate in candidates],
+        }
+        self._write_json(path, payload)
+
+    def _new_http_session(self) -> requests.Session:
+        session = requests.Session()
+        session.headers.update(dict(self.http.headers))
+        adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
+
+    def _asset_cache_lock(self, output: Path) -> threading.Lock:
+        cache_key = str(output.resolve())
+        with self._asset_cache_registry_lock:
+            existing = self._asset_cache_locks.get(cache_key)
+            if existing is not None:
+                return existing
+            lock = threading.Lock()
+            self._asset_cache_locks[cache_key] = lock
+            return lock
+
+    def _http_get_with_retries(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        timeout: tuple[int, int] = (5, 15),
+        session: requests.Session | None = None,
+    ) -> requests.Response:
+        delays = (0.0, 1.0, 2.0, 4.0)
+        last_error: Exception | None = None
+        active_session = session or self.http
+
+        for attempt_index, delay in enumerate(delays):
+            if attempt_index > 0:
+                self._increment_optimization_counter("asset_resolution", "provider_retry_attempts")
+                time.sleep(delay)
+            try:
+                response = active_session.get(url, headers=headers, params=params, timeout=timeout)
+            except requests.exceptions.Timeout as exc:
+                last_error = exc
+                if attempt_index == len(delays) - 1:
+                    break
+                continue
+            except requests.exceptions.RequestException as exc:
+                raise RuntimeError(f"HTTP GET failed for {url}: {exc}") from exc
+
+            if response.status_code >= 500:
+                response.close()
+                if attempt_index == len(delays) - 1:
+                    raise RuntimeError(f"HTTP GET failed for {url}, status={response.status_code}")
+                continue
+            return response
+
+        if last_error is not None:
+            raise RuntimeError(f"HTTP GET timed out for {url}") from last_error
+        raise RuntimeError(f"HTTP GET failed for {url}")
 
     def _selected_candidate_for_shot(self, shot_id: str) -> AssetCandidate | None:
         clip_catalog = self._load_json_state(self.paths["clip_catalog"]) or {}
@@ -2373,7 +2547,12 @@ class VideoPipeline:
             )
 
             def render_stage() -> None:
-                self._render_video(timeline, narration_wav, self.paths["final_mp4"])
+                self._render_video(
+                    timeline,
+                    narration_wav,
+                    self.paths["final_mp4"],
+                    metrics_section="render",
+                )
                 shutil.copy2(captions_srt, self.paths["final_srt"])
 
             self._run_stage("render", "Stage 4/5: Rendering updated video", render_stage)
@@ -2456,14 +2635,30 @@ class VideoPipeline:
             video_candidates: list[AssetCandidate] = []
             image_candidates: list[AssetCandidate] = []
             candidates: list[AssetCandidate] = []
+            existing_rights = self._load_existing_rights()
+            existing_rights_by_scene = {right.scene_id: right for right in existing_rights}
+            selected_candidate = self._selected_candidate_for_shot(shot_id)
+            selected_key = self._asset_uniqueness_key(selected_candidate) if selected_candidate is not None else None
+            current_asset_key = ""
             if not editorial_locked:
                 active_asset_keys = self._active_shot_asset_keys()
                 current_asset_key = active_asset_keys.get(shot_id)
+                if not current_asset_key:
+                    current_right = existing_rights_by_scene.get(shot_id)
+                    if current_right is not None:
+                        current_asset_key = self._asset_uniqueness_key_from_right(current_right)
+                if not current_asset_key and selected_key:
+                    current_asset_key = selected_key
                 other_active_asset_keys = {
                     key
                     for active_shot_id, key in active_asset_keys.items()
                     if active_shot_id != shot_id and key
                 }
+                other_active_asset_keys.update(
+                    self._asset_uniqueness_key_from_right(right)
+                    for right in existing_rights
+                    if right.scene_id != shot_id
+                )
                 ranked_candidates = self._rank_scene_candidates(
                     scene,
                     provider_order=provider_order,
@@ -2481,8 +2676,6 @@ class VideoPipeline:
                 image_candidates = [candidate for candidate in filtered_candidates if candidate.media_type == "image"][:shortlist_size]
                 candidates = self._sort_candidates([*video_candidates, *image_candidates])
 
-            selected_candidate = self._selected_candidate_for_shot(shot_id)
-            selected_key = self._asset_uniqueness_key(selected_candidate) if selected_candidate is not None else None
             preview_budget = {"video": 3, "image": 3}
             manifest_candidates: list[dict[str, Any]] = []
             payload_by_key: dict[str, dict[str, Any]] = {}
@@ -2531,6 +2724,7 @@ class VideoPipeline:
                 "search_queries": list(target_shot.search_queries),
                 "editorial_locked": bool(editorial_locked),
                 "visual_strategy": normalize_news_visual_strategy(target_shot.visual_strategy, "stock"),
+                "current_asset_key": current_asset_key,
                 "current_asset_path": target_shot.asset_path,
                 "current_asset_provider": target_shot.asset_provider,
                 "candidates": manifest_candidates,
@@ -2625,7 +2819,17 @@ class VideoPipeline:
             single_plan = ShotPlan(title=shot_plan.title, summary=shot_plan.summary, shots=[target_shot])
             existing_rights = self._load_existing_rights()
             existing_rights_by_scene = {right.scene_id: right for right in existing_rights}
-            rights = self._resolve_shot_assets(single_plan, preferred_candidates=preferred_candidates, persist_state=False)
+            preused_asset_keys = {
+                self._asset_uniqueness_key_from_right(right)
+                for right in existing_rights
+                if right.scene_id != shot_id
+            }
+            rights = self._resolve_shot_assets(
+                single_plan,
+                preferred_candidates=preferred_candidates,
+                persist_state=False,
+                preused_asset_keys=preused_asset_keys,
+            )
             updated_shot = single_plan.shots[0]
             if (
                 not self._news_mode_enabled()
@@ -2701,6 +2905,8 @@ class VideoPipeline:
             "narration_txt": project_dir / "narration.txt",
             "narration_raw": project_dir / "narration.raw.wav",
             "narration_wav": project_dir / "narration.wav",
+            "outro_narration_raw": project_dir / "tmp" / "outro_narration.raw.wav",
+            "outro_narration_wav": project_dir / "tmp" / "outro_narration.wav",
             "captions": project_dir / "captions.srt",
             "captions_ass": project_dir / "captions.ass",
             "timeline": project_dir / "timeline.json",
@@ -3849,6 +4055,13 @@ class VideoPipeline:
             """
         ).strip()
 
+        _SCRIPT_LANG_NAMES = {"pt-br": "Brazilian Portuguese", "es": "Spanish", "fr": "French"}
+        if getattr(self.config, "script_language", "en") not in ("en", "", None):
+            lang_name = _SCRIPT_LANG_NAMES.get(
+                self.config.script_language, self.config.script_language
+            )
+            prompt += f"\n- language: Generate ALL content (scene titles, voiceovers, narration) in {lang_name}. Do NOT use English."
+
         result = self._run_command(
             ["ollama", "run", self.config.ollama_model, prompt],
             timeout=600,
@@ -4195,7 +4408,7 @@ class VideoPipeline:
     def _word_count_plan(self, plan: ScriptPlan) -> int:
         total = 0
         for scene in plan.scenes:
-            total += len(re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", scene.voiceover or ""))
+            total += len(re.findall(r"[^\W_]+(?:'[^\W_]+)?", scene.voiceover or ""))
         return total
 
     def _estimate_seconds_from_words(self, words: int) -> float:
@@ -4790,7 +5003,7 @@ class VideoPipeline:
         return None
 
     def _last_word_token(self, text: str) -> str | None:
-        tokens = re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", text or "")
+        tokens = re.findall(r"[^\W_]+(?:'[^\W_]+)?", text or "")
         if not tokens:
             return None
         return tokens[-1].lower()
@@ -4805,7 +5018,7 @@ class VideoPipeline:
         return value.endswith((",", ";", ":"))
 
     def _word_count_text(self, text: str) -> int:
-        return len(re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", text or ""))
+        return len(re.findall(r"[^\W_]+(?:'[^\W_]+)?", text or ""))
 
     def _tts_with_melo(self, chunks: list[dict[str, Any]], output_raw_wav: Path) -> None:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -4876,12 +5089,21 @@ class VideoPipeline:
         effective_speed = max(0.5, min(2.0, float(self.config.voice_speed) * float(settings["speed_multiplier"])))
         length_scale = max(0.1, min(2.5, 1.0 / effective_speed))
         speaker_id = voice_meta.get("speaker_id")
+        active_chunks = [
+            (
+                idx,
+                str(chunk.get("text") or "").strip(),
+                float(chunk.get("pause_after") or 0.0),
+            )
+            for idx, chunk in enumerate(chunks)
+            if str(chunk.get("text") or "").strip()
+        ]
 
-        for idx, chunk in enumerate(chunks):
-            text = str(chunk.get("text") or "").strip()
-            if not text:
-                continue
-
+        def synthesize_chunk(
+            idx: int,
+            text: str,
+            pause_seconds: float,
+        ) -> tuple[int, list[Path]]:
             raw_wav = parts_dir / f"piper_{idx:04d}.raw.wav"
             wav_path = parts_dir / f"piper_{idx:04d}.wav"
             command = list(piper_command)
@@ -4918,13 +5140,35 @@ class VideoPipeline:
                 raise RuntimeError(f"Piper synthesis failed: {stderr_text}")
 
             self._standardize_wav(raw_wav, wav_path)
-            part_files.append(wav_path)
+            chunk_files = [wav_path]
 
-            pause_seconds = float(chunk.get("pause_after") or 0.0)
             if pause_seconds > 0.0:
                 pause_path = parts_dir / f"pause_{idx:04d}.wav"
                 self._generate_silence_wav(pause_path, pause_seconds)
-                part_files.append(pause_path)
+                chunk_files.append(pause_path)
+            return idx, chunk_files
+
+        chunk_workers = min(4, len(active_chunks))
+        synthesized_parts: dict[int, list[Path]] = {}
+        if chunk_workers <= 1:
+            for idx, text, pause_seconds in active_chunks:
+                chunk_index, chunk_files = synthesize_chunk(idx, text, pause_seconds)
+                synthesized_parts[chunk_index] = chunk_files
+        else:
+            with ThreadPoolExecutor(max_workers=chunk_workers) as executor:
+                futures = [
+                    executor.submit(synthesize_chunk, idx, text, pause_seconds)
+                    for idx, text, pause_seconds in active_chunks
+                ]
+            for future in futures:
+                chunk_index, chunk_files = future.result()
+                synthesized_parts[chunk_index] = chunk_files
+
+        for idx, chunk in enumerate(chunks):
+            text = str(chunk.get("text") or "").strip()
+            if not text:
+                continue
+            part_files.extend(synthesized_parts.get(idx, []))
 
         if not part_files:
             raise RuntimeError("Piper TTS did not produce any audio parts")
@@ -4991,7 +5235,29 @@ class VideoPipeline:
                 "Kokoro TTS not available. Install voice deps with: python -m pip install -e '.[voice]'"
             ) from exc
 
-        pipeline = KPipeline(lang_code=lang_code)
+        try:
+            pipeline = KPipeline(lang_code=lang_code)
+        except Exception as exc:
+            msg = str(exc)
+            if lang_code not in ("en-us", "en-gb"):
+                raise RuntimeError(
+                    f"Kokoro {lang_code} requires espeak-ng for phonemization. "
+                    "Install: brew install espeak-ng && pip install phonemizer  "
+                    "then set: export PHONEMIZER_ESPEAK_LIBRARY=/opt/homebrew/lib/libespeak-ng.dylib"
+                ) from exc
+            raise RuntimeError(f"Kokoro pipeline init failed: {msg}") from exc
+        # misaki EspeakG2P returns (phoneme_string, tokens) tuple but kokoro
+        # pipeline expects a plain string. Wrap g2p to unwrap the tuple.
+        if hasattr(pipeline, "g2p") and lang_code not in ("a", "b"):
+            _orig_g2p = pipeline.g2p
+
+            class _G2PWrapper:
+                def __call__(self_, text: str) -> str:  # noqa: N805
+                    result = _orig_g2p(text)
+                    return result[0] if isinstance(result, tuple) else result
+
+            pipeline.g2p = _G2PWrapper()
+
         self._kokoro_pipelines[lang_code] = pipeline
         return pipeline
 
@@ -5270,9 +5536,15 @@ class VideoPipeline:
 
         part_files.append(narration_wav)
 
-        if tail > 0.0:
+        remaining_tail = tail
+        outro_narration_wav = self.paths["outro_narration_wav"]
+        if remaining_tail > 0.0 and outro_narration_wav.exists() and outro_narration_wav.stat().st_size > 0:
+            part_files.append(outro_narration_wav)
+            remaining_tail = max(0.0, tail - self._media_duration(outro_narration_wav))
+
+        if remaining_tail > 0.0:
             tail_path = parts_dir / "outro_silence.wav"
-            self._generate_silence_wav(tail_path, tail, sample_rate=48000)
+            self._generate_silence_wav(tail_path, remaining_tail, sample_rate=48000)
             part_files.append(tail_path)
 
         self._concat_wav_parts(
@@ -5281,6 +5553,30 @@ class VideoPipeline:
             sample_rate=48000,
             concat_list_path=parts_dir / "concat_bookends.txt",
         )
+
+    def _resolved_outro_spoken_text(self) -> str:
+        explicit = re.sub(r"\s+", " ", str(self.config.outro_spoken_text or "").strip())
+        if explicit:
+            return explicit
+        return re.sub(r"\s+", " ", str(self.config.outro_text or "").strip())
+
+    def _ensure_outro_narration_audio(self) -> None:
+        raw_path = self.paths["outro_narration_raw"]
+        wav_path = self.paths["outro_narration_wav"]
+        spoken_text = self._clean_narration_text(self._resolved_outro_spoken_text())
+        if not self.config.include_outro or not spoken_text:
+            raw_path.unlink(missing_ok=True)
+            wav_path.unlink(missing_ok=True)
+            return
+
+        self._synthesize_narration(spoken_text, raw_path)
+        self._normalize_audio(raw_path, wav_path)
+
+    def _outro_spoken_audio_duration(self) -> float:
+        path = self.paths["outro_narration_wav"]
+        if not path.exists() or path.stat().st_size <= 0:
+            return 0.0
+        return max(0.0, self._media_duration(path))
 
     def _select_voice_sample_excerpt(self, text: str, sample_words: int) -> str:
         target = max(40, int(sample_words))
@@ -5698,7 +5994,9 @@ class VideoPipeline:
                     continue
 
                 try:
-                    local_path, resolved_candidate = self._download_candidate_asset(candidate)
+                    self._increment_optimization_counter("asset_resolution", "download_attempts")
+                    with self._timed_optimization_block("asset_resolution", "download_seconds"):
+                        local_path, resolved_candidate = self._download_candidate_asset(candidate)
                     actual_duration = self._downloaded_asset_duration_seconds(
                         local_path,
                         scene.scene_id,
@@ -5753,6 +6051,7 @@ class VideoPipeline:
                         attribution_text=resolved_candidate.attribution_text,
                     )
                     rights.append(right)
+                    self._increment_optimization_counter("asset_resolution", "download_successes")
                     if resolved_candidate.media_type == "image":
                         resolved_image_scenes += 1
                     else:
@@ -5795,6 +6094,9 @@ class VideoPipeline:
                 rights,
             )
 
+        asset_optimization_stats = self.optimization_stats.get("asset_resolution")
+        if not isinstance(asset_optimization_stats, dict):
+            asset_optimization_stats = {}
         self.asset_stats = {
             "resolved_scene_count": len(rights),
             "resolved_video_scene_count": resolved_video_scenes,
@@ -5822,6 +6124,15 @@ class VideoPipeline:
             "asset_mode": self._normalized_asset_mode(),
             "image_motion_style": self._normalized_image_motion_style(),
             "provider_usage": provider_usage,
+            "query_cache_hits": int(asset_optimization_stats.get("query_cache_hits") or 0),
+            "query_cache_misses": int(asset_optimization_stats.get("query_cache_misses") or 0),
+            "persistent_query_cache_hits": int(asset_optimization_stats.get("persistent_query_cache_hits") or 0),
+            "persistent_query_cache_misses": int(asset_optimization_stats.get("persistent_query_cache_misses") or 0),
+            "download_attempts": int(asset_optimization_stats.get("download_attempts") or 0),
+            "download_successes": int(asset_optimization_stats.get("download_successes") or 0),
+            "montage_download_attempts": int(asset_optimization_stats.get("montage_download_attempts") or 0),
+            "montage_download_successes": int(asset_optimization_stats.get("montage_download_successes") or 0),
+            "provider_retry_attempts": int(asset_optimization_stats.get("provider_retry_attempts") or 0),
         }
 
         if download_failures > 0:
@@ -5960,6 +6271,7 @@ class VideoPipeline:
         self,
         shot_plan: ShotPlan,
         *,
+        preused_asset_keys: set[str] | None = None,
         preferred_candidates: dict[str, AssetCandidate] | None = None,
         persist_state: bool = True,
     ) -> list[AssetRight]:
@@ -5984,7 +6296,11 @@ class VideoPipeline:
 
         if synthetic_scenes:
             stock_plan = ScriptPlan(title=shot_plan.title, summary=shot_plan.summary, scenes=synthetic_scenes)
-            stock_rights = self._resolve_assets(stock_plan, preferred_candidates=preferred_candidates)
+            stock_rights = self._resolve_assets(
+                stock_plan,
+                preused_asset_keys=preused_asset_keys,
+                preferred_candidates=preferred_candidates,
+            )
             rights.extend(stock_rights)
             scene_by_id = {scene.scene_id: scene for scene in stock_plan.scenes}
             for shot in shot_plan.shots:
@@ -6095,6 +6411,7 @@ class VideoPipeline:
         self._write_json(self.paths["clip_catalog"], payload)
 
     def _ensure_shot_previews(self, shot_plan: ShotPlan) -> None:
+        preview_jobs: list[tuple[str, TimelineClip, Path, Path, Path]] = []
         for shot in shot_plan.shots:
             shot_dir = self._shot_preview_dir(shot.shot_id)
             shot_dir.mkdir(parents=True, exist_ok=True)
@@ -6139,6 +6456,10 @@ class VideoPipeline:
                 match_confidence=normalize_shot_confidence(shot.match_confidence, "medium"),
                 fallback_level=shot.fallback_level,
             )
+            preview_jobs.append((shot.shot_id, clip, audio_path, preview_path, ass_path))
+
+        def render_preview_job(job: tuple[str, TimelineClip, Path, Path, Path]) -> None:
+            shot_id, clip, audio_path, preview_path, ass_path = job
             self._render_video(
                 [clip],
                 audio_path,
@@ -6146,8 +6467,24 @@ class VideoPipeline:
                 captions_ass_path=ass_path,
                 intro_seconds=0.0,
                 outro_seconds=0.0,
-                render_subdir=f"shot-{shot.shot_id}",
+                render_subdir=f"shot-{shot_id}",
+                metrics_section="shot_preview",
             )
+
+        if not preview_jobs:
+            return
+
+        preview_workers = min(4, len(preview_jobs))
+        self._set_optimization_value("shot_preview", "render_workers", preview_workers)
+        if preview_workers == 1:
+            for job in preview_jobs:
+                render_preview_job(job)
+            return
+
+        with ThreadPoolExecutor(max_workers=preview_workers) as executor:
+            futures = [executor.submit(render_preview_job, job) for job in preview_jobs]
+        for future in futures:
+            future.result()
 
     def _montage_motion_profile(self, style: str | None = None) -> dict[str, float | str]:
         normalized_style = self._normalized_image_motion_style(style)
@@ -6226,9 +6563,8 @@ class VideoPipeline:
             shortlist = self._scene_asset_shortlists.get(scene.scene_id, [])
 
             if target_count > 1:
+                eligible_candidates: list[AssetCandidate] = []
                 for candidate in shortlist:
-                    if len(component_payloads) >= target_count:
-                        break
                     if candidate.media_type != "image":
                         continue
                     unique_key = self._asset_uniqueness_key(candidate)
@@ -6237,40 +6573,81 @@ class VideoPipeline:
                     policy_block_reason = self._candidate_policy_block_reason(candidate)
                     if policy_block_reason is not None:
                         continue
+                    eligible_candidates.append(candidate)
 
-                    try:
-                        local_path, resolved_candidate = self._download_candidate_asset(candidate)
-                    except Exception as exc:
-                        montage_download_failures += 1
-                        self._log(
-                            f"Montage asset download failed for {scene.scene_id} "
-                            f"({candidate.source_platform}, {candidate.query or 'shortlist'}): {exc}"
-                        )
+                candidate_index = 0
+                while len(component_payloads) < target_count and candidate_index < len(eligible_candidates):
+                    batch: list[AssetCandidate] = []
+                    remaining_vecteezy_downloads = self._vecteezy_estimated_remaining_downloads()
+                    while len(batch) < 4 and candidate_index < len(eligible_candidates):
+                        candidate = eligible_candidates[candidate_index]
+                        candidate_index += 1
+                        if candidate.source_platform == "vecteezy" and remaining_vecteezy_downloads is not None:
+                            if remaining_vecteezy_downloads <= 0:
+                                continue
+                            remaining_vecteezy_downloads -= 1
+                        batch.append(candidate)
+
+                    if not batch:
                         continue
 
-                    component_right = AssetRight(
-                        scene_id=scene.scene_id,
-                        source_platform=resolved_candidate.source_platform or "unknown",
-                        source_asset_id=resolved_candidate.source_asset_id,
-                        source_url=resolved_candidate.source_url or resolved_candidate.download_url,
-                        creator_name=resolved_candidate.creator_name,
-                        creator_profile_url=resolved_candidate.creator_profile_url,
-                        license_name=resolved_candidate.license_name,
-                        license_url=resolved_candidate.license_url,
-                        downloaded_at=dt.datetime.now(dt.timezone.utc).isoformat(),
-                        local_path=str(local_path.resolve()),
-                        sha256=self._file_sha256(local_path),
-                        media_type=resolved_candidate.media_type,
-                        width=resolved_candidate.width,
-                        height=resolved_candidate.height,
-                        duration_seconds=resolved_candidate.duration_seconds,
-                        restriction_flags=list(resolved_candidate.restriction_flags),
-                        attribution_required=bool(resolved_candidate.attribution_required),
-                        attribution_text=resolved_candidate.attribution_text,
-                    )
-                    component_payloads.append(self._asset_component_payload_from_right(component_right))
-                    scene_keys.add(unique_key)
-                    used_asset_keys.add(unique_key)
+                    def download_montage_candidate(
+                        candidate: AssetCandidate,
+                    ) -> tuple[Path | None, AssetCandidate | None, Exception | None]:
+                        session = self._new_http_session()
+                        try:
+                            self._increment_optimization_counter("asset_resolution", "montage_download_attempts")
+                            with self._timed_optimization_block("asset_resolution", "montage_download_seconds"):
+                                local_path, resolved_candidate = self._download_candidate_asset(candidate, session=session)
+                            return local_path, resolved_candidate, None
+                        except Exception as exc:
+                            return None, None, exc
+                        finally:
+                            session.close()
+
+                    with ThreadPoolExecutor(max_workers=min(4, len(batch))) as executor:
+                        futures = [executor.submit(download_montage_candidate, candidate) for candidate in batch]
+
+                    for candidate, future in zip(batch, futures):
+                        local_path, resolved_candidate, error = future.result()
+                        if error is not None or local_path is None or resolved_candidate is None:
+                            montage_download_failures += 1
+                            self._log(
+                                f"Montage asset download failed for {scene.scene_id} "
+                                f"({candidate.source_platform}, {candidate.query or 'shortlist'}): {error}"
+                            )
+                            continue
+
+                        resolved_key = self._asset_uniqueness_key(resolved_candidate)
+                        if resolved_key in scene_keys or resolved_key in used_asset_keys:
+                            continue
+
+                        self._increment_optimization_counter("asset_resolution", "montage_download_successes")
+                        component_right = AssetRight(
+                            scene_id=scene.scene_id,
+                            source_platform=resolved_candidate.source_platform or "unknown",
+                            source_asset_id=resolved_candidate.source_asset_id,
+                            source_url=resolved_candidate.source_url or resolved_candidate.download_url,
+                            creator_name=resolved_candidate.creator_name,
+                            creator_profile_url=resolved_candidate.creator_profile_url,
+                            license_name=resolved_candidate.license_name,
+                            license_url=resolved_candidate.license_url,
+                            downloaded_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+                            local_path=str(local_path.resolve()),
+                            sha256=self._file_sha256(local_path),
+                            media_type=resolved_candidate.media_type,
+                            width=resolved_candidate.width,
+                            height=resolved_candidate.height,
+                            duration_seconds=resolved_candidate.duration_seconds,
+                            restriction_flags=list(resolved_candidate.restriction_flags),
+                            attribution_required=bool(resolved_candidate.attribution_required),
+                            attribution_text=resolved_candidate.attribution_text,
+                        )
+                        component_payloads.append(self._asset_component_payload_from_right(component_right))
+                        scene_keys.add(resolved_key)
+                        used_asset_keys.add(resolved_key)
+                        if len(component_payloads) >= target_count:
+                            break
 
             right.scene_components = component_payloads
             self._scene_montage_assets[scene.scene_id] = [dict(item) for item in component_payloads]
@@ -6291,6 +6668,8 @@ class VideoPipeline:
         queries = self._queries_for_scene(scene)
 
         def collect_from_providers(provider_names: list[str], *, provider_index_offset: int) -> None:
+            ordered_searches: list[tuple[int, int, str, str, tuple[str, str]]] = []
+            pending_searches: list[tuple[str, str, tuple[str, str]]] = []
             for provider_offset, provider_name in enumerate(provider_names):
                 if not self._provider_is_configured(provider_name):
                     continue
@@ -6298,34 +6677,99 @@ class VideoPipeline:
                 provider_index = provider_index_offset + provider_offset
                 for query_index, query in enumerate(queries):
                     cache_key = (provider_name, query.lower())
-                    candidates = query_cache.get(cache_key)
-                    if cache_key not in query_cache:
-                        try:
-                            candidates = self._search_provider_candidates(provider_name, query)
-                        except Exception as exc:
-                            self._log(f"{provider_name} search failed for {scene.scene_id} ({query}): {exc}")
-                            candidates = []
-                        query_cache[cache_key] = list(candidates)
+                    ordered_searches.append((provider_index, query_index, provider_name, query, cache_key))
+                    if cache_key in query_cache:
+                        self._increment_optimization_counter("asset_resolution", "query_cache_hits")
+                        continue
 
-                    for base_candidate in query_cache.get(cache_key, []):
-                        quality_score = self._candidate_quality_score(base_candidate, scene)
-                        ranking_score = self._candidate_ranking_score(
-                            base_candidate,
-                            scene,
-                            quality_score=quality_score,
-                            provider_rank=provider_index,
-                            query_rank=query_index,
+                    candidates = query_cache.get(cache_key)
+                    if candidates is None:
+                        self._increment_optimization_counter("asset_resolution", "query_cache_misses")
+                        cached_candidates = self._load_persistent_query_cache(provider_name, query)
+                        if cached_candidates is not None:
+                            self._increment_optimization_counter("asset_resolution", "persistent_query_cache_hits")
+                            candidates = list(cached_candidates)
+                            query_cache[cache_key] = list(candidates)
+                        else:
+                            self._increment_optimization_counter("asset_resolution", "persistent_query_cache_misses")
+                            pending_searches.append((provider_name, query, cache_key))
+
+            def run_search_task(
+                provider_name: str,
+                query: str,
+            ) -> tuple[list[AssetCandidate], float, Exception | None]:
+                session = self._new_http_session()
+                started_at = time.perf_counter()
+                try:
+                    candidates = self._search_provider_candidates(provider_name, query, session=session)
+                    return list(candidates), time.perf_counter() - started_at, None
+                except Exception as exc:
+                    return [], time.perf_counter() - started_at, exc
+                finally:
+                    session.close()
+
+            if pending_searches:
+                parallel_pending = [
+                    (provider_name, query, cache_key)
+                    for provider_name, query, cache_key in pending_searches
+                    if provider_name != "coverr"
+                ]
+                serial_pending = [
+                    (provider_name, query, cache_key)
+                    for provider_name, query, cache_key in pending_searches
+                    if provider_name == "coverr"
+                ]
+
+                future_entries = []
+                if parallel_pending:
+                    with ThreadPoolExecutor(max_workers=min(4, len(parallel_pending))) as executor:
+                        future_entries.extend(
+                            [
+                                (provider_name, query, cache_key, executor.submit(run_search_task, provider_name, query))
+                                for provider_name, query, cache_key in parallel_pending
+                            ]
                         )
-                        ranked_candidate = replace(
-                            base_candidate,
-                            query=query,
-                            quality_score=quality_score,
-                            ranking_score=ranking_score,
-                        )
-                        unique_key = self._asset_uniqueness_key(ranked_candidate)
-                        existing = ranked_by_key.get(unique_key)
-                        if existing is None or ranked_candidate.ranking_score > existing.ranking_score:
-                            ranked_by_key[unique_key] = ranked_candidate
+
+                for provider_name, query, cache_key in serial_pending:
+                    candidates, elapsed_seconds, error = run_search_task(provider_name, query)
+                    self._record_optimization_time("asset_resolution", "search_seconds", elapsed_seconds)
+                    if error is not None:
+                        self._log(f"{provider_name} search failed for {scene.scene_id} ({query}): {error}")
+                        query_cache[cache_key] = []
+                        continue
+                    query_cache[cache_key] = list(candidates)
+                    self._write_persistent_query_cache(provider_name, query, list(candidates))
+
+                for provider_name, query, cache_key, future in future_entries:
+                    candidates, elapsed_seconds, error = future.result()
+                    self._record_optimization_time("asset_resolution", "search_seconds", elapsed_seconds)
+                    if error is not None:
+                        self._log(f"{provider_name} search failed for {scene.scene_id} ({query}): {error}")
+                        query_cache[cache_key] = []
+                        continue
+                    query_cache[cache_key] = list(candidates)
+                    self._write_persistent_query_cache(provider_name, query, list(candidates))
+
+            for provider_index, query_index, _, query, cache_key in ordered_searches:
+                for base_candidate in query_cache.get(cache_key, []):
+                    quality_score = self._candidate_quality_score(base_candidate, scene)
+                    ranking_score = self._candidate_ranking_score(
+                        base_candidate,
+                        scene,
+                        quality_score=quality_score,
+                        provider_rank=provider_index,
+                        query_rank=query_index,
+                    )
+                    ranked_candidate = replace(
+                        base_candidate,
+                        query=query,
+                        quality_score=quality_score,
+                        ranking_score=ranking_score,
+                    )
+                    unique_key = self._asset_uniqueness_key(ranked_candidate)
+                    existing = ranked_by_key.get(unique_key)
+                    if existing is None or ranked_candidate.ranking_score > existing.ranking_score:
+                        ranked_by_key[unique_key] = ranked_candidate
 
         primary_providers = self._primary_provider_order(provider_order)
         fallback_providers = self._fallback_provider_order(provider_order)
@@ -6385,7 +6829,13 @@ class VideoPipeline:
         remaining = [candidate for candidate in scene_candidates if self._asset_uniqueness_key(candidate) != preferred_key]
         return [pinned_candidate, *remaining]
 
-    def _search_provider_candidates(self, provider_name: str, query: str) -> list[AssetCandidate]:
+    def _search_provider_candidates(
+        self,
+        provider_name: str,
+        query: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> list[AssetCandidate]:
         candidates: list[AssetCandidate] = []
         asset_mode = self._normalized_asset_mode()
         image_assets_enabled = self._image_assets_enabled()
@@ -6395,17 +6845,17 @@ class VideoPipeline:
             if not api_key:
                 return []
             if not image_only:
-                candidates.extend(self._search_pexels_videos(api_key, query=query))
+                candidates.extend(self._search_pexels_videos(api_key, query=query, session=session))
             if image_assets_enabled:
-                candidates.extend(self._search_pexels_images(api_key, query=query))
+                candidates.extend(self._search_pexels_images(api_key, query=query, session=session))
         elif provider_name == "pixabay":
             api_key = self._coerce_str_or_none(self.config.pixabay_api_key)
             if not api_key:
                 return []
             if not image_only:
-                candidates.extend(self._search_pixabay_videos(api_key, query=query))
+                candidates.extend(self._search_pixabay_videos(api_key, query=query, session=session))
             if image_assets_enabled:
-                candidates.extend(self._search_pixabay_images(api_key, query=query))
+                candidates.extend(self._search_pixabay_images(api_key, query=query, session=session))
         elif provider_name == "coverr":
             api_key = self._coerce_str_or_none(self.config.coverr_api_key)
             if not api_key:
@@ -6415,16 +6865,16 @@ class VideoPipeline:
             remaining_requests = self._coverr_estimated_remaining_requests()
             if remaining_requests is not None and remaining_requests <= 0:
                 return []
-            candidates.extend(self._search_coverr_videos(api_key, query=query))
+            candidates.extend(self._search_coverr_videos(api_key, query=query, session=session))
         elif provider_name == "vecteezy":
             api_key = self._coerce_str_or_none(self.config.vecteezy_api_key)
             account_id = self._coerce_str_or_none(self.config.vecteezy_account_id)
             if not api_key or not account_id:
                 return []
             if not image_only:
-                candidates.extend(self._search_vecteezy_videos(account_id, api_key, query=query))
+                candidates.extend(self._search_vecteezy_videos(account_id, api_key, query=query, session=session))
             if image_assets_enabled:
-                candidates.extend(self._search_vecteezy_images(account_id, api_key, query=query))
+                candidates.extend(self._search_vecteezy_images(account_id, api_key, query=query, session=session))
         return candidates
 
     def _candidate_quality_score(self, candidate: AssetCandidate, scene: Scene) -> float:
@@ -6698,9 +7148,20 @@ class VideoPipeline:
         pivot = self._stable_pivot(seed, len(ordered))
         return ordered[pivot:] + ordered[:pivot]
 
-    def _search_pexels_videos(self, api_key: str, query: str) -> list[AssetCandidate]:
+    def _search_pexels_videos(
+        self,
+        api_key: str,
+        query: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> list[AssetCandidate]:
         url = f"https://api.pexels.com/videos/search?query={quote_plus(query)}&orientation=landscape&per_page=20"
-        response = self.http.get(url, headers={"Authorization": api_key}, timeout=(5, 15))
+        response = self._http_get_with_retries(
+            url,
+            headers={"Authorization": api_key},
+            timeout=(5, 15),
+            session=session,
+        )
         if response.status_code != 200:
             return []
 
@@ -6760,9 +7221,20 @@ class VideoPipeline:
 
         return self._stable_rotate_candidates(candidates, seed=f"pexels:{query.lower()}")
 
-    def _search_pexels_images(self, api_key: str, query: str) -> list[AssetCandidate]:
+    def _search_pexels_images(
+        self,
+        api_key: str,
+        query: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> list[AssetCandidate]:
         url = f"https://api.pexels.com/v1/search?query={quote_plus(query)}&orientation=landscape&per_page=20"
-        response = self.http.get(url, headers={"Authorization": api_key}, timeout=(5, 15))
+        response = self._http_get_with_retries(
+            url,
+            headers={"Authorization": api_key},
+            timeout=(5, 15),
+            session=session,
+        )
         if response.status_code != 200:
             return []
 
@@ -6813,12 +7285,18 @@ class VideoPipeline:
 
         return self._stable_rotate_candidates(candidates, seed=f"pexels-images:{query.lower()}")
 
-    def _search_pixabay_videos(self, api_key: str, query: str) -> list[AssetCandidate]:
+    def _search_pixabay_videos(
+        self,
+        api_key: str,
+        query: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> list[AssetCandidate]:
         url = (
             "https://pixabay.com/api/videos/"
             f"?key={quote_plus(api_key)}&q={quote_plus(query)}&safesearch=true&per_page=20"
         )
-        response = self.http.get(url, timeout=(5, 15))
+        response = self._http_get_with_retries(url, timeout=(5, 15), session=session)
         if response.status_code != 200:
             return []
 
@@ -6885,13 +7363,19 @@ class VideoPipeline:
 
         return self._stable_rotate_candidates(candidates, seed=f"pixabay:{query.lower()}")
 
-    def _search_pixabay_images(self, api_key: str, query: str) -> list[AssetCandidate]:
+    def _search_pixabay_images(
+        self,
+        api_key: str,
+        query: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> list[AssetCandidate]:
         url = (
             "https://pixabay.com/api/"
             f"?key={quote_plus(api_key)}&q={quote_plus(query)}&image_type=photo&orientation=horizontal"
             "&safesearch=true&per_page=20"
         )
-        response = self.http.get(url, timeout=(5, 15))
+        response = self._http_get_with_retries(url, timeout=(5, 15), session=session)
         if response.status_code != 200:
             return []
 
@@ -6939,9 +7423,15 @@ class VideoPipeline:
 
         return self._stable_rotate_candidates(candidates, seed=f"pixabay-images:{query.lower()}")
 
-    def _search_coverr_videos(self, api_key: str, query: str) -> list[AssetCandidate]:
+    def _search_coverr_videos(
+        self,
+        api_key: str,
+        query: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> list[AssetCandidate]:
         url = "https://api.coverr.co/videos"
-        response = self.http.get(
+        response = self._http_get_with_retries(
             url,
             headers=self._coverr_headers(api_key),
             params={
@@ -6950,6 +7440,7 @@ class VideoPipeline:
                 "urls": "true",
             },
             timeout=(5, 15),
+            session=session,
         )
         self._record_coverr_request_event(endpoint="videos", query=query)
         if response.status_code != 200:
@@ -7019,13 +7510,25 @@ class VideoPipeline:
 
         return self._stable_rotate_candidates(candidates, seed=f"coverr:{query.lower()}")
 
-    def _search_vecteezy_videos(self, account_id: str, api_key: str, query: str) -> list[AssetCandidate]:
+    def _search_vecteezy_videos(
+        self,
+        account_id: str,
+        api_key: str,
+        query: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> list[AssetCandidate]:
         url = (
             f"https://api.vecteezy.com/v2/{quote_plus(account_id)}/resources"
             f"?term={quote_plus(query)}&content_type=video&license_type=commercial"
             "&family_friendly=true&sort_by=relevance&per_page=20"
         )
-        response = self.http.get(url, headers=self._vecteezy_headers(api_key), timeout=(5, 15))
+        response = self._http_get_with_retries(
+            url,
+            headers=self._vecteezy_headers(api_key),
+            timeout=(5, 15),
+            session=session,
+        )
         if response.status_code != 200:
             return []
 
@@ -7103,13 +7606,25 @@ class VideoPipeline:
 
         return self._stable_rotate_candidates(candidates, seed=f"vecteezy:{query.lower()}")
 
-    def _search_vecteezy_images(self, account_id: str, api_key: str, query: str) -> list[AssetCandidate]:
+    def _search_vecteezy_images(
+        self,
+        account_id: str,
+        api_key: str,
+        query: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> list[AssetCandidate]:
         url = (
             f"https://api.vecteezy.com/v2/{quote_plus(account_id)}/resources"
             f"?term={quote_plus(query)}&content_type=photo&license_type=commercial"
             "&orientation=horizontal&family_friendly=true&sort_by=relevance&per_page=20"
         )
-        response = self.http.get(url, headers=self._vecteezy_headers(api_key), timeout=(5, 15))
+        response = self._http_get_with_retries(
+            url,
+            headers=self._vecteezy_headers(api_key),
+            timeout=(5, 15),
+            session=session,
+        )
         if response.status_code != 200:
             return []
 
@@ -7241,53 +7756,54 @@ class VideoPipeline:
         return self._coerce_optional_int(hour_payload.get("request_count")) or 0
 
     def _record_coverr_request_event(self, *, endpoint: str, query: str | None = None) -> None:
-        subject = self._coverr_usage_subject()
-        payload = self._load_coverr_usage_ledger()
-        apps = payload.setdefault("apps", {})
-        if not isinstance(apps, dict):
-            payload["apps"] = {}
-            apps = payload["apps"]
+        with self._provider_usage_lock:
+            subject = self._coverr_usage_subject()
+            payload = self._load_coverr_usage_ledger()
+            apps = payload.setdefault("apps", {})
+            if not isinstance(apps, dict):
+                payload["apps"] = {}
+                apps = payload["apps"]
 
-        app_payload = apps.setdefault(subject, {})
-        if not isinstance(app_payload, dict):
-            app_payload = {}
-            apps[subject] = app_payload
+            app_payload = apps.setdefault(subject, {})
+            if not isinstance(app_payload, dict):
+                app_payload = {}
+                apps[subject] = app_payload
 
-        hours = app_payload.setdefault("hours", {})
-        if not isinstance(hours, dict):
-            app_payload["hours"] = {}
-            hours = app_payload["hours"]
+            hours = app_payload.setdefault("hours", {})
+            if not isinstance(hours, dict):
+                app_payload["hours"] = {}
+                hours = app_payload["hours"]
 
-        hour_key = self._current_hour_key()
-        hour_payload = hours.setdefault(hour_key, {})
-        if not isinstance(hour_payload, dict):
-            hour_payload = {}
-            hours[hour_key] = hour_payload
+            hour_key = self._current_hour_key()
+            hour_payload = hours.setdefault(hour_key, {})
+            if not isinstance(hour_payload, dict):
+                hour_payload = {}
+                hours[hour_key] = hour_payload
 
-        events = hour_payload.setdefault("events", [])
-        if not isinstance(events, list):
-            hour_payload["events"] = []
-            events = hour_payload["events"]
+            events = hour_payload.setdefault("events", [])
+            if not isinstance(events, list):
+                hour_payload["events"] = []
+                events = hour_payload["events"]
 
-        events.append(
-            {
-                "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                "project_id": self.config.project_dir.name,
-                "endpoint": endpoint,
-                "query": self._coerce_str_or_none(query),
-            }
-        )
-        hour_payload["request_count"] = len(events)
-        self._save_coverr_usage_ledger(payload)
+            events.append(
+                {
+                    "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "project_id": self.config.project_dir.name,
+                    "endpoint": endpoint,
+                    "query": self._coerce_str_or_none(query),
+                }
+            )
+            hour_payload["request_count"] = len(events)
+            self._save_coverr_usage_ledger(payload)
 
-        self._coverr_requests_this_run += 1
-        if isinstance(self._coverr_usage_state, dict):
-            local_count = self._coerce_optional_int(self._coverr_usage_state.get("local_hour_request_count")) or 0
-            self._coverr_usage_state["local_hour_request_count"] = local_count + 1
-            self._coverr_usage_state["requests_this_run"] = int(self._coverr_requests_this_run)
-            remaining = self._coerce_optional_int(self._coverr_usage_state.get("estimated_remaining_requests"))
-            if remaining is not None:
-                self._coverr_usage_state["estimated_remaining_requests"] = max(0, remaining - 1)
+            self._coverr_requests_this_run += 1
+            if isinstance(self._coverr_usage_state, dict):
+                local_count = self._coerce_optional_int(self._coverr_usage_state.get("local_hour_request_count")) or 0
+                self._coverr_usage_state["local_hour_request_count"] = local_count + 1
+                self._coverr_usage_state["requests_this_run"] = int(self._coverr_requests_this_run)
+                remaining = self._coerce_optional_int(self._coverr_usage_state.get("estimated_remaining_requests"))
+                if remaining is not None:
+                    self._coverr_usage_state["estimated_remaining_requests"] = max(0, remaining - 1)
 
     def _refresh_coverr_usage_state(self) -> dict[str, Any]:
         subject = self._coverr_usage_subject()
@@ -7309,19 +7825,20 @@ class VideoPipeline:
         return snapshot
 
     def _coverr_estimated_remaining_requests(self) -> int | None:
-        if self._coverr_usage_state is None:
-            self._refresh_coverr_usage_state()
+        with self._provider_usage_lock:
+            if self._coverr_usage_state is None:
+                self._refresh_coverr_usage_state()
 
-        if not isinstance(self._coverr_usage_state, dict):
-            return None
+            if not isinstance(self._coverr_usage_state, dict):
+                return None
 
-        remaining = self._coverr_usage_state.get("estimated_remaining_requests")
-        if remaining is None:
-            return None
-        try:
-            return int(remaining)
-        except (TypeError, ValueError):
-            return None
+            remaining = self._coverr_usage_state.get("estimated_remaining_requests")
+            if remaining is None:
+                return None
+            try:
+                return int(remaining)
+            except (TypeError, ValueError):
+                return None
 
     def _vecteezy_headers(self, api_key: str) -> dict[str, str]:
         return {
@@ -7374,47 +7891,48 @@ class VideoPipeline:
         return self._coerce_optional_int(month_payload.get("download_count")) or 0
 
     def _record_vecteezy_download_event(self, asset_id: str, source_url: str | None) -> None:
-        account_id = self._coerce_str_or_none(self.config.vecteezy_account_id)
-        if not account_id:
-            return
+        with self._provider_usage_lock:
+            account_id = self._coerce_str_or_none(self.config.vecteezy_account_id)
+            if not account_id:
+                return
 
-        payload = self._load_vecteezy_usage_ledger()
-        accounts = payload.setdefault("accounts", {})
-        if not isinstance(accounts, dict):
-            payload["accounts"] = {}
-            accounts = payload["accounts"]
+            payload = self._load_vecteezy_usage_ledger()
+            accounts = payload.setdefault("accounts", {})
+            if not isinstance(accounts, dict):
+                payload["accounts"] = {}
+                accounts = payload["accounts"]
 
-        account_payload = accounts.setdefault(account_id, {})
-        if not isinstance(account_payload, dict):
-            account_payload = {}
-            accounts[account_id] = account_payload
+            account_payload = accounts.setdefault(account_id, {})
+            if not isinstance(account_payload, dict):
+                account_payload = {}
+                accounts[account_id] = account_payload
 
-        months = account_payload.setdefault("months", {})
-        if not isinstance(months, dict):
-            account_payload["months"] = {}
-            months = account_payload["months"]
+            months = account_payload.setdefault("months", {})
+            if not isinstance(months, dict):
+                account_payload["months"] = {}
+                months = account_payload["months"]
 
-        month_key = self._current_month_key()
-        month_payload = months.setdefault(month_key, {})
-        if not isinstance(month_payload, dict):
-            month_payload = {}
-            months[month_key] = month_payload
+            month_key = self._current_month_key()
+            month_payload = months.setdefault(month_key, {})
+            if not isinstance(month_payload, dict):
+                month_payload = {}
+                months[month_key] = month_payload
 
-        events = month_payload.setdefault("events", [])
-        if not isinstance(events, list):
-            month_payload["events"] = []
-            events = month_payload["events"]
+            events = month_payload.setdefault("events", [])
+            if not isinstance(events, list):
+                month_payload["events"] = []
+                events = month_payload["events"]
 
-        events.append(
-            {
-                "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                "project_id": self.config.project_dir.name,
-                "asset_id": asset_id,
-                "source_url": source_url or "",
-            }
-        )
-        month_payload["download_count"] = len(events)
-        self._save_vecteezy_usage_ledger(payload)
+            events.append(
+                {
+                    "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "project_id": self.config.project_dir.name,
+                    "asset_id": asset_id,
+                    "source_url": source_url or "",
+                }
+            )
+            month_payload["download_count"] = len(events)
+            self._save_vecteezy_usage_ledger(payload)
 
     def _fetch_vecteezy_account_info(self, account_id: str, api_key: str) -> dict[str, Any]:
         url = f"https://api.vecteezy.com/v2/{quote_plus(account_id)}/account/info"
@@ -7481,19 +7999,20 @@ class VideoPipeline:
         return snapshot
 
     def _vecteezy_estimated_remaining_downloads(self) -> int | None:
-        if self._vecteezy_usage_state is None:
-            self._refresh_vecteezy_usage_state()
+        with self._provider_usage_lock:
+            if self._vecteezy_usage_state is None:
+                self._refresh_vecteezy_usage_state()
 
-        if not isinstance(self._vecteezy_usage_state, dict):
-            return None
+            if not isinstance(self._vecteezy_usage_state, dict):
+                return None
 
-        remaining = self._vecteezy_usage_state.get("estimated_remaining_downloads")
-        if remaining is None:
-            return None
-        try:
-            return int(remaining)
-        except (TypeError, ValueError):
-            return None
+            remaining = self._vecteezy_usage_state.get("estimated_remaining_downloads")
+            if remaining is None:
+                return None
+            try:
+                return int(remaining)
+            except (TypeError, ValueError):
+                return None
 
     def _merge_restriction_flags(self, existing_flags: list[str], extra_flags: list[str]) -> list[str]:
         merged: list[str] = []
@@ -7525,22 +8044,33 @@ class VideoPipeline:
         cache_path = self._candidate_cache_path(candidate)
         return cache_path.exists() and cache_path.stat().st_size > 0
 
-    def _download_candidate_asset(self, candidate: AssetCandidate) -> tuple[Path, AssetCandidate]:
+    def _download_candidate_asset(
+        self,
+        candidate: AssetCandidate,
+        *,
+        session: requests.Session | None = None,
+    ) -> tuple[Path, AssetCandidate]:
         if self._candidate_is_cached(candidate):
             return self._candidate_cache_path(candidate), candidate
 
         if candidate.source_platform == "vecteezy":
-            download_url, resolved_candidate = self._resolve_vecteezy_download(candidate)
+            download_url, resolved_candidate = self._resolve_vecteezy_download(candidate, session=session)
             local_path = self._download_asset(
                 download_url,
                 cache_key=self._candidate_cache_key(resolved_candidate),
                 suffix_hint=resolved_candidate.download_extension,
+                session=session,
             )
             return local_path, resolved_candidate
 
-        return self._download_asset(candidate.download_url), candidate
+        return self._download_asset(candidate.download_url, session=session), candidate
 
-    def _resolve_vecteezy_download(self, candidate: AssetCandidate) -> tuple[str, AssetCandidate]:
+    def _resolve_vecteezy_download(
+        self,
+        candidate: AssetCandidate,
+        *,
+        session: requests.Session | None = None,
+    ) -> tuple[str, AssetCandidate]:
         account_id = self._coerce_str_or_none(self.config.vecteezy_account_id)
         api_key = self._coerce_str_or_none(self.config.vecteezy_api_key)
         asset_id = self._coerce_str_or_none(candidate.source_asset_id)
@@ -7552,7 +8082,12 @@ class VideoPipeline:
         if file_extension:
             url += f"?file_type={quote_plus(file_extension)}"
 
-        response = self.http.get(url, headers=self._vecteezy_headers(api_key), timeout=(5, 20))
+        response = self._http_get_with_retries(
+            url,
+            headers=self._vecteezy_headers(api_key),
+            timeout=(5, 20),
+            session=session,
+        )
         if response.status_code == 402:
             raise RuntimeError("Vecteezy monthly download quota exceeded")
         if response.status_code != 200:
@@ -7565,7 +8100,7 @@ class VideoPipeline:
         download_url = self._coerce_str_or_none(payload.get("url")) or self._coerce_str_or_none(payload.get("inline_url"))
         download_status_url = self._coerce_str_or_none(payload.get("download_status_url"))
         if not download_url and download_status_url:
-            download_url = self._poll_vecteezy_download_status(download_status_url, api_key)
+            download_url = self._poll_vecteezy_download_status(download_status_url, api_key, session=session)
         if not download_url:
             raise RuntimeError("Vecteezy download response did not include a usable URL")
 
@@ -7594,19 +8129,27 @@ class VideoPipeline:
             ),
         )
         self._record_vecteezy_download_event(asset_id, resolved_candidate.source_url)
-        self._vecteezy_downloads_this_run += 1
-        if isinstance(self._vecteezy_usage_state, dict):
-            current_tracked = self._coerce_optional_int(self._vecteezy_usage_state.get("tracked_download_count")) or 0
-            self._vecteezy_usage_state["tracked_download_count"] = current_tracked + 1
-            self._vecteezy_usage_state["downloads_this_run"] = int(self._vecteezy_downloads_this_run)
-            remaining = self._coerce_optional_int(self._vecteezy_usage_state.get("estimated_remaining_downloads"))
-            if remaining is not None:
-                self._vecteezy_usage_state["estimated_remaining_downloads"] = max(0, remaining - 1)
+        with self._provider_usage_lock:
+            self._vecteezy_downloads_this_run += 1
+            if isinstance(self._vecteezy_usage_state, dict):
+                current_tracked = self._coerce_optional_int(self._vecteezy_usage_state.get("tracked_download_count")) or 0
+                self._vecteezy_usage_state["tracked_download_count"] = current_tracked + 1
+                self._vecteezy_usage_state["downloads_this_run"] = int(self._vecteezy_downloads_this_run)
+                remaining = self._coerce_optional_int(self._vecteezy_usage_state.get("estimated_remaining_downloads"))
+                if remaining is not None:
+                    self._vecteezy_usage_state["estimated_remaining_downloads"] = max(0, remaining - 1)
         return download_url, resolved_candidate
 
-    def _poll_vecteezy_download_status(self, status_url: str, api_key: str) -> str:
+    def _poll_vecteezy_download_status(
+        self,
+        status_url: str,
+        api_key: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> str:
+        active_session = session or self.http
         for _ in range(12):
-            response = self.http.get(status_url, headers=self._vecteezy_headers(api_key), timeout=(5, 20))
+            response = active_session.get(status_url, headers=self._vecteezy_headers(api_key), timeout=(5, 20))
             if response.status_code != 200:
                 raise RuntimeError(f"Vecteezy download status failed, status={response.status_code}")
             payload = response.json()
@@ -7717,22 +8260,50 @@ class VideoPipeline:
         *,
         cache_key: str | None = None,
         suffix_hint: str | None = None,
+        session: requests.Session | None = None,
     ) -> Path:
         output = self._asset_cache_path(url, cache_key=cache_key, suffix_hint=suffix_hint)
         if output.exists() and output.stat().st_size > 0:
             return output
 
-        with self.http.get(url, stream=True, timeout=(8, 20)) as response:
-            if response.status_code != 200:
-                raise RuntimeError(f"Failed to download asset, status={response.status_code}")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        active_session = session or self.http
+        cache_lock = self._asset_cache_lock(output)
+        with cache_lock:
+            if output.exists() and output.stat().st_size > 0:
+                return output
+            if output.exists():
+                try:
+                    output.unlink()
+                except FileNotFoundError:
+                    pass
 
-            with output.open("wb") as handle:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        handle.write(chunk)
+            temp_output = output.with_name(f".{output.name}.part-{os.getpid()}-{threading.get_ident()}")
+            try:
+                if temp_output.exists():
+                    temp_output.unlink()
 
-        if output.stat().st_size == 0:
-            raise RuntimeError("Downloaded asset is empty")
+                try:
+                    with active_session.get(url, stream=True, timeout=(8, 20)) as response:
+                        if response.status_code != 200:
+                            raise RuntimeError(f"Failed to download asset, status={response.status_code}")
+
+                        with temp_output.open("wb") as handle:
+                            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                                if chunk:
+                                    handle.write(chunk)
+                except requests.exceptions.RequestException as exc:
+                    raise RuntimeError(f"Failed to download asset from {url}: {exc}") from exc
+
+                if not temp_output.exists() or temp_output.stat().st_size == 0:
+                    raise RuntimeError("Downloaded asset is empty")
+                temp_output.replace(output)
+            finally:
+                if temp_output.exists():
+                    try:
+                        temp_output.unlink()
+                    except FileNotFoundError:
+                        pass
         return output
 
     def _generate_captions(self, plan: ScriptPlan, narration_wav: Path) -> list[CaptionCue]:
@@ -7951,7 +8522,7 @@ class VideoPipeline:
         return stabilized
 
     def _tokenize_caption_text(self, text: str) -> list[str]:
-        return re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?|[.,!?;:]", text)
+        return re.findall(r"[^\W_]+(?:'[^\W_]+)?|[.,!?;:]", text)
 
     def _join_caption_tokens(self, tokens: list[str]) -> str:
         punctuation = {".", ",", "!", "?", ";", ":"}
@@ -8035,8 +8606,8 @@ class VideoPipeline:
         return max(0.02, min(0.2, float(self.config.caption_bottom_ratio)))
 
     def _caption_token_is_highlightable(self, token: str) -> bool:
-        candidate = re.sub(r"^[^A-Za-z0-9']+|[^A-Za-z0-9']+$", "", token).strip()
-        return bool(re.fullmatch(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", candidate))
+        candidate = re.sub(r"^[^\w']+|[^\w']+$", "", token).strip()
+        return bool(re.fullmatch(r"[^\W_]+(?:'[^\W_]+)?", candidate))
 
     def _subtitle_follow_intervals(
         self,
@@ -8199,6 +8770,7 @@ class VideoPipeline:
         lines = [
             "[Script Info]",
             "ScriptType: v4.00+",
+            "Encoding: UTF-8",
             f"PlayResX: {self.config.width}",
             f"PlayResY: {self.config.height}",
             "WrapStyle: 2",
@@ -8296,7 +8868,8 @@ class VideoPipeline:
     def _outro_bookend_seconds(self) -> float:
         if not self.config.include_outro:
             return 0.0
-        return max(0.0, float(self.config.outro_seconds))
+        spoken_duration = self._outro_spoken_audio_duration()
+        return max(0.0, float(self.config.outro_seconds), spoken_duration + 0.4)
 
     def _shift_captions(
         self,
@@ -8546,91 +9119,124 @@ class VideoPipeline:
         intro_seconds: float | None = None,
         outro_seconds: float | None = None,
         render_subdir: str = "render",
+        metrics_section: str = "render",
     ) -> None:
         render_dir = self.paths["tmp"] / render_subdir
         render_dir.mkdir(parents=True, exist_ok=True)
         subtitle_path = captions_ass_path or self.paths["captions_ass"]
         intro_pad = self._intro_bookend_seconds() if intro_seconds is None else max(0.0, float(intro_seconds))
         outro_pad = self._outro_bookend_seconds() if outro_seconds is None else max(0.0, float(outro_seconds))
+        self._set_optimization_value(metrics_section, "requested_video_encoder", self._preferred_video_encoder())
 
         render_audio = render_dir / "narration_with_bookends.wav"
-        self._build_render_audio_track(
-            narration_wav=narration_wav,
-            output_audio=render_audio,
-            intro_seconds=intro_pad,
-            outro_seconds=outro_pad,
-        )
-
-        clip_files: list[Path] = []
-        for idx, clip in enumerate(timeline):
-            clip_path = render_dir / f"clip_{idx:04d}.mp4"
-            self._render_single_clip(clip, clip_path, idx)
-            clip_files.append(clip_path)
-
-        concat_list = render_dir / "concat.txt"
-        concat_lines = [f"file '{path.resolve()}'" for path in clip_files]
-        self._write_text(concat_list, "\n".join(concat_lines) + "\n")
+        with self._timed_optimization_block(metrics_section, "build_audio_seconds"):
+            self._build_render_audio_track(
+                narration_wav=narration_wav,
+                output_audio=render_audio,
+                intro_seconds=intro_pad,
+                outro_seconds=outro_pad,
+            )
 
         visuals_mp4 = render_dir / "visuals.mp4"
-        concat = self._run_command(
-            [
-                "ffmpeg",
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                str(concat_list),
-                "-c:v",
-                "libx264",
-                "-preset",
-                "slow",
-                "-crf",
-                "18",
-                "-pix_fmt",
-                "yuv420p",
-                "-an",
-                str(visuals_mp4),
-            ],
-            timeout=3600,
-            check=False,
-        )
-        if concat.returncode != 0:
-            raise RuntimeError(f"Failed to concat clips: {concat.stderr.strip()}")
+        single_clip_fast_path = len(timeline) == 1 and intro_pad <= 0.0 and outro_pad <= 0.0
+        self._set_optimization_value(metrics_section, "single_clip_fast_path", bool(single_clip_fast_path))
 
-        mixed_mp4 = render_dir / "master_with_audio.mp4"
-        mux = self._run_command(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(visuals_mp4),
-                "-i",
-                str(render_audio),
-                "-map",
-                "0:v:0",
-                "-map",
-                "1:a:0",
-                "-c:v",
-                "copy",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                "-shortest",
-                str(mixed_mp4),
-            ],
-            timeout=1200,
-            check=False,
-        )
-        if mux.returncode != 0:
-            raise RuntimeError(f"Failed to mux narration and video: {mux.stderr.strip()}")
+        if single_clip_fast_path:
+            self._set_optimization_value(metrics_section, "clip_render_workers", 1)
+            with self._timed_optimization_block(metrics_section, "clip_render_seconds"):
+                self._render_single_clip(timeline[0], visuals_mp4, 0, metrics_section=metrics_section)
+            self._increment_optimization_counter(metrics_section, "rendered_clip_count", amount=1)
+        else:
+            clip_files: list[Path] = [render_dir / f"clip_{idx:04d}.mp4" for idx in range(len(timeline))]
+            clip_workers = min(4, max(1, (os.cpu_count() or 2) // 2), len(timeline))
+            self._set_optimization_value(metrics_section, "clip_render_workers", clip_workers)
+
+            def render_clip_task(index: int, clip: TimelineClip, clip_path: Path) -> tuple[int, float]:
+                started_at = time.perf_counter()
+                self._render_single_clip(clip, clip_path, index, metrics_section=metrics_section)
+                return index, time.perf_counter() - started_at
+
+            if clip_workers == 1:
+                results = [render_clip_task(idx, clip, clip_files[idx]) for idx, clip in enumerate(timeline)]
+            else:
+                with ThreadPoolExecutor(max_workers=clip_workers) as executor:
+                    futures = [
+                        executor.submit(render_clip_task, idx, clip, clip_files[idx])
+                        for idx, clip in enumerate(timeline)
+                    ]
+                results = [future.result() for future in futures]
+
+            for _, elapsed_seconds in results:
+                self._record_optimization_time(metrics_section, "clip_render_seconds", elapsed_seconds)
+            self._increment_optimization_counter(metrics_section, "rendered_clip_count", amount=len(clip_files))
+
+            concat_list = render_dir / "concat.txt"
+            concat_lines = [f"file '{path.resolve()}'" for path in clip_files]
+            self._write_text(concat_list, "\n".join(concat_lines) + "\n")
+
+            with self._timed_optimization_block(metrics_section, "concat_seconds"):
+                concat = self._run_ffmpeg_video_command(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-f",
+                        "concat",
+                        "-safe",
+                        "0",
+                        "-i",
+                        str(concat_list),
+                        *self._video_encode_args(preset="slow", crf=18),
+                        "-an",
+                        str(visuals_mp4),
+                    ],
+                    timeout=3600,
+                    preset="slow",
+                    crf=18,
+                    metrics_section=metrics_section,
+                )
+            if concat.returncode != 0:
+                raise RuntimeError(f"Failed to concat clips: {concat.stderr.strip()}")
 
         if self.config.burn_subtitles and subtitle_path.exists():
-            self._burn_subtitles(mixed_mp4, subtitle_path, final_mp4)
-        else:
-            shutil.copy2(mixed_mp4, final_mp4)
+            self._burn_subtitles(
+                visuals_mp4,
+                subtitle_path,
+                final_mp4,
+                audio_input=render_audio,
+                metrics_section=metrics_section,
+            )
+            return
+
+        if self.config.burn_subtitles and not subtitle_path.exists():
+            self._warn("Subtitle burn-in skipped because captions.ass is missing or empty.")
+
+        with self._timed_optimization_block(metrics_section, "mux_seconds"):
+            mux = self._run_command(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(visuals_mp4),
+                    "-i",
+                    str(render_audio),
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-shortest",
+                    str(final_mp4),
+                ],
+                timeout=1200,
+                check=False,
+            )
+        if mux.returncode != 0:
+            raise RuntimeError(f"Failed to mux narration and video: {mux.stderr.strip()}")
 
     def _resolve_optional_input_path(self, raw_path: str | None, *, purpose: str) -> Path | None:
         if not raw_path:
@@ -8982,7 +9588,14 @@ class VideoPipeline:
         )
         return f"{base_vf},{overlay}"
 
-    def _render_single_clip(self, clip: TimelineClip, output_clip: Path, index: int) -> None:
+    def _render_single_clip(
+        self,
+        clip: TimelineClip,
+        output_clip: Path,
+        index: int,
+        *,
+        metrics_section: str = "render",
+    ) -> None:
         duration = max(0.3, clip.seconds)
         if clip.scene_id == "__intro":
             include_text = True
@@ -8994,7 +9607,13 @@ class VideoPipeline:
                 logo_image=self._bookend_logo_overlay,
                 include_text=include_text,
             )
-            result = self._run_command(command, timeout=900, check=False)
+            result = self._run_ffmpeg_video_command(
+                command,
+                timeout=900,
+                preset="medium",
+                crf=20,
+                metrics_section=metrics_section,
+            )
             if result.returncode != 0 and self._is_drawtext_missing_error(result.stderr):
                 self._ffmpeg_drawtext_available = False
                 raise RuntimeError(
@@ -9015,7 +9634,13 @@ class VideoPipeline:
                 logo_image=self._bookend_logo_overlay,
                 include_text=include_text,
             )
-            result = self._run_command(command, timeout=900, check=False)
+            result = self._run_ffmpeg_video_command(
+                command,
+                timeout=900,
+                preset="medium",
+                crf=20,
+                metrics_section=metrics_section,
+            )
             if result.returncode != 0 and self._is_drawtext_missing_error(result.stderr):
                 self._ffmpeg_drawtext_available = False
                 raise RuntimeError(
@@ -9028,7 +9653,13 @@ class VideoPipeline:
 
         if clip.scene_id == "__tail":
             command = self._tail_hold_clip_command(output_clip=output_clip, duration=duration)
-            result = self._run_command(command, timeout=900, check=False)
+            result = self._run_ffmpeg_video_command(
+                command,
+                timeout=900,
+                preset="medium",
+                crf=20,
+                metrics_section=metrics_section,
+            )
             if result.returncode != 0:
                 raise RuntimeError(f"Failed to render tail hold clip: {result.stderr.strip()}")
             return
@@ -9104,14 +9735,7 @@ class VideoPipeline:
                         "-vf",
                         vf_primary,
                         "-an",
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "medium",
-                        "-crf",
-                        "20",
-                        "-pix_fmt",
-                        "yuv420p",
+                        *self._video_encode_args(preset="medium", crf=20),
                         str(output_clip),
                     ]
                     fallback = [*command]
@@ -9134,14 +9758,7 @@ class VideoPipeline:
                         "-vf",
                         vf_retry,
                         "-an",
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "medium",
-                        "-crf",
-                        "20",
-                        "-pix_fmt",
-                        "yuv420p",
+                        *self._video_encode_args(preset="medium", crf=20),
                         str(output_clip),
                     ]
                     montage_paths = self._scene_montage_image_paths(clip.scene_id, source)
@@ -9162,14 +9779,7 @@ class VideoPipeline:
                             "-vf",
                             vf_primary,
                             "-an",
-                            "-c:v",
-                            "libx264",
-                            "-preset",
-                            "medium",
-                            "-crf",
-                            "20",
-                            "-pix_fmt",
-                            "yuv420p",
+                            *self._video_encode_args(preset="medium", crf=20),
                             str(output_clip),
                         ]
                 else:
@@ -9199,14 +9809,7 @@ class VideoPipeline:
                     "-vf",
                     vf_retry,
                     "-an",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "medium",
-                    "-crf",
-                    "20",
-                    "-pix_fmt",
-                    "yuv420p",
+                    *self._video_encode_args(preset="medium", crf=20),
                     str(output_clip),
                 ]
                 montage_paths = self._scene_montage_image_paths(clip.scene_id, source)
@@ -9227,14 +9830,7 @@ class VideoPipeline:
                         "-vf",
                         vf_primary,
                         "-an",
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "medium",
-                        "-crf",
-                        "20",
-                        "-pix_fmt",
-                        "yuv420p",
+                        *self._video_encode_args(preset="medium", crf=20),
                         str(output_clip),
                     ]
             else:
@@ -9256,13 +9852,25 @@ class VideoPipeline:
             command = self._placeholder_clip_command(output_clip, duration, index, vf_primary)
             fallback = self._placeholder_clip_command(output_clip, duration, index, vf_fallback)
 
-        result = self._run_command(command, timeout=900, check=False)
+        result = self._run_ffmpeg_video_command(
+            command,
+            timeout=900,
+            preset="medium",
+            crf=20,
+            metrics_section=metrics_section,
+        )
         if result.returncode != 0:
             self._warn(
                 f"Primary visual filter failed for {clip.scene_id}; retrying simplified filter. "
                 f"Details: {result.stderr.strip()}"
             )
-            result = self._run_command(fallback, timeout=900, check=False)
+            result = self._run_ffmpeg_video_command(
+                fallback,
+                timeout=900,
+                preset="medium",
+                crf=20,
+                metrics_section=metrics_section,
+            )
         if result.returncode != 0:
             raise RuntimeError(f"Failed to render clip {clip.scene_id}: {result.stderr.strip()}")
 
@@ -9287,14 +9895,7 @@ class VideoPipeline:
                 f"fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f}"
             ),
             "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
+            *self._video_encode_args(preset="medium", crf=20),
             str(output_clip),
         ]
 
@@ -9418,14 +10019,7 @@ class VideoPipeline:
                 "-map",
                 "[v]",
                 "-an",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "20",
-                "-pix_fmt",
-                "yuv420p",
+                *self._video_encode_args(preset="medium", crf=20),
                 str(output_clip),
             ]
 
@@ -9523,14 +10117,7 @@ class VideoPipeline:
                 "-map",
                 "[v]",
                 "-an",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "20",
-                "-pix_fmt",
-                "yuv420p",
+                *self._video_encode_args(preset="medium", crf=20),
                 str(output_clip),
             ]
 
@@ -9575,14 +10162,7 @@ class VideoPipeline:
                 f"fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f}"
             ),
             "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
+            *self._video_encode_args(preset="medium", crf=20),
             str(output_clip),
         ]
 
@@ -9754,14 +10334,7 @@ class VideoPipeline:
                 "-map",
                 "[v]",
                 "-an",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "20",
-                "-pix_fmt",
-                "yuv420p",
+                *self._video_encode_args(preset="medium", crf=20),
                 str(output_clip),
             ]
 
@@ -9869,14 +10442,7 @@ class VideoPipeline:
                 "-map",
                 "[v]",
                 "-an",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "20",
-                "-pix_fmt",
-                "yuv420p",
+                *self._video_encode_args(preset="medium", crf=20),
                 str(output_clip),
             ]
 
@@ -9921,14 +10487,7 @@ class VideoPipeline:
                 f"fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f}"
             ),
             "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
+            *self._video_encode_args(preset="medium", crf=20),
             str(output_clip),
         ]
 
@@ -9937,6 +10496,134 @@ class VideoPipeline:
         if style not in {"minimal-clean", "cinematic-subtle", "brand-image-motion", "corner-fade"}:
             return "minimal-clean"
         return style
+
+    def _preferred_video_encoder(self) -> str:
+        if self._hw_encoder_checked:
+            return self._hw_encoder or "libx264"
+
+        self._hw_encoder_checked = True
+        self._hw_encoder = None
+        if sys.platform != "darwin":
+            return "libx264"
+
+        result = self._run_command(["ffmpeg", "-hide_banner", "-encoders"], timeout=30, check=False)
+        catalog = f"{result.stdout}\n{result.stderr}".lower()
+        if re.search(r"\bh264_videotoolbox\b", catalog):
+            self._hw_encoder = "h264_videotoolbox"
+        return self._hw_encoder or "libx264"
+
+    def _target_video_bitrate_kbps(self, *, crf: int) -> int:
+        pixels = int(self.config.width) * int(self.config.height)
+        if pixels <= (640 * 360):
+            bitrate = 2500
+        elif pixels <= (1280 * 720):
+            bitrate = 5000
+        elif pixels <= (1920 * 1080):
+            bitrate = 8000
+        else:
+            bitrate = 12000
+
+        if crf <= 18:
+            bitrate = int(bitrate * 1.2)
+        elif crf >= 22:
+            bitrate = int(bitrate * 0.85)
+        return max(1500, bitrate)
+
+    def _libx264_encode_args(self, *, preset: str, crf: int) -> list[str]:
+        return [
+            "-c:v",
+            "libx264",
+            "-preset",
+            str(preset),
+            "-crf",
+            str(crf),
+            "-pix_fmt",
+            "yuv420p",
+        ]
+
+    def _video_encode_args(
+        self,
+        *,
+        preset: str,
+        crf: int,
+        encoder: str | None = None,
+    ) -> list[str]:
+        selected_encoder = str(encoder or self._preferred_video_encoder() or "libx264").strip().lower()
+        if selected_encoder == "h264_videotoolbox":
+            bitrate_kbps = self._target_video_bitrate_kbps(crf=crf)
+            return [
+                "-c:v",
+                "h264_videotoolbox",
+                "-allow_sw",
+                "1",
+                "-b:v",
+                f"{bitrate_kbps}k",
+                "-pix_fmt",
+                "yuv420p",
+            ]
+        return self._libx264_encode_args(preset=preset, crf=crf)
+
+    def _replace_video_encode_args(
+        self,
+        command: list[str],
+        *,
+        preset: str,
+        crf: int,
+        encoder: str,
+    ) -> list[str]:
+        if "-c:v" not in command or "-pix_fmt" not in command:
+            return list(command)
+
+        c_index = command.index("-c:v")
+        pix_index = command.index("-pix_fmt", c_index)
+        end_index = min(len(command), pix_index + 2)
+        return [
+            *command[:c_index],
+            *self._video_encode_args(preset=preset, crf=crf, encoder=encoder),
+            *command[end_index:],
+        ]
+
+    def _run_ffmpeg_video_command(
+        self,
+        command: list[str],
+        *,
+        timeout: int,
+        preset: str,
+        crf: int,
+        metrics_section: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        result = self._run_command(command, timeout=timeout, check=False)
+        if result.returncode == 0:
+            return result
+
+        preferred_encoder = self._preferred_video_encoder()
+        if preferred_encoder == "libx264":
+            return result
+        if "-c:v" not in command:
+            return result
+
+        encoder_index = command.index("-c:v") + 1
+        current_encoder = str(command[encoder_index]).strip().lower() if encoder_index < len(command) else ""
+        if current_encoder != preferred_encoder:
+            return result
+
+        fallback_command = self._replace_video_encode_args(
+            command,
+            preset=preset,
+            crf=crf,
+            encoder="libx264",
+        )
+        fallback_result = self._run_command(fallback_command, timeout=timeout, check=False)
+        if fallback_result.returncode == 0:
+            if metrics_section:
+                self._increment_optimization_counter(metrics_section, "hw_encoder_fallbacks")
+                self._set_optimization_value(metrics_section, "video_encoder_fallback", "libx264")
+            self._log(
+                f"Video encode fallback triggered for {metrics_section or 'render'}; "
+                f"retrying {preferred_encoder} output with libx264."
+            )
+            return fallback_result
+        return fallback_result
 
     def _ffmpeg_supports_drawtext(self) -> bool:
         cached = self._ffmpeg_drawtext_available
@@ -10107,18 +10794,19 @@ class VideoPipeline:
             "-vf",
             f"hue=h={hue_shift}:s=0.45,{vf}",
             "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
+            *self._video_encode_args(preset="medium", crf=20),
             str(output_clip),
         ]
 
-    def _burn_subtitles(self, input_mp4: Path, subtitles_ass: Path, output_mp4: Path) -> None:
+    def _burn_subtitles(
+        self,
+        input_mp4: Path,
+        subtitles_ass: Path,
+        output_mp4: Path,
+        *,
+        audio_input: Path | None = None,
+        metrics_section: str = "render",
+    ) -> None:
         if not subtitles_ass.exists() or subtitles_ass.stat().st_size == 0:
             self._warn("Subtitle burn-in skipped because captions.ass is missing or empty.")
             shutil.copy2(input_mp4, output_mp4)
@@ -10131,26 +10819,29 @@ class VideoPipeline:
             )
 
         filter_value = self._ffmpeg_subtitles_filter(subtitles_ass)
-        command = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(input_mp4),
-            "-vf",
-            filter_value,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "18",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "copy",
-            str(output_mp4),
-        ]
-        result = self._run_command(command, timeout=2400, check=False)
+        command = ["ffmpeg", "-y", "-i", str(input_mp4)]
+        if audio_input is not None:
+            command.extend(["-i", str(audio_input), "-map", "0:v:0", "-map", "1:a:0"])
+        command.extend(
+            [
+                "-vf",
+                filter_value,
+                *self._video_encode_args(preset="medium", crf=18),
+                "-c:a",
+                "aac" if audio_input is not None else "copy",
+            ]
+        )
+        if audio_input is not None:
+            command.extend(["-b:a", "192k", "-shortest"])
+        command.append(str(output_mp4))
+        with self._timed_optimization_block(metrics_section, "subtitle_burn_seconds"):
+            result = self._run_ffmpeg_video_command(
+                command,
+                timeout=2400,
+                preset="medium",
+                crf=18,
+                metrics_section=metrics_section,
+            )
         if result.returncode != 0:
             lowered = (result.stderr or "").lower()
             if "no such filter" in lowered and "subtitles" in lowered:
@@ -10160,7 +10851,36 @@ class VideoPipeline:
                     "Install an ffmpeg build with libass/subtitles support or disable burned subtitles."
                 )
             self._warn(f"Subtitle burn-in failed; shipping video without burned subtitles. Details: {result.stderr.strip()}")
-            shutil.copy2(input_mp4, output_mp4)
+            if audio_input is None:
+                shutil.copy2(input_mp4, output_mp4)
+                return
+
+            mux = self._run_command(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(input_mp4),
+                    "-i",
+                    str(audio_input),
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-shortest",
+                    str(output_mp4),
+                ],
+                timeout=1200,
+                check=False,
+            )
+            if mux.returncode != 0:
+                raise RuntimeError(f"Failed to mux narration and video after subtitle fallback: {mux.stderr.strip()}")
 
     def _ffmpeg_subtitles_filter(self, subtitles_ass: Path) -> str:
         value = str(subtitles_ass.resolve())
@@ -10401,6 +11121,7 @@ class VideoPipeline:
                 "intro_seconds": self.config.intro_seconds,
                 "outro_seconds": self.config.outro_seconds,
                 "outro_text": self.config.outro_text,
+                "outro_spoken_text": self.config.outro_spoken_text,
                 "channel_name": self.config.channel_name,
                 "intro_tagline": self.config.intro_tagline,
                 "outro_tagline": self.config.outro_tagline,
@@ -10582,6 +11303,57 @@ class VideoPipeline:
         self.stage_times[key] = round(elapsed, 3)
         self._log(f"{key} completed in {elapsed:.2f}s")
         return result
+
+    def _optimization_section(self, key: str) -> dict[str, Any]:
+        with self._stats_lock:
+            section = self.optimization_stats.get(key)
+            if isinstance(section, dict):
+                return section
+            section = {}
+            self.optimization_stats[key] = section
+            return section
+
+    def _increment_optimization_counter(self, section: str, key: str, amount: int = 1) -> None:
+        with self._stats_lock:
+            bucket = self.optimization_stats.get(section)
+            if not isinstance(bucket, dict):
+                bucket = {}
+                self.optimization_stats[section] = bucket
+            current = bucket.get(key)
+            try:
+                base = int(current)
+            except (TypeError, ValueError):
+                base = 0
+            bucket[key] = base + int(amount)
+
+    def _record_optimization_time(self, section: str, key: str, elapsed: float) -> None:
+        with self._stats_lock:
+            bucket = self.optimization_stats.get(section)
+            if not isinstance(bucket, dict):
+                bucket = {}
+                self.optimization_stats[section] = bucket
+            current = bucket.get(key)
+            try:
+                base = float(current)
+            except (TypeError, ValueError):
+                base = 0.0
+            bucket[key] = round(base + max(0.0, float(elapsed)), 3)
+
+    def _set_optimization_value(self, section: str, key: str, value: Any) -> None:
+        with self._stats_lock:
+            bucket = self.optimization_stats.get(section)
+            if not isinstance(bucket, dict):
+                bucket = {}
+                self.optimization_stats[section] = bucket
+            bucket[key] = value
+
+    @contextmanager
+    def _timed_optimization_block(self, section: str, key: str) -> Any:
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._record_optimization_time(section, key, time.perf_counter() - started)
 
     def _update_pacing_post_tts(self, narration_text: str, audio_duration: float, adjust_passes: int) -> None:
         words = self._word_count_text(narration_text)
@@ -10776,14 +11548,7 @@ class VideoPipeline:
             "-map",
             f"[{current_label}]",
             "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
+            *self._video_encode_args(preset="medium", crf=20),
             str(output_clip),
         ]
 
@@ -11101,27 +11866,44 @@ class VideoPipeline:
         self._write_json(self.paths["run_report"], payload)
 
     def _media_duration(self, media_path: Path) -> float:
-        result = self._run_command(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                str(media_path),
-            ],
-            timeout=60,
-            check=False,
-        )
+        cache_key: tuple[str, int, int] | None = None
+        try:
+            resolved_path = media_path.expanduser().resolve()
+            stat = resolved_path.stat()
+            cache_key = (str(resolved_path), int(stat.st_size), int(stat.st_mtime_ns))
+        except OSError:
+            resolved_path = media_path
+
+        if cache_key is not None and cache_key in self._duration_cache:
+            self._increment_optimization_counter("media_probe", "cache_hits")
+            return self._duration_cache[cache_key]
+
+        self._increment_optimization_counter("media_probe", "cache_misses")
+        with self._timed_optimization_block("media_probe", "ffprobe_seconds"):
+            result = self._run_command(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(resolved_path),
+                ],
+                timeout=60,
+                check=False,
+            )
         if result.returncode != 0:
             raise RuntimeError(f"ffprobe failed: {result.stderr.strip()}")
 
         try:
-            return float((result.stdout or "0").strip())
+            duration = float((result.stdout or "0").strip())
         except ValueError as exc:
             raise RuntimeError("Could not parse media duration") from exc
+        if cache_key is not None:
+            self._duration_cache[cache_key] = duration
+        return duration
 
     def _tool_version(self, command: list[str]) -> str | None:
         if not command:
@@ -11228,18 +12010,21 @@ class VideoPipeline:
         self._log_with_level(message, level="INFO")
 
     def _warn(self, message: str) -> None:
-        self.warnings.append(message)
+        with self._warnings_lock:
+            self.warnings.append(message)
         self._log_with_level(message, level="WARN")
 
     def _log_with_level(self, message: str, level: str) -> None:
         timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
         line = f"{timestamp} [{level}] {message}"
         try:
-            self.paths["run_log"].parent.mkdir(parents=True, exist_ok=True)
-            with self.paths["run_log"].open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
+            with self._log_lock:
+                self.paths["run_log"].parent.mkdir(parents=True, exist_ok=True)
+                with self.paths["run_log"].open("a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
         except Exception:
             pass
 
         if self.config.verbose or level in {"WARN", "ERROR"}:
-            print(f"[local-video-mvp] {message}")
+            with self._log_lock:
+                print(f"[local-video-mvp] {message}")

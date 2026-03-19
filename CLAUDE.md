@@ -339,7 +339,7 @@ Then:
 - `ollama serve` (for script generation; TUI auto-starts if needed)
 - MeloTTS, Kokoro, Piper (for narration; install via `pip install -e '.[voice]'`)
 - faster-whisper (for caption quality pass; install via `pip install -e '.[captions]'`)
-- `mpv` (for terminal video playback in TUI)
+- `mpv` (for media preview playback in TUI)
 
 **Stock asset providers (API keys required for production runs):**
 - Pexels (primary)
