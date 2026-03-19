@@ -534,6 +534,7 @@ STRICT_SAFE_BLOCKING_FLAGS = {
 }
 
 COVERR_HOURLY_REQUEST_LIMIT = 50
+ASSET_QUERY_CACHE_TTL_SECONDS = 24 * 60 * 60
 
 FALLBACK_ONLY_ASSET_PROVIDERS = {"coverr", "vecteezy"}
 ASSET_MODE_CHOICES = {"prefer-video", "balanced", "prefer-images", "images-only"}
@@ -2153,6 +2154,107 @@ class VideoPipeline:
         if not isinstance(payload, dict):
             return None
         return payload
+
+    def _asset_query_cache_root(self) -> Path:
+        return (Path.home() / ".imagine" / "asset_query_cache").resolve()
+
+    def _asset_query_cache_path(self, provider_name: str, query: str) -> Path:
+        provider_key = str(provider_name or "").strip().lower() or "unknown"
+        normalized_query = str(query or "").strip().lower()
+        digest = hashlib.sha1(normalized_query.encode("utf-8")).hexdigest()
+        return self._asset_query_cache_root() / provider_key / f"{digest}.json"
+
+    def _query_cache_entry_fresh(self, fetched_at: str, ttl_seconds: int) -> bool:
+        if not fetched_at:
+            return False
+        try:
+            timestamp = dt.datetime.fromisoformat(fetched_at)
+        except ValueError:
+            return False
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=dt.timezone.utc)
+        age_seconds = (dt.datetime.now(dt.timezone.utc) - timestamp.astimezone(dt.timezone.utc)).total_seconds()
+        return age_seconds <= max(0, int(ttl_seconds))
+
+    def _load_persistent_query_cache(self, provider_name: str, query: str) -> list[AssetCandidate] | None:
+        payload = self._load_json_state(self._asset_query_cache_path(provider_name, query))
+        if not isinstance(payload, dict):
+            return None
+
+        fetched_at = str(payload.get("fetched_at") or "").strip()
+        ttl_seconds = self._coerce_optional_int(payload.get("ttl_seconds")) or ASSET_QUERY_CACHE_TTL_SECONDS
+        if not self._query_cache_entry_fresh(fetched_at, ttl_seconds):
+            return None
+
+        raw_candidates = payload.get("candidates")
+        if not isinstance(raw_candidates, list):
+            return None
+
+        candidates: list[AssetCandidate] = []
+        for item in raw_candidates:
+            if not isinstance(item, dict):
+                continue
+            candidate = self._asset_candidate_from_payload(item)
+            if candidate is not None:
+                candidates.append(candidate)
+        return candidates
+
+    def _write_persistent_query_cache(
+        self,
+        provider_name: str,
+        query: str,
+        candidates: list[AssetCandidate],
+    ) -> None:
+        if not candidates:
+            return
+
+        path = self._asset_query_cache_path(provider_name, query)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "provider": str(provider_name or "").strip().lower(),
+            "query": str(query or "").strip(),
+            "fetched_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "ttl_seconds": ASSET_QUERY_CACHE_TTL_SECONDS,
+            "candidate_count": len(candidates),
+            "candidates": [candidate.to_dict() for candidate in candidates],
+        }
+        self._write_json(path, payload)
+
+    def _http_get_with_retries(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        timeout: tuple[int, int] = (5, 15),
+    ) -> requests.Response:
+        delays = (0.0, 1.0, 2.0, 4.0)
+        last_error: Exception | None = None
+
+        for attempt_index, delay in enumerate(delays):
+            if attempt_index > 0:
+                self._increment_optimization_counter("asset_resolution", "provider_retry_attempts")
+                time.sleep(delay)
+            try:
+                response = self.http.get(url, headers=headers, params=params, timeout=timeout)
+            except requests.exceptions.Timeout as exc:
+                last_error = exc
+                if attempt_index == len(delays) - 1:
+                    break
+                continue
+            except requests.exceptions.RequestException as exc:
+                raise RuntimeError(f"HTTP GET failed for {url}: {exc}") from exc
+
+            if response.status_code >= 500:
+                response.close()
+                if attempt_index == len(delays) - 1:
+                    raise RuntimeError(f"HTTP GET failed for {url}, status={response.status_code}")
+                continue
+            return response
+
+        if last_error is not None:
+            raise RuntimeError(f"HTTP GET timed out for {url}") from last_error
+        raise RuntimeError(f"HTTP GET failed for {url}")
 
     def _selected_candidate_for_shot(self, shot_id: str) -> AssetCandidate | None:
         clip_catalog = self._load_json_state(self.paths["clip_catalog"]) or {}
@@ -5960,10 +6062,13 @@ class VideoPipeline:
             "provider_usage": provider_usage,
             "query_cache_hits": int(asset_optimization_stats.get("query_cache_hits") or 0),
             "query_cache_misses": int(asset_optimization_stats.get("query_cache_misses") or 0),
+            "persistent_query_cache_hits": int(asset_optimization_stats.get("persistent_query_cache_hits") or 0),
+            "persistent_query_cache_misses": int(asset_optimization_stats.get("persistent_query_cache_misses") or 0),
             "download_attempts": int(asset_optimization_stats.get("download_attempts") or 0),
             "download_successes": int(asset_optimization_stats.get("download_successes") or 0),
             "montage_download_attempts": int(asset_optimization_stats.get("montage_download_attempts") or 0),
             "montage_download_successes": int(asset_optimization_stats.get("montage_download_successes") or 0),
+            "provider_retry_attempts": int(asset_optimization_stats.get("provider_retry_attempts") or 0),
         }
 
         if download_failures > 0:
@@ -6452,12 +6557,20 @@ class VideoPipeline:
                     candidates = query_cache.get(cache_key)
                     if cache_key not in query_cache:
                         self._increment_optimization_counter("asset_resolution", "query_cache_misses")
-                        try:
-                            with self._timed_optimization_block("asset_resolution", "search_seconds"):
-                                candidates = self._search_provider_candidates(provider_name, query)
-                        except Exception as exc:
-                            self._log(f"{provider_name} search failed for {scene.scene_id} ({query}): {exc}")
-                            candidates = []
+                        cached_candidates = self._load_persistent_query_cache(provider_name, query)
+                        if cached_candidates is not None:
+                            self._increment_optimization_counter("asset_resolution", "persistent_query_cache_hits")
+                            candidates = list(cached_candidates)
+                        else:
+                            self._increment_optimization_counter("asset_resolution", "persistent_query_cache_misses")
+                            try:
+                                with self._timed_optimization_block("asset_resolution", "search_seconds"):
+                                    candidates = self._search_provider_candidates(provider_name, query)
+                            except Exception as exc:
+                                self._log(f"{provider_name} search failed for {scene.scene_id} ({query}): {exc}")
+                                candidates = []
+                            else:
+                                self._write_persistent_query_cache(provider_name, query, list(candidates))
                         query_cache[cache_key] = list(candidates)
                     else:
                         self._increment_optimization_counter("asset_resolution", "query_cache_hits")
@@ -6855,7 +6968,7 @@ class VideoPipeline:
 
     def _search_pexels_videos(self, api_key: str, query: str) -> list[AssetCandidate]:
         url = f"https://api.pexels.com/videos/search?query={quote_plus(query)}&orientation=landscape&per_page=20"
-        response = self.http.get(url, headers={"Authorization": api_key}, timeout=(5, 15))
+        response = self._http_get_with_retries(url, headers={"Authorization": api_key}, timeout=(5, 15))
         if response.status_code != 200:
             return []
 
@@ -6917,7 +7030,7 @@ class VideoPipeline:
 
     def _search_pexels_images(self, api_key: str, query: str) -> list[AssetCandidate]:
         url = f"https://api.pexels.com/v1/search?query={quote_plus(query)}&orientation=landscape&per_page=20"
-        response = self.http.get(url, headers={"Authorization": api_key}, timeout=(5, 15))
+        response = self._http_get_with_retries(url, headers={"Authorization": api_key}, timeout=(5, 15))
         if response.status_code != 200:
             return []
 
@@ -6973,7 +7086,7 @@ class VideoPipeline:
             "https://pixabay.com/api/videos/"
             f"?key={quote_plus(api_key)}&q={quote_plus(query)}&safesearch=true&per_page=20"
         )
-        response = self.http.get(url, timeout=(5, 15))
+        response = self._http_get_with_retries(url, timeout=(5, 15))
         if response.status_code != 200:
             return []
 
@@ -7046,7 +7159,7 @@ class VideoPipeline:
             f"?key={quote_plus(api_key)}&q={quote_plus(query)}&image_type=photo&orientation=horizontal"
             "&safesearch=true&per_page=20"
         )
-        response = self.http.get(url, timeout=(5, 15))
+        response = self._http_get_with_retries(url, timeout=(5, 15))
         if response.status_code != 200:
             return []
 
@@ -7096,7 +7209,7 @@ class VideoPipeline:
 
     def _search_coverr_videos(self, api_key: str, query: str) -> list[AssetCandidate]:
         url = "https://api.coverr.co/videos"
-        response = self.http.get(
+        response = self._http_get_with_retries(
             url,
             headers=self._coverr_headers(api_key),
             params={
@@ -7180,7 +7293,7 @@ class VideoPipeline:
             f"?term={quote_plus(query)}&content_type=video&license_type=commercial"
             "&family_friendly=true&sort_by=relevance&per_page=20"
         )
-        response = self.http.get(url, headers=self._vecteezy_headers(api_key), timeout=(5, 15))
+        response = self._http_get_with_retries(url, headers=self._vecteezy_headers(api_key), timeout=(5, 15))
         if response.status_code != 200:
             return []
 
@@ -7264,7 +7377,7 @@ class VideoPipeline:
             f"?term={quote_plus(query)}&content_type=photo&license_type=commercial"
             "&orientation=horizontal&family_friendly=true&sort_by=relevance&per_page=20"
         )
-        response = self.http.get(url, headers=self._vecteezy_headers(api_key), timeout=(5, 15))
+        response = self._http_get_with_retries(url, headers=self._vecteezy_headers(api_key), timeout=(5, 15))
         if response.status_code != 200:
             return []
 
