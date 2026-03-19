@@ -5089,12 +5089,21 @@ class VideoPipeline:
         effective_speed = max(0.5, min(2.0, float(self.config.voice_speed) * float(settings["speed_multiplier"])))
         length_scale = max(0.1, min(2.5, 1.0 / effective_speed))
         speaker_id = voice_meta.get("speaker_id")
+        active_chunks = [
+            (
+                idx,
+                str(chunk.get("text") or "").strip(),
+                float(chunk.get("pause_after") or 0.0),
+            )
+            for idx, chunk in enumerate(chunks)
+            if str(chunk.get("text") or "").strip()
+        ]
 
-        for idx, chunk in enumerate(chunks):
-            text = str(chunk.get("text") or "").strip()
-            if not text:
-                continue
-
+        def synthesize_chunk(
+            idx: int,
+            text: str,
+            pause_seconds: float,
+        ) -> tuple[int, list[Path]]:
             raw_wav = parts_dir / f"piper_{idx:04d}.raw.wav"
             wav_path = parts_dir / f"piper_{idx:04d}.wav"
             command = list(piper_command)
@@ -5131,13 +5140,35 @@ class VideoPipeline:
                 raise RuntimeError(f"Piper synthesis failed: {stderr_text}")
 
             self._standardize_wav(raw_wav, wav_path)
-            part_files.append(wav_path)
+            chunk_files = [wav_path]
 
-            pause_seconds = float(chunk.get("pause_after") or 0.0)
             if pause_seconds > 0.0:
                 pause_path = parts_dir / f"pause_{idx:04d}.wav"
                 self._generate_silence_wav(pause_path, pause_seconds)
-                part_files.append(pause_path)
+                chunk_files.append(pause_path)
+            return idx, chunk_files
+
+        chunk_workers = min(4, len(active_chunks))
+        synthesized_parts: dict[int, list[Path]] = {}
+        if chunk_workers <= 1:
+            for idx, text, pause_seconds in active_chunks:
+                chunk_index, chunk_files = synthesize_chunk(idx, text, pause_seconds)
+                synthesized_parts[chunk_index] = chunk_files
+        else:
+            with ThreadPoolExecutor(max_workers=chunk_workers) as executor:
+                futures = [
+                    executor.submit(synthesize_chunk, idx, text, pause_seconds)
+                    for idx, text, pause_seconds in active_chunks
+                ]
+            for future in futures:
+                chunk_index, chunk_files = future.result()
+                synthesized_parts[chunk_index] = chunk_files
+
+        for idx, chunk in enumerate(chunks):
+            text = str(chunk.get("text") or "").strip()
+            if not text:
+                continue
+            part_files.extend(synthesized_parts.get(idx, []))
 
         if not part_files:
             raise RuntimeError("Piper TTS did not produce any audio parts")
