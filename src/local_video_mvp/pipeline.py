@@ -610,6 +610,8 @@ class VideoPipeline:
         self._bookend_logo_overlay: Path | None = None
         self._ffmpeg_drawtext_available: bool | None = None
         self._ffmpeg_subtitles_available: bool | None = None
+        self._hw_encoder: str | None = None
+        self._hw_encoder_checked = False
         self._piper_command: list[str] | None = None
         self._kokoro_pipelines: dict[str, Any] = {}
         self._ollama_ready = False
@@ -6378,6 +6380,7 @@ class VideoPipeline:
         self._write_json(self.paths["clip_catalog"], payload)
 
     def _ensure_shot_previews(self, shot_plan: ShotPlan) -> None:
+        preview_jobs: list[tuple[str, TimelineClip, Path, Path, Path]] = []
         for shot in shot_plan.shots:
             shot_dir = self._shot_preview_dir(shot.shot_id)
             shot_dir.mkdir(parents=True, exist_ok=True)
@@ -6422,6 +6425,10 @@ class VideoPipeline:
                 match_confidence=normalize_shot_confidence(shot.match_confidence, "medium"),
                 fallback_level=shot.fallback_level,
             )
+            preview_jobs.append((shot.shot_id, clip, audio_path, preview_path, ass_path))
+
+        def render_preview_job(job: tuple[str, TimelineClip, Path, Path, Path]) -> None:
+            shot_id, clip, audio_path, preview_path, ass_path = job
             self._render_video(
                 [clip],
                 audio_path,
@@ -6429,9 +6436,24 @@ class VideoPipeline:
                 captions_ass_path=ass_path,
                 intro_seconds=0.0,
                 outro_seconds=0.0,
-                render_subdir=f"shot-{shot.shot_id}",
+                render_subdir=f"shot-{shot_id}",
                 metrics_section="shot_preview",
             )
+
+        if not preview_jobs:
+            return
+
+        preview_workers = min(4, len(preview_jobs))
+        self._set_optimization_value("shot_preview", "render_workers", preview_workers)
+        if preview_workers == 1:
+            for job in preview_jobs:
+                render_preview_job(job)
+            return
+
+        with ThreadPoolExecutor(max_workers=preview_workers) as executor:
+            futures = [executor.submit(render_preview_job, job) for job in preview_jobs]
+        for future in futures:
+            future.result()
 
     def _montage_motion_profile(self, style: str | None = None) -> dict[str, float | str]:
         normalized_style = self._normalized_image_motion_style(style)
@@ -9073,6 +9095,7 @@ class VideoPipeline:
         subtitle_path = captions_ass_path or self.paths["captions_ass"]
         intro_pad = self._intro_bookend_seconds() if intro_seconds is None else max(0.0, float(intro_seconds))
         outro_pad = self._outro_bookend_seconds() if outro_seconds is None else max(0.0, float(outro_seconds))
+        self._set_optimization_value(metrics_section, "requested_video_encoder", self._preferred_video_encoder())
 
         render_audio = render_dir / "narration_with_bookends.wav"
         with self._timed_optimization_block(metrics_section, "build_audio_seconds"):
@@ -9083,48 +9106,79 @@ class VideoPipeline:
                 outro_seconds=outro_pad,
             )
 
-        clip_files: list[Path] = []
-        for idx, clip in enumerate(timeline):
-            clip_path = render_dir / f"clip_{idx:04d}.mp4"
-            with self._timed_optimization_block(metrics_section, "clip_render_seconds"):
-                self._render_single_clip(clip, clip_path, idx)
-            clip_files.append(clip_path)
-        self._increment_optimization_counter(metrics_section, "rendered_clip_count", amount=len(clip_files))
-
-        concat_list = render_dir / "concat.txt"
-        concat_lines = [f"file '{path.resolve()}'" for path in clip_files]
-        self._write_text(concat_list, "\n".join(concat_lines) + "\n")
-
         visuals_mp4 = render_dir / "visuals.mp4"
-        with self._timed_optimization_block(metrics_section, "concat_seconds"):
-            concat = self._run_command(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-f",
-                    "concat",
-                    "-safe",
-                    "0",
-                    "-i",
-                    str(concat_list),
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "slow",
-                    "-crf",
-                    "18",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-an",
-                    str(visuals_mp4),
-                ],
-                timeout=3600,
-                check=False,
-            )
-        if concat.returncode != 0:
-            raise RuntimeError(f"Failed to concat clips: {concat.stderr.strip()}")
+        single_clip_fast_path = len(timeline) == 1 and intro_pad <= 0.0 and outro_pad <= 0.0
+        self._set_optimization_value(metrics_section, "single_clip_fast_path", bool(single_clip_fast_path))
 
-        mixed_mp4 = render_dir / "master_with_audio.mp4"
+        if single_clip_fast_path:
+            self._set_optimization_value(metrics_section, "clip_render_workers", 1)
+            with self._timed_optimization_block(metrics_section, "clip_render_seconds"):
+                self._render_single_clip(timeline[0], visuals_mp4, 0, metrics_section=metrics_section)
+            self._increment_optimization_counter(metrics_section, "rendered_clip_count", amount=1)
+        else:
+            clip_files: list[Path] = [render_dir / f"clip_{idx:04d}.mp4" for idx in range(len(timeline))]
+            clip_workers = min(4, max(1, (os.cpu_count() or 2) // 2), len(timeline))
+            self._set_optimization_value(metrics_section, "clip_render_workers", clip_workers)
+
+            def render_clip_task(index: int, clip: TimelineClip, clip_path: Path) -> tuple[int, float]:
+                started_at = time.perf_counter()
+                self._render_single_clip(clip, clip_path, index, metrics_section=metrics_section)
+                return index, time.perf_counter() - started_at
+
+            if clip_workers == 1:
+                results = [render_clip_task(idx, clip, clip_files[idx]) for idx, clip in enumerate(timeline)]
+            else:
+                with ThreadPoolExecutor(max_workers=clip_workers) as executor:
+                    futures = [
+                        executor.submit(render_clip_task, idx, clip, clip_files[idx])
+                        for idx, clip in enumerate(timeline)
+                    ]
+                results = [future.result() for future in futures]
+
+            for _, elapsed_seconds in results:
+                self._record_optimization_time(metrics_section, "clip_render_seconds", elapsed_seconds)
+            self._increment_optimization_counter(metrics_section, "rendered_clip_count", amount=len(clip_files))
+
+            concat_list = render_dir / "concat.txt"
+            concat_lines = [f"file '{path.resolve()}'" for path in clip_files]
+            self._write_text(concat_list, "\n".join(concat_lines) + "\n")
+
+            with self._timed_optimization_block(metrics_section, "concat_seconds"):
+                concat = self._run_ffmpeg_video_command(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-f",
+                        "concat",
+                        "-safe",
+                        "0",
+                        "-i",
+                        str(concat_list),
+                        *self._video_encode_args(preset="slow", crf=18),
+                        "-an",
+                        str(visuals_mp4),
+                    ],
+                    timeout=3600,
+                    preset="slow",
+                    crf=18,
+                    metrics_section=metrics_section,
+                )
+            if concat.returncode != 0:
+                raise RuntimeError(f"Failed to concat clips: {concat.stderr.strip()}")
+
+        if self.config.burn_subtitles and subtitle_path.exists():
+            self._burn_subtitles(
+                visuals_mp4,
+                subtitle_path,
+                final_mp4,
+                audio_input=render_audio,
+                metrics_section=metrics_section,
+            )
+            return
+
+        if self.config.burn_subtitles and not subtitle_path.exists():
+            self._warn("Subtitle burn-in skipped because captions.ass is missing or empty.")
+
         with self._timed_optimization_block(metrics_section, "mux_seconds"):
             mux = self._run_command(
                 [
@@ -9145,18 +9199,13 @@ class VideoPipeline:
                     "-b:a",
                     "192k",
                     "-shortest",
-                    str(mixed_mp4),
+                    str(final_mp4),
                 ],
                 timeout=1200,
                 check=False,
             )
         if mux.returncode != 0:
             raise RuntimeError(f"Failed to mux narration and video: {mux.stderr.strip()}")
-
-        if self.config.burn_subtitles and subtitle_path.exists():
-            self._burn_subtitles(mixed_mp4, subtitle_path, final_mp4, metrics_section=metrics_section)
-        else:
-            shutil.copy2(mixed_mp4, final_mp4)
 
     def _resolve_optional_input_path(self, raw_path: str | None, *, purpose: str) -> Path | None:
         if not raw_path:
@@ -9508,7 +9557,14 @@ class VideoPipeline:
         )
         return f"{base_vf},{overlay}"
 
-    def _render_single_clip(self, clip: TimelineClip, output_clip: Path, index: int) -> None:
+    def _render_single_clip(
+        self,
+        clip: TimelineClip,
+        output_clip: Path,
+        index: int,
+        *,
+        metrics_section: str = "render",
+    ) -> None:
         duration = max(0.3, clip.seconds)
         if clip.scene_id == "__intro":
             include_text = True
@@ -9520,7 +9576,13 @@ class VideoPipeline:
                 logo_image=self._bookend_logo_overlay,
                 include_text=include_text,
             )
-            result = self._run_command(command, timeout=900, check=False)
+            result = self._run_ffmpeg_video_command(
+                command,
+                timeout=900,
+                preset="medium",
+                crf=20,
+                metrics_section=metrics_section,
+            )
             if result.returncode != 0 and self._is_drawtext_missing_error(result.stderr):
                 self._ffmpeg_drawtext_available = False
                 raise RuntimeError(
@@ -9541,7 +9603,13 @@ class VideoPipeline:
                 logo_image=self._bookend_logo_overlay,
                 include_text=include_text,
             )
-            result = self._run_command(command, timeout=900, check=False)
+            result = self._run_ffmpeg_video_command(
+                command,
+                timeout=900,
+                preset="medium",
+                crf=20,
+                metrics_section=metrics_section,
+            )
             if result.returncode != 0 and self._is_drawtext_missing_error(result.stderr):
                 self._ffmpeg_drawtext_available = False
                 raise RuntimeError(
@@ -9554,7 +9622,13 @@ class VideoPipeline:
 
         if clip.scene_id == "__tail":
             command = self._tail_hold_clip_command(output_clip=output_clip, duration=duration)
-            result = self._run_command(command, timeout=900, check=False)
+            result = self._run_ffmpeg_video_command(
+                command,
+                timeout=900,
+                preset="medium",
+                crf=20,
+                metrics_section=metrics_section,
+            )
             if result.returncode != 0:
                 raise RuntimeError(f"Failed to render tail hold clip: {result.stderr.strip()}")
             return
@@ -9630,14 +9704,7 @@ class VideoPipeline:
                         "-vf",
                         vf_primary,
                         "-an",
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "medium",
-                        "-crf",
-                        "20",
-                        "-pix_fmt",
-                        "yuv420p",
+                        *self._video_encode_args(preset="medium", crf=20),
                         str(output_clip),
                     ]
                     fallback = [*command]
@@ -9660,14 +9727,7 @@ class VideoPipeline:
                         "-vf",
                         vf_retry,
                         "-an",
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "medium",
-                        "-crf",
-                        "20",
-                        "-pix_fmt",
-                        "yuv420p",
+                        *self._video_encode_args(preset="medium", crf=20),
                         str(output_clip),
                     ]
                     montage_paths = self._scene_montage_image_paths(clip.scene_id, source)
@@ -9688,14 +9748,7 @@ class VideoPipeline:
                             "-vf",
                             vf_primary,
                             "-an",
-                            "-c:v",
-                            "libx264",
-                            "-preset",
-                            "medium",
-                            "-crf",
-                            "20",
-                            "-pix_fmt",
-                            "yuv420p",
+                            *self._video_encode_args(preset="medium", crf=20),
                             str(output_clip),
                         ]
                 else:
@@ -9725,14 +9778,7 @@ class VideoPipeline:
                     "-vf",
                     vf_retry,
                     "-an",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "medium",
-                    "-crf",
-                    "20",
-                    "-pix_fmt",
-                    "yuv420p",
+                    *self._video_encode_args(preset="medium", crf=20),
                     str(output_clip),
                 ]
                 montage_paths = self._scene_montage_image_paths(clip.scene_id, source)
@@ -9753,14 +9799,7 @@ class VideoPipeline:
                         "-vf",
                         vf_primary,
                         "-an",
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "medium",
-                        "-crf",
-                        "20",
-                        "-pix_fmt",
-                        "yuv420p",
+                        *self._video_encode_args(preset="medium", crf=20),
                         str(output_clip),
                     ]
             else:
@@ -9782,13 +9821,25 @@ class VideoPipeline:
             command = self._placeholder_clip_command(output_clip, duration, index, vf_primary)
             fallback = self._placeholder_clip_command(output_clip, duration, index, vf_fallback)
 
-        result = self._run_command(command, timeout=900, check=False)
+        result = self._run_ffmpeg_video_command(
+            command,
+            timeout=900,
+            preset="medium",
+            crf=20,
+            metrics_section=metrics_section,
+        )
         if result.returncode != 0:
             self._warn(
                 f"Primary visual filter failed for {clip.scene_id}; retrying simplified filter. "
                 f"Details: {result.stderr.strip()}"
             )
-            result = self._run_command(fallback, timeout=900, check=False)
+            result = self._run_ffmpeg_video_command(
+                fallback,
+                timeout=900,
+                preset="medium",
+                crf=20,
+                metrics_section=metrics_section,
+            )
         if result.returncode != 0:
             raise RuntimeError(f"Failed to render clip {clip.scene_id}: {result.stderr.strip()}")
 
@@ -9813,14 +9864,7 @@ class VideoPipeline:
                 f"fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f}"
             ),
             "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
+            *self._video_encode_args(preset="medium", crf=20),
             str(output_clip),
         ]
 
@@ -9944,14 +9988,7 @@ class VideoPipeline:
                 "-map",
                 "[v]",
                 "-an",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "20",
-                "-pix_fmt",
-                "yuv420p",
+                *self._video_encode_args(preset="medium", crf=20),
                 str(output_clip),
             ]
 
@@ -10049,14 +10086,7 @@ class VideoPipeline:
                 "-map",
                 "[v]",
                 "-an",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "20",
-                "-pix_fmt",
-                "yuv420p",
+                *self._video_encode_args(preset="medium", crf=20),
                 str(output_clip),
             ]
 
@@ -10101,14 +10131,7 @@ class VideoPipeline:
                 f"fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f}"
             ),
             "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
+            *self._video_encode_args(preset="medium", crf=20),
             str(output_clip),
         ]
 
@@ -10280,14 +10303,7 @@ class VideoPipeline:
                 "-map",
                 "[v]",
                 "-an",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "20",
-                "-pix_fmt",
-                "yuv420p",
+                *self._video_encode_args(preset="medium", crf=20),
                 str(output_clip),
             ]
 
@@ -10395,14 +10411,7 @@ class VideoPipeline:
                 "-map",
                 "[v]",
                 "-an",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "20",
-                "-pix_fmt",
-                "yuv420p",
+                *self._video_encode_args(preset="medium", crf=20),
                 str(output_clip),
             ]
 
@@ -10447,14 +10456,7 @@ class VideoPipeline:
                 f"fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f}"
             ),
             "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
+            *self._video_encode_args(preset="medium", crf=20),
             str(output_clip),
         ]
 
@@ -10463,6 +10465,134 @@ class VideoPipeline:
         if style not in {"minimal-clean", "cinematic-subtle", "brand-image-motion", "corner-fade"}:
             return "minimal-clean"
         return style
+
+    def _preferred_video_encoder(self) -> str:
+        if self._hw_encoder_checked:
+            return self._hw_encoder or "libx264"
+
+        self._hw_encoder_checked = True
+        self._hw_encoder = None
+        if sys.platform != "darwin":
+            return "libx264"
+
+        result = self._run_command(["ffmpeg", "-hide_banner", "-encoders"], timeout=30, check=False)
+        catalog = f"{result.stdout}\n{result.stderr}".lower()
+        if re.search(r"\bh264_videotoolbox\b", catalog):
+            self._hw_encoder = "h264_videotoolbox"
+        return self._hw_encoder or "libx264"
+
+    def _target_video_bitrate_kbps(self, *, crf: int) -> int:
+        pixels = int(self.config.width) * int(self.config.height)
+        if pixels <= (640 * 360):
+            bitrate = 2500
+        elif pixels <= (1280 * 720):
+            bitrate = 5000
+        elif pixels <= (1920 * 1080):
+            bitrate = 8000
+        else:
+            bitrate = 12000
+
+        if crf <= 18:
+            bitrate = int(bitrate * 1.2)
+        elif crf >= 22:
+            bitrate = int(bitrate * 0.85)
+        return max(1500, bitrate)
+
+    def _libx264_encode_args(self, *, preset: str, crf: int) -> list[str]:
+        return [
+            "-c:v",
+            "libx264",
+            "-preset",
+            str(preset),
+            "-crf",
+            str(crf),
+            "-pix_fmt",
+            "yuv420p",
+        ]
+
+    def _video_encode_args(
+        self,
+        *,
+        preset: str,
+        crf: int,
+        encoder: str | None = None,
+    ) -> list[str]:
+        selected_encoder = str(encoder or self._preferred_video_encoder() or "libx264").strip().lower()
+        if selected_encoder == "h264_videotoolbox":
+            bitrate_kbps = self._target_video_bitrate_kbps(crf=crf)
+            return [
+                "-c:v",
+                "h264_videotoolbox",
+                "-allow_sw",
+                "1",
+                "-b:v",
+                f"{bitrate_kbps}k",
+                "-pix_fmt",
+                "yuv420p",
+            ]
+        return self._libx264_encode_args(preset=preset, crf=crf)
+
+    def _replace_video_encode_args(
+        self,
+        command: list[str],
+        *,
+        preset: str,
+        crf: int,
+        encoder: str,
+    ) -> list[str]:
+        if "-c:v" not in command or "-pix_fmt" not in command:
+            return list(command)
+
+        c_index = command.index("-c:v")
+        pix_index = command.index("-pix_fmt", c_index)
+        end_index = min(len(command), pix_index + 2)
+        return [
+            *command[:c_index],
+            *self._video_encode_args(preset=preset, crf=crf, encoder=encoder),
+            *command[end_index:],
+        ]
+
+    def _run_ffmpeg_video_command(
+        self,
+        command: list[str],
+        *,
+        timeout: int,
+        preset: str,
+        crf: int,
+        metrics_section: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        result = self._run_command(command, timeout=timeout, check=False)
+        if result.returncode == 0:
+            return result
+
+        preferred_encoder = self._preferred_video_encoder()
+        if preferred_encoder == "libx264":
+            return result
+        if "-c:v" not in command:
+            return result
+
+        encoder_index = command.index("-c:v") + 1
+        current_encoder = str(command[encoder_index]).strip().lower() if encoder_index < len(command) else ""
+        if current_encoder != preferred_encoder:
+            return result
+
+        fallback_command = self._replace_video_encode_args(
+            command,
+            preset=preset,
+            crf=crf,
+            encoder="libx264",
+        )
+        fallback_result = self._run_command(fallback_command, timeout=timeout, check=False)
+        if fallback_result.returncode == 0:
+            if metrics_section:
+                self._increment_optimization_counter(metrics_section, "hw_encoder_fallbacks")
+                self._set_optimization_value(metrics_section, "video_encoder_fallback", "libx264")
+            self._log(
+                f"Video encode fallback triggered for {metrics_section or 'render'}; "
+                f"retrying {preferred_encoder} output with libx264."
+            )
+            return fallback_result
+        return fallback_result
 
     def _ffmpeg_supports_drawtext(self) -> bool:
         cached = self._ffmpeg_drawtext_available
@@ -10633,14 +10763,7 @@ class VideoPipeline:
             "-vf",
             f"hue=h={hue_shift}:s=0.45,{vf}",
             "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
+            *self._video_encode_args(preset="medium", crf=20),
             str(output_clip),
         ]
 
@@ -10650,6 +10773,7 @@ class VideoPipeline:
         subtitles_ass: Path,
         output_mp4: Path,
         *,
+        audio_input: Path | None = None,
         metrics_section: str = "render",
     ) -> None:
         if not subtitles_ass.exists() or subtitles_ass.stat().st_size == 0:
@@ -10664,27 +10788,29 @@ class VideoPipeline:
             )
 
         filter_value = self._ffmpeg_subtitles_filter(subtitles_ass)
-        command = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(input_mp4),
-            "-vf",
-            filter_value,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "18",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "copy",
-            str(output_mp4),
-        ]
+        command = ["ffmpeg", "-y", "-i", str(input_mp4)]
+        if audio_input is not None:
+            command.extend(["-i", str(audio_input), "-map", "0:v:0", "-map", "1:a:0"])
+        command.extend(
+            [
+                "-vf",
+                filter_value,
+                *self._video_encode_args(preset="medium", crf=18),
+                "-c:a",
+                "aac" if audio_input is not None else "copy",
+            ]
+        )
+        if audio_input is not None:
+            command.extend(["-b:a", "192k", "-shortest"])
+        command.append(str(output_mp4))
         with self._timed_optimization_block(metrics_section, "subtitle_burn_seconds"):
-            result = self._run_command(command, timeout=2400, check=False)
+            result = self._run_ffmpeg_video_command(
+                command,
+                timeout=2400,
+                preset="medium",
+                crf=18,
+                metrics_section=metrics_section,
+            )
         if result.returncode != 0:
             lowered = (result.stderr or "").lower()
             if "no such filter" in lowered and "subtitles" in lowered:
@@ -10694,7 +10820,36 @@ class VideoPipeline:
                     "Install an ffmpeg build with libass/subtitles support or disable burned subtitles."
                 )
             self._warn(f"Subtitle burn-in failed; shipping video without burned subtitles. Details: {result.stderr.strip()}")
-            shutil.copy2(input_mp4, output_mp4)
+            if audio_input is None:
+                shutil.copy2(input_mp4, output_mp4)
+                return
+
+            mux = self._run_command(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(input_mp4),
+                    "-i",
+                    str(audio_input),
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-shortest",
+                    str(output_mp4),
+                ],
+                timeout=1200,
+                check=False,
+            )
+            if mux.returncode != 0:
+                raise RuntimeError(f"Failed to mux narration and video after subtitle fallback: {mux.stderr.strip()}")
 
     def _ffmpeg_subtitles_filter(self, subtitles_ass: Path) -> str:
         value = str(subtitles_ass.resolve())
@@ -11362,14 +11517,7 @@ class VideoPipeline:
             "-map",
             f"[{current_label}]",
             "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
+            *self._video_encode_args(preset="medium", crf=20),
             str(output_clip),
         ]
 
