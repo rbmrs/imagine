@@ -166,6 +166,7 @@ class PipelineConfig:
     intro_seconds: float = 2.8
     outro_seconds: float = 3.0
     outro_text: str = "Thanks for watching"
+    outro_spoken_text: str = ""
     bookend_style: str = "minimal-clean"
     brand_logo_path: str | None = None
     brand_intro_image_path: str | None = None
@@ -180,6 +181,7 @@ class PipelineConfig:
     melo_speaker: str = "EN-US"
     kokoro_lang_code: str = "en-us"
     kokoro_voice: str = "af_heart"
+    script_language: str = "en"
     piper_voice_id: str | None = None
     piper_speaker_id: int | None = None
     piper_model_url: str | None = None

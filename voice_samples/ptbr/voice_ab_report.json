@@ -1,0 +1,32 @@
+{
+  "generated_at": "2026-03-18T14:37:28.404672+00:00",
+  "tts_engine": "kokoro",
+  "voice_profile": "calm-documentary",
+  "voice_speed": 1.0,
+  "melo_language": "EN",
+  "kokoro_lang_code": "pt-br",
+  "sample_words": 19,
+  "sample_text": "Ol\u00e1, este \u00e9 um teste de voz em portugu\u00eas brasileiro para verificar a qualidade da s\u00edntese de fala.",
+  "compare_mix": "/Users/rafaelbm/Dev/AI/Imagine/voice_samples/ptbr/ab_compare.wav",
+  "samples": [
+    {
+      "speaker": "pf_dora",
+      "voice": "pf_dora",
+      "file": "/Users/rafaelbm/Dev/AI/Imagine/voice_samples/ptbr/01_pf_dora.wav",
+      "duration_seconds": 0.275
+    },
+    {
+      "speaker": "pm_alex",
+      "voice": "pm_alex",
+      "file": "/Users/rafaelbm/Dev/AI/Imagine/voice_samples/ptbr/02_pm_alex.wav",
+      "duration_seconds": 0.275
+    },
+    {
+      "speaker": "pm_santa",
+      "voice": "pm_santa",
+      "file": "/Users/rafaelbm/Dev/AI/Imagine/voice_samples/ptbr/03_pm_santa.wav",
+      "duration_seconds": 0.275
+    }
+  ],
+  "output_dir": "/Users/rafaelbm/Dev/AI/Imagine/voice_samples/ptbr"
+}

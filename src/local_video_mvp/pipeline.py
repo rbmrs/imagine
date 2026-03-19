@@ -644,6 +644,7 @@ class VideoPipeline:
             "subtitle_outline": bool(self.config.subtitle_outline),
             "include_intro": self.config.include_intro,
             "include_outro": self.config.include_outro,
+            "outro_spoken_text": self.config.outro_spoken_text,
             "require_external_assets": self.config.require_external_assets,
             "enable_pexels_provider": self.config.enable_pexels_provider,
             "enable_pixabay_provider": self.config.enable_pixabay_provider,
@@ -1613,6 +1614,7 @@ class VideoPipeline:
         if narration_wav.exists() and narration_wav.stat().st_size > 0:
             existing_hash = self._load_narration_state_hash()
             if existing_hash and existing_hash == expected_hash:
+                self._ensure_outro_narration_audio()
                 return
 
             self._warn("Approved script changed since narration generation; re-synthesizing narration audio.")
@@ -1630,6 +1632,7 @@ class VideoPipeline:
             self._stage_label(3 if self._news_mode_enabled() else 2, "Synthesizing narration audio"),
             voice_stage,
         )
+        self._ensure_outro_narration_audio()
         audio_duration = self._media_duration(narration_wav)
         self._rebalance_scene_durations(plan, audio_duration)
         self._update_duration_post_tts(plan, audio_duration, adjust_passes=0)
@@ -1959,6 +1962,7 @@ class VideoPipeline:
             "intro_seconds": self.config.intro_seconds,
             "outro_seconds": self.config.outro_seconds,
             "outro_text": self.config.outro_text,
+            "outro_spoken_text": self.config.outro_spoken_text,
         }
         return self._stable_payload_hash(payload)
 
@@ -1992,6 +1996,7 @@ class VideoPipeline:
                 "intro_seconds": self.config.intro_seconds,
                 "outro_seconds": self.config.outro_seconds,
                 "outro_text": self.config.outro_text,
+                "outro_spoken_text": self.config.outro_spoken_text,
                 "channel_name": self.config.channel_name,
                 "intro_tagline": self.config.intro_tagline,
                 "outro_tagline": self.config.outro_tagline,
@@ -2456,14 +2461,30 @@ class VideoPipeline:
             video_candidates: list[AssetCandidate] = []
             image_candidates: list[AssetCandidate] = []
             candidates: list[AssetCandidate] = []
+            existing_rights = self._load_existing_rights()
+            existing_rights_by_scene = {right.scene_id: right for right in existing_rights}
+            selected_candidate = self._selected_candidate_for_shot(shot_id)
+            selected_key = self._asset_uniqueness_key(selected_candidate) if selected_candidate is not None else None
+            current_asset_key = ""
             if not editorial_locked:
                 active_asset_keys = self._active_shot_asset_keys()
                 current_asset_key = active_asset_keys.get(shot_id)
+                if not current_asset_key:
+                    current_right = existing_rights_by_scene.get(shot_id)
+                    if current_right is not None:
+                        current_asset_key = self._asset_uniqueness_key_from_right(current_right)
+                if not current_asset_key and selected_key:
+                    current_asset_key = selected_key
                 other_active_asset_keys = {
                     key
                     for active_shot_id, key in active_asset_keys.items()
                     if active_shot_id != shot_id and key
                 }
+                other_active_asset_keys.update(
+                    self._asset_uniqueness_key_from_right(right)
+                    for right in existing_rights
+                    if right.scene_id != shot_id
+                )
                 ranked_candidates = self._rank_scene_candidates(
                     scene,
                     provider_order=provider_order,
@@ -2481,8 +2502,6 @@ class VideoPipeline:
                 image_candidates = [candidate for candidate in filtered_candidates if candidate.media_type == "image"][:shortlist_size]
                 candidates = self._sort_candidates([*video_candidates, *image_candidates])
 
-            selected_candidate = self._selected_candidate_for_shot(shot_id)
-            selected_key = self._asset_uniqueness_key(selected_candidate) if selected_candidate is not None else None
             preview_budget = {"video": 3, "image": 3}
             manifest_candidates: list[dict[str, Any]] = []
             payload_by_key: dict[str, dict[str, Any]] = {}
@@ -2531,6 +2550,7 @@ class VideoPipeline:
                 "search_queries": list(target_shot.search_queries),
                 "editorial_locked": bool(editorial_locked),
                 "visual_strategy": normalize_news_visual_strategy(target_shot.visual_strategy, "stock"),
+                "current_asset_key": current_asset_key,
                 "current_asset_path": target_shot.asset_path,
                 "current_asset_provider": target_shot.asset_provider,
                 "candidates": manifest_candidates,
@@ -2625,7 +2645,17 @@ class VideoPipeline:
             single_plan = ShotPlan(title=shot_plan.title, summary=shot_plan.summary, shots=[target_shot])
             existing_rights = self._load_existing_rights()
             existing_rights_by_scene = {right.scene_id: right for right in existing_rights}
-            rights = self._resolve_shot_assets(single_plan, preferred_candidates=preferred_candidates, persist_state=False)
+            preused_asset_keys = {
+                self._asset_uniqueness_key_from_right(right)
+                for right in existing_rights
+                if right.scene_id != shot_id
+            }
+            rights = self._resolve_shot_assets(
+                single_plan,
+                preferred_candidates=preferred_candidates,
+                persist_state=False,
+                preused_asset_keys=preused_asset_keys,
+            )
             updated_shot = single_plan.shots[0]
             if (
                 not self._news_mode_enabled()
@@ -2701,6 +2731,8 @@ class VideoPipeline:
             "narration_txt": project_dir / "narration.txt",
             "narration_raw": project_dir / "narration.raw.wav",
             "narration_wav": project_dir / "narration.wav",
+            "outro_narration_raw": project_dir / "tmp" / "outro_narration.raw.wav",
+            "outro_narration_wav": project_dir / "tmp" / "outro_narration.wav",
             "captions": project_dir / "captions.srt",
             "captions_ass": project_dir / "captions.ass",
             "timeline": project_dir / "timeline.json",
@@ -3849,6 +3881,13 @@ class VideoPipeline:
             """
         ).strip()
 
+        _SCRIPT_LANG_NAMES = {"pt-br": "Brazilian Portuguese", "es": "Spanish", "fr": "French"}
+        if getattr(self.config, "script_language", "en") not in ("en", "", None):
+            lang_name = _SCRIPT_LANG_NAMES.get(
+                self.config.script_language, self.config.script_language
+            )
+            prompt += f"\n- language: Generate ALL content (scene titles, voiceovers, narration) in {lang_name}. Do NOT use English."
+
         result = self._run_command(
             ["ollama", "run", self.config.ollama_model, prompt],
             timeout=600,
@@ -4195,7 +4234,7 @@ class VideoPipeline:
     def _word_count_plan(self, plan: ScriptPlan) -> int:
         total = 0
         for scene in plan.scenes:
-            total += len(re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", scene.voiceover or ""))
+            total += len(re.findall(r"[^\W_]+(?:'[^\W_]+)?", scene.voiceover or ""))
         return total
 
     def _estimate_seconds_from_words(self, words: int) -> float:
@@ -4790,7 +4829,7 @@ class VideoPipeline:
         return None
 
     def _last_word_token(self, text: str) -> str | None:
-        tokens = re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", text or "")
+        tokens = re.findall(r"[^\W_]+(?:'[^\W_]+)?", text or "")
         if not tokens:
             return None
         return tokens[-1].lower()
@@ -4805,7 +4844,7 @@ class VideoPipeline:
         return value.endswith((",", ";", ":"))
 
     def _word_count_text(self, text: str) -> int:
-        return len(re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", text or ""))
+        return len(re.findall(r"[^\W_]+(?:'[^\W_]+)?", text or ""))
 
     def _tts_with_melo(self, chunks: list[dict[str, Any]], output_raw_wav: Path) -> None:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -4991,7 +5030,29 @@ class VideoPipeline:
                 "Kokoro TTS not available. Install voice deps with: python -m pip install -e '.[voice]'"
             ) from exc
 
-        pipeline = KPipeline(lang_code=lang_code)
+        try:
+            pipeline = KPipeline(lang_code=lang_code)
+        except Exception as exc:
+            msg = str(exc)
+            if lang_code not in ("en-us", "en-gb"):
+                raise RuntimeError(
+                    f"Kokoro {lang_code} requires espeak-ng for phonemization. "
+                    "Install: brew install espeak-ng && pip install phonemizer  "
+                    "then set: export PHONEMIZER_ESPEAK_LIBRARY=/opt/homebrew/lib/libespeak-ng.dylib"
+                ) from exc
+            raise RuntimeError(f"Kokoro pipeline init failed: {msg}") from exc
+        # misaki EspeakG2P returns (phoneme_string, tokens) tuple but kokoro
+        # pipeline expects a plain string. Wrap g2p to unwrap the tuple.
+        if hasattr(pipeline, "g2p") and lang_code not in ("a", "b"):
+            _orig_g2p = pipeline.g2p
+
+            class _G2PWrapper:
+                def __call__(self_, text: str) -> str:  # noqa: N805
+                    result = _orig_g2p(text)
+                    return result[0] if isinstance(result, tuple) else result
+
+            pipeline.g2p = _G2PWrapper()
+
         self._kokoro_pipelines[lang_code] = pipeline
         return pipeline
 
@@ -5270,9 +5331,15 @@ class VideoPipeline:
 
         part_files.append(narration_wav)
 
-        if tail > 0.0:
+        remaining_tail = tail
+        outro_narration_wav = self.paths["outro_narration_wav"]
+        if remaining_tail > 0.0 and outro_narration_wav.exists() and outro_narration_wav.stat().st_size > 0:
+            part_files.append(outro_narration_wav)
+            remaining_tail = max(0.0, tail - self._media_duration(outro_narration_wav))
+
+        if remaining_tail > 0.0:
             tail_path = parts_dir / "outro_silence.wav"
-            self._generate_silence_wav(tail_path, tail, sample_rate=48000)
+            self._generate_silence_wav(tail_path, remaining_tail, sample_rate=48000)
             part_files.append(tail_path)
 
         self._concat_wav_parts(
@@ -5281,6 +5348,30 @@ class VideoPipeline:
             sample_rate=48000,
             concat_list_path=parts_dir / "concat_bookends.txt",
         )
+
+    def _resolved_outro_spoken_text(self) -> str:
+        explicit = re.sub(r"\s+", " ", str(self.config.outro_spoken_text or "").strip())
+        if explicit:
+            return explicit
+        return re.sub(r"\s+", " ", str(self.config.outro_text or "").strip())
+
+    def _ensure_outro_narration_audio(self) -> None:
+        raw_path = self.paths["outro_narration_raw"]
+        wav_path = self.paths["outro_narration_wav"]
+        spoken_text = self._clean_narration_text(self._resolved_outro_spoken_text())
+        if not self.config.include_outro or not spoken_text:
+            raw_path.unlink(missing_ok=True)
+            wav_path.unlink(missing_ok=True)
+            return
+
+        self._synthesize_narration(spoken_text, raw_path)
+        self._normalize_audio(raw_path, wav_path)
+
+    def _outro_spoken_audio_duration(self) -> float:
+        path = self.paths["outro_narration_wav"]
+        if not path.exists() or path.stat().st_size <= 0:
+            return 0.0
+        return max(0.0, self._media_duration(path))
 
     def _select_voice_sample_excerpt(self, text: str, sample_words: int) -> str:
         target = max(40, int(sample_words))
@@ -5960,6 +6051,7 @@ class VideoPipeline:
         self,
         shot_plan: ShotPlan,
         *,
+        preused_asset_keys: set[str] | None = None,
         preferred_candidates: dict[str, AssetCandidate] | None = None,
         persist_state: bool = True,
     ) -> list[AssetRight]:
@@ -5984,7 +6076,11 @@ class VideoPipeline:
 
         if synthetic_scenes:
             stock_plan = ScriptPlan(title=shot_plan.title, summary=shot_plan.summary, scenes=synthetic_scenes)
-            stock_rights = self._resolve_assets(stock_plan, preferred_candidates=preferred_candidates)
+            stock_rights = self._resolve_assets(
+                stock_plan,
+                preused_asset_keys=preused_asset_keys,
+                preferred_candidates=preferred_candidates,
+            )
             rights.extend(stock_rights)
             scene_by_id = {scene.scene_id: scene for scene in stock_plan.scenes}
             for shot in shot_plan.shots:
@@ -7951,7 +8047,7 @@ class VideoPipeline:
         return stabilized
 
     def _tokenize_caption_text(self, text: str) -> list[str]:
-        return re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?|[.,!?;:]", text)
+        return re.findall(r"[^\W_]+(?:'[^\W_]+)?|[.,!?;:]", text)
 
     def _join_caption_tokens(self, tokens: list[str]) -> str:
         punctuation = {".", ",", "!", "?", ";", ":"}
@@ -8035,8 +8131,8 @@ class VideoPipeline:
         return max(0.02, min(0.2, float(self.config.caption_bottom_ratio)))
 
     def _caption_token_is_highlightable(self, token: str) -> bool:
-        candidate = re.sub(r"^[^A-Za-z0-9']+|[^A-Za-z0-9']+$", "", token).strip()
-        return bool(re.fullmatch(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", candidate))
+        candidate = re.sub(r"^[^\w']+|[^\w']+$", "", token).strip()
+        return bool(re.fullmatch(r"[^\W_]+(?:'[^\W_]+)?", candidate))
 
     def _subtitle_follow_intervals(
         self,
@@ -8199,6 +8295,7 @@ class VideoPipeline:
         lines = [
             "[Script Info]",
             "ScriptType: v4.00+",
+            "Encoding: UTF-8",
             f"PlayResX: {self.config.width}",
             f"PlayResY: {self.config.height}",
             "WrapStyle: 2",
@@ -8296,7 +8393,8 @@ class VideoPipeline:
     def _outro_bookend_seconds(self) -> float:
         if not self.config.include_outro:
             return 0.0
-        return max(0.0, float(self.config.outro_seconds))
+        spoken_duration = self._outro_spoken_audio_duration()
+        return max(0.0, float(self.config.outro_seconds), spoken_duration + 0.4)
 
     def _shift_captions(
         self,
@@ -10401,6 +10499,7 @@ class VideoPipeline:
                 "intro_seconds": self.config.intro_seconds,
                 "outro_seconds": self.config.outro_seconds,
                 "outro_text": self.config.outro_text,
+                "outro_spoken_text": self.config.outro_spoken_text,
                 "channel_name": self.config.channel_name,
                 "intro_tagline": self.config.intro_tagline,
                 "outro_tagline": self.config.outro_tagline,

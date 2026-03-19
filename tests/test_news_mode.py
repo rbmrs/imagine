@@ -841,7 +841,13 @@ class NewsModePipelineTests(unittest.TestCase):
                 ],
             )
 
-            def fake_resolve(single_plan: ShotPlan, preferred_candidates=None, persist_state=False):
+            def fake_resolve(
+                single_plan: ShotPlan,
+                *,
+                preused_asset_keys=None,
+                preferred_candidates=None,
+                persist_state=False,
+            ):
                 single_plan.shots[0].asset_path = str(Path(tmpdir) / "internal-card.png")
                 single_plan.shots[0].asset_provider = "internal-shot-card"
                 single_plan.shots[0].fallback_level = "internal-card"
@@ -879,6 +885,27 @@ class NewsModePipelineTests(unittest.TestCase):
             self.assertEqual(refreshed_shot["asset_path"], str(existing_asset))
             self.assertEqual(refreshed_shot["asset_provider"], "pexels")
             self.assertEqual(refreshed_shot["fallback_level"], "exact")
+
+    def test_outro_bookend_seconds_expands_for_spoken_outro_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline = VideoPipeline(
+                PipelineConfig(
+                    prompt="Ports",
+                    project_dir=Path(tmpdir),
+                    content_mode="explainer",
+                    script_engine="template",
+                    include_outro=True,
+                    outro_seconds=3.0,
+                    outro_spoken_text="Thanks for watching. Remember to like, share and subscribe.",
+                )
+            )
+            pipeline._prepare_dirs()
+            outro_wav = pipeline.paths["outro_narration_wav"]
+            outro_wav.parent.mkdir(parents=True, exist_ok=True)
+            outro_wav.write_bytes(b"spoken-outro")
+
+            with mock.patch.object(pipeline, "_media_duration", return_value=4.4):
+                self.assertAlmostEqual(pipeline._outro_bookend_seconds(), 4.8)
 
     def test_tui_runtime_elapsed_formatting(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -920,6 +947,55 @@ class NewsModePipelineTests(unittest.TestCase):
                 self.assertEqual(app._format_runtime_elapsed(12.4), "12.4s elapsed")
                 self.assertEqual(app._format_runtime_elapsed(126.8), "02:06 elapsed")
                 self.assertEqual(app._format_runtime_elapsed(3723.4), "01:02:03 elapsed")
+            finally:
+                app._shutdown()
+
+    def test_religious_channel_resolves_portuguese_outro_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = TuiConfig(
+                prompt="Fé",
+                content_mode="explainer",
+                asset_keywords=[],
+                news_feed_urls=[],
+                project_dir=Path(tmpdir),
+                minutes=3,
+                resolution="1280x720",
+                burn_subtitles=True,
+                subtitle_preset="regular",
+                subtitle_position="bottom",
+                subtitle_accent_color="sunflower",
+                subtitle_box_color="sunflower",
+                fast_mode=False,
+                script_tone="conversational",
+                target_audience="público cristão",
+                hook_style="story-first",
+                narrative_mode="story-led",
+                example_density="balanced",
+                asset_mode="prefer-video",
+                image_motion_style="slow",
+                tts_engine="kokoro",
+                piper_voice_id="",
+                piper_speaker_id=None,
+                voice_profile="calm-documentary",
+                voice_speed=1.0,
+                melo_language="EN",
+                melo_speaker="EN-US",
+                kokoro_lang_code="pt-br",
+                kokoro_voice="pf_dora",
+                active_channel="refugio_da_fe",
+                script_language="pt-br",
+            )
+
+            with mock.patch.object(LocalVideoMvpTui, "_load_persisted_settings", autospec=True, return_value=None):
+                app = LocalVideoMvpTui(config)
+            try:
+                outro_text, outro_tagline, spoken_text = app._resolved_channel_outro_copy()
+                self.assertEqual(outro_text, "Obrigado por assistir")
+                self.assertEqual(outro_tagline, "Lembre-se de curtir, compartilhar e se inscrever")
+                self.assertEqual(
+                    spoken_text,
+                    "Obrigado por assistir. Lembre-se de curtir, compartilhar e se inscrever.",
+                )
             finally:
                 app._shutdown()
 
@@ -988,15 +1064,21 @@ class NewsModePipelineTests(unittest.TestCase):
                             with mock.patch.object(app, "_save_shot_review_state", return_value=None):
                                 with mock.patch.object(
                                     app,
-                                    "_select_from_list",
+                                    "_select_shot_review_entry",
                                     side_effect=[
                                         "01. Ports matter | shot 1/1",
-                                        "Play",
-                                        None,
                                         None,
                                     ],
-                                ) as select_mock:
-                                    outcome = app._run_shot_review_prompt(Path(tmpdir))
+                                ):
+                                    with mock.patch.object(
+                                        app,
+                                        "_select_from_list",
+                                        side_effect=[
+                                            "Play",
+                                            None,
+                                        ],
+                                    ) as select_mock:
+                                        outcome = app._run_shot_review_prompt(Path(tmpdir))
 
                 self.assertEqual(outcome, "cancel")
                 self.assertEqual(play_mock.call_count, 1)
@@ -1075,14 +1157,20 @@ class NewsModePipelineTests(unittest.TestCase):
                         with mock.patch.object(app, "_save_shot_review_state", return_value=None):
                             with mock.patch.object(
                                 app,
-                                "_select_from_list",
+                                "_select_shot_review_entry",
                                 side_effect=[
                                     "01. Ports matter | shot 1/1",
-                                    "Approve",
                                     None,
                                 ],
-                            ) as select_mock:
-                                outcome = app._run_shot_review_prompt(Path(tmpdir))
+                            ):
+                                with mock.patch.object(
+                                    app,
+                                    "_select_from_list",
+                                    side_effect=[
+                                        "Approve",
+                                    ],
+                                ) as select_mock:
+                                    outcome = app._run_shot_review_prompt(Path(tmpdir))
 
                 self.assertEqual(outcome, "cancel")
                 shot_modal_calls = [
@@ -1187,22 +1275,24 @@ class NewsModePipelineTests(unittest.TestCase):
                             with mock.patch.object(app, "_regenerate_shot_entry", return_value=True):
                                 with mock.patch.object(
                                     app,
-                                    "_select_from_list",
+                                    "_select_shot_review_entry",
                                     side_effect=[
                                         "02. Cargo moves | shot 1/1",
-                                        "Regenerate",
-                                        None,
                                         None,
                                     ],
-                                ) as select_mock:
-                                    outcome = app._run_shot_review_prompt(Path(tmpdir))
+                                ) as shot_review_mock:
+                                    with mock.patch.object(
+                                        app,
+                                        "_select_from_list",
+                                        side_effect=[
+                                            "Regenerate",
+                                            None,
+                                        ],
+                                    ):
+                                        outcome = app._run_shot_review_prompt(Path(tmpdir))
 
                 self.assertEqual(outcome, "cancel")
-                shot_review_calls = [
-                    call
-                    for call in select_mock.call_args_list
-                    if call.kwargs.get("label", "").startswith("Shot Review")
-                ]
+                shot_review_calls = list(shot_review_mock.call_args_list)
                 self.assertEqual(len(shot_review_calls), 2)
                 self.assertEqual(shot_review_calls[1].kwargs.get("current_value"), "02. [R] Cargo moves | shot 1/1")
             finally:
@@ -1506,11 +1596,11 @@ class NewsModePipelineTests(unittest.TestCase):
                         with mock.patch.object(app, "_prompt_yes_no", side_effect=AssertionError("unexpected prompt")):
                             app._maybe_prompt_stage_transition()
 
-                start_mock.assert_not_called()
+                start_mock.assert_called_once()
                 self.assertEqual(app._hitl_stage, "finalize")
                 self.assertEqual(
                     app._get_status(),
-                    f"Preview ready: {preview_path}. Press R to finalize when ready.",
+                    f"Preview ready: {preview_path}. Finalizing...",
                 )
             finally:
                 app._shutdown()

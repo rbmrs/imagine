@@ -993,6 +993,7 @@ def run_command(args: argparse.Namespace) -> int:
         intro_seconds=intro_seconds,
         outro_seconds=outro_seconds,
         outro_text=str(args.outro_text).strip() or "Thanks for watching",
+        outro_spoken_text="",
         channel_name=str(args.channel_name).strip() or "IMAGINE",
         intro_tagline=str(args.intro_tagline).strip(),
         outro_tagline=str(args.outro_tagline).strip() or "Watch next",
@@ -1203,6 +1204,7 @@ def replace_clips_command(args: argparse.Namespace) -> int:
         intro_seconds=max(0.0, _coerce_float(manifest_config.get("intro_seconds"), 0.0)),
         outro_seconds=max(0.0, _coerce_float(manifest_config.get("outro_seconds"), 0.0)),
         outro_text=_coerce_str(manifest_config.get("outro_text"), "Thanks for watching"),
+        outro_spoken_text=_coerce_str(manifest_config.get("outro_spoken_text"), ""),
         channel_name=_coerce_str(manifest_config.get("channel_name"), "IMAGINE"),
         intro_tagline=_coerce_str(manifest_config.get("intro_tagline"), ""),
         outro_tagline=_coerce_str(manifest_config.get("outro_tagline"), "Watch next"),
@@ -1964,7 +1966,37 @@ def imagine_entry() -> int:
     )
 
 
+def _load_dotenv_into_environ() -> None:
+    """Load repo .env into os.environ without overwriting existing vars."""
+    dotenv_path = Path(__file__).resolve().parents[2] / ".env"
+    if not dotenv_path.exists():
+        return
+    try:
+        for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            if "=" not in line:
+                continue
+            key, raw_value = line.split("=", maxsplit=1)
+            key = key.strip()
+            if not key or key in os.environ:
+                continue
+            value = raw_value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                value = value[1:-1]
+            else:
+                value = value.split(" #", maxsplit=1)[0].strip()
+            if value:
+                os.environ[key] = value
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main() -> int:
+    _load_dotenv_into_environ()
     parser = build_parser()
     args = parser.parse_args()
 

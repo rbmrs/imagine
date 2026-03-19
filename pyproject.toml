@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
   "feedparser>=6.0.11",
+  "Pillow>=10.4.0",
   "playwright>=1.52.0",
   "pytrends>=4.9.0",
   "requests>=2.32.0",
