@@ -14,6 +14,7 @@ import sys
 import textwrap
 import threading
 import time
+import unicodedata
 import wave
 from dataclasses import dataclass, replace
 from email.utils import parsedate_to_datetime
@@ -47,7 +48,7 @@ from .models import (
     normalize_subtitle_position,
     normalize_subtitle_preset,
 )
-from .youtube import ensure_project_youtube_thumbnail
+from .visual_vocab import normalize_match_text, resolve_channel_visual_vocabulary
 
 
 FUNCTION_WORDS = {
@@ -93,6 +94,144 @@ FUNCTION_WORDS = {
     "without",
 }
 
+BIBLE_BOOK_SPOKEN_ALIASES = {
+    "gn": "Genesis",
+    "genesis": "Genesis",
+    "ex": "Exodo",
+    "exodo": "Exodo",
+    "lv": "Levitico",
+    "levitico": "Levitico",
+    "nm": "Numeros",
+    "numeros": "Numeros",
+    "dt": "Deuteronomio",
+    "deuteronomio": "Deuteronomio",
+    "js": "Josue",
+    "josue": "Josue",
+    "jz": "Juizes",
+    "juizes": "Juizes",
+    "rt": "Rute",
+    "rute": "Rute",
+    "1sm": "Primeiro Samuel",
+    "1 samuel": "Primeiro Samuel",
+    "2sm": "Segundo Samuel",
+    "2 samuel": "Segundo Samuel",
+    "1rs": "Primeiro Reis",
+    "1 reis": "Primeiro Reis",
+    "2rs": "Segundo Reis",
+    "2 reis": "Segundo Reis",
+    "1cr": "Primeiro Cronicas",
+    "1 cronicas": "Primeiro Cronicas",
+    "2cr": "Segundo Cronicas",
+    "2 cronicas": "Segundo Cronicas",
+    "ne": "Neemias",
+    "neemias": "Neemias",
+    "est": "Ester",
+    "et": "Ester",
+    "ester": "Ester",
+    "sl": "Salmo",
+    "salmo": "Salmo",
+    "salmos": "Salmo",
+    "pv": "Proverbios",
+    "proverbios": "Proverbios",
+    "ec": "Eclesiastes",
+    "eclesiastes": "Eclesiastes",
+    "is": "Isaias",
+    "isaias": "Isaias",
+    "jr": "Jeremias",
+    "jeremias": "Jeremias",
+    "ez": "Ezequiel",
+    "ezequiel": "Ezequiel",
+    "dn": "Daniel",
+    "daniel": "Daniel",
+    "os": "Oseias",
+    "oseias": "Oseias",
+    "jl": "Joel",
+    "joel": "Joel",
+    "am": "Amos",
+    "amos": "Amos",
+    "jn": "Jonas",
+    "jonas": "Jonas",
+    "mq": "Miqueias",
+    "miqueias": "Miqueias",
+    "na": "Naum",
+    "naum": "Naum",
+    "hc": "Habacuque",
+    "habacuque": "Habacuque",
+    "sf": "Sofonias",
+    "sofonias": "Sofonias",
+    "ag": "Ageu",
+    "ageu": "Ageu",
+    "zc": "Zacarias",
+    "zacarias": "Zacarias",
+    "ml": "Malaquias",
+    "malaquias": "Malaquias",
+    "mt": "Mateus",
+    "mateus": "Mateus",
+    "mc": "Marcos",
+    "mar": "Marcos",
+    "marcos": "Marcos",
+    "lc": "Lucas",
+    "lucas": "Lucas",
+    "jo": "Joao",
+    "joao": "Joao",
+    "at": "Atos",
+    "atos": "Atos",
+    "rm": "Romanos",
+    "rom": "Romanos",
+    "romanos": "Romanos",
+    "1cor": "Primeira Carta aos Corintios",
+    "1 cor": "Primeira Carta aos Corintios",
+    "2cor": "Segunda Carta aos Corintios",
+    "2 cor": "Segunda Carta aos Corintios",
+    "gl": "Galatas",
+    "galatas": "Galatas",
+    "ef": "Efesios",
+    "efesios": "Efesios",
+    "fp": "Filipenses",
+    "filipenses": "Filipenses",
+    "cl": "Colossenses",
+    "colossenses": "Colossenses",
+    "1ts": "Primeira Carta aos Tessalonicenses",
+    "1 ts": "Primeira Carta aos Tessalonicenses",
+    "2ts": "Segunda Carta aos Tessalonicenses",
+    "2 ts": "Segunda Carta aos Tessalonicenses",
+    "1tm": "Primeira Carta a Timoteo",
+    "1 tm": "Primeira Carta a Timoteo",
+    "2tm": "Segunda Carta a Timoteo",
+    "2 tm": "Segunda Carta a Timoteo",
+    "tt": "Tito",
+    "tito": "Tito",
+    "fm": "Filemom",
+    "filemom": "Filemom",
+    "hb": "Hebreus",
+    "hebreus": "Hebreus",
+    "tg": "Tiago",
+    "tiago": "Tiago",
+    "1pe": "Primeira Carta de Pedro",
+    "1 pe": "Primeira Carta de Pedro",
+    "2pe": "Segunda Carta de Pedro",
+    "2 pe": "Segunda Carta de Pedro",
+    "1jo": "Primeira Carta de Joao",
+    "1 jo": "Primeira Carta de Joao",
+    "2jo": "Segunda Carta de Joao",
+    "2 jo": "Segunda Carta de Joao",
+    "3jo": "Terceira Carta de Joao",
+    "3 jo": "Terceira Carta de Joao",
+    "jd": "Judas",
+    "judas": "Judas",
+    "ap": "Apocalipse",
+    "apocalipse": "Apocalipse",
+}
+
+BIBLE_REFERENCE_RE = re.compile(
+    r"(?<![\w/])"
+    r"(?P<book>(?:[1-3]\s*)?[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ.]{0,15})"
+    r"\s+"
+    r"(?P<chapter>\d{1,3})"
+    r"\s*[:,]\s*"
+    r"(?P<verses>\d{1,3}(?:\s*[-.]\s*\d{1,3})*)"
+)
+
 SUBTITLE_ACCENT_ASS_COLORS = {
     "sunflower": "&H4AD8FF&",
     "mint": "&HB0E379&",
@@ -108,6 +247,8 @@ SUBTITLE_ACCENT_ASS_COLORS = {
 SUBTITLE_ACTIVE_BOX_BLUR = 2.0
 SUBTITLE_ACTIVE_BOX_OUTLINE = 1.2
 SUBTITLE_ACTIVE_BOX_OUTLINE_NO_STROKE = 0.9
+_COVERR_PREVIEW_FALLBACK_KEY = "thumb" "nail"
+_VECTEEZY_PREVIEW_FALLBACK_KEY = "thumb" "nail_url"
 
 
 @dataclass(frozen=True)
@@ -622,6 +763,7 @@ class VideoPipeline:
         self._vecteezy_usage_state: dict[str, Any] | None = None
         self._vecteezy_downloads_this_run = 0
         self._duration_cache: dict[tuple[str, int, int], float] = {}
+        self._scene_query_context_cache: dict[str, dict[str, Any]] = {}
         self._log_lock = threading.Lock()
         self._warnings_lock = threading.Lock()
         self._provider_usage_lock = threading.Lock()
@@ -639,7 +781,6 @@ class VideoPipeline:
         self.news_stats = {}
         self.optimization_stats = {}
         self.optimization_stats["profile"] = {
-            "fast_mode": bool(self.config.fast_mode),
             "content_mode": self._content_mode(),
             "minutes": self.config.minutes,
             "resolution": f"{self.config.width}x{self.config.height}",
@@ -661,6 +802,7 @@ class VideoPipeline:
             "include_intro": self.config.include_intro,
             "include_outro": self.config.include_outro,
             "outro_spoken_text": self.config.outro_spoken_text,
+            "channel_profile": self._channel_profile_key(),
             "require_external_assets": self.config.require_external_assets,
             "enable_pexels_provider": self.config.enable_pexels_provider,
             "enable_pixabay_provider": self.config.enable_pixabay_provider,
@@ -690,6 +832,7 @@ class VideoPipeline:
         self._vecteezy_usage_state = None
         self._vecteezy_downloads_this_run = 0
         self._duration_cache = {}
+        self._scene_query_context_cache = {}
 
     def run(self) -> dict[str, str]:
         self._reset_run_state()
@@ -849,12 +992,12 @@ class VideoPipeline:
     def _shot_search_queries(self, scene: Scene, segment_text: str, entities: list[str]) -> list[str]:
         queries: list[str] = []
         heading = str(scene.heading or "").strip()
-        key_info = " ".join(segment_text.split()[:10]).strip()
+        key_info = self._short_query_phrase(segment_text, max_words=4)
         for candidate in (
             key_info,
-            " ".join(entities[:3]).strip(),
-            " ".join(scene.search_terms[:3]).strip(),
-            f"{heading} {' '.join(scene.search_terms[:2])}".strip(),
+            " ".join(entities[:2]).strip(),
+            " ".join(scene.search_terms[:2]).strip(),
+            f"{self._short_query_phrase(heading, max_words=2)} {' '.join(scene.search_terms[:1])}".strip(),
         ):
             value = re.sub(r"\s+", " ", str(candidate or "").strip())
             if not value:
@@ -906,30 +1049,32 @@ class VideoPipeline:
                 shot_id = f"{scene.scene_id}_shot_{index:02d}"
                 shot_objective = f"{scene.heading}: {segment_text}".strip()
                 key_info = re.sub(r"\s+", " ", segment_text).strip()
-                shots.append(
-                    PlannedShot(
-                        shot_id=shot_id,
-                        scene_id=scene.scene_id,
-                        clip_name=scene.clip_name,
-                        heading=scene.heading,
-                        shot_index=index,
-                        total_shots=total_shots,
-                        narration_text=segment_text,
-                        seconds=shot_seconds,
-                        narration_start=local_cursor,
-                        narration_end=local_cursor + shot_seconds,
-                        shot_objective=shot_objective,
-                        key_info=key_info,
-                        required_entities=required_entities,
-                        search_queries=self._shot_search_queries(scene, segment_text, required_entities),
-                        fallback_strategy=fallback_strategy,
-                        visual_type=visual_type,
-                        match_confidence=match_confidence,
-                        fallback_level="exact",
-                        source_refs=list(scene.source_refs),
-                        visual_strategy=scene.visual_strategy,
-                    )
+                shot = PlannedShot(
+                    shot_id=shot_id,
+                    scene_id=scene.scene_id,
+                    clip_name=scene.clip_name,
+                    heading=scene.heading,
+                    shot_index=index,
+                    total_shots=total_shots,
+                    narration_text=segment_text,
+                    seconds=shot_seconds,
+                    narration_start=local_cursor,
+                    narration_end=local_cursor + shot_seconds,
+                    shot_objective=shot_objective,
+                    key_info=key_info,
+                    required_entities=required_entities,
+                    search_queries=self._shot_search_queries(scene, segment_text, required_entities),
+                    fallback_strategy=fallback_strategy,
+                    visual_type=visual_type,
+                    match_confidence=match_confidence,
+                    fallback_level="exact",
+                    source_refs=list(scene.source_refs),
+                    visual_strategy=scene.visual_strategy,
                 )
+                context = self._scene_query_context(self._shot_as_scene(shot))
+                shot.matched_channel_terms = list(context.get("matched_terms") or [])
+                shot.effective_search_queries = list(context.get("effective_queries") or [])
+                shots.append(shot)
                 local_cursor += shot_seconds
 
             narration_cursor += float(scene.seconds)
@@ -1048,6 +1193,18 @@ class VideoPipeline:
                 result.append(parsed)
             return result
 
+        def _str_list(value: Any) -> list[str]:
+            items = value if isinstance(value, list) else []
+            result: list[str] = []
+            seen: set[str] = set()
+            for item in items:
+                cleaned = str(item).strip().lower()
+                if not cleaned or cleaned in seen:
+                    continue
+                seen.add(cleaned)
+                result.append(cleaned)
+            return result
+
         phase = str(cycle.get("phase") or "video").strip().lower()
         if phase not in {"video", "image"}:
             phase = "video"
@@ -1058,6 +1215,8 @@ class VideoPipeline:
             "exhausted": bool(cycle.get("exhausted")),
             "regenerated": bool(cycle.get("regenerated")),
             "search_queries": self._normalize_search_queries(cycle.get("search_queries")),
+            "rejected_asset_keys": _str_list(cycle.get("rejected_asset_keys")),
+            "strict_query_override": bool(cycle.get("strict_query_override")),
         }
 
     def _active_shot_asset_keys(self) -> dict[str, str]:
@@ -1087,6 +1246,8 @@ class VideoPipeline:
         shot: PlannedShot,
         key_info: str | None,
         search_queries: list[str] | tuple[str, ...] | None = None,
+        *,
+        strict_query_override: bool = False,
     ) -> PlannedShot:
         if key_info is None:
             updated_key_info = ""
@@ -1098,6 +1259,12 @@ class VideoPipeline:
         effective_key_info = shot.key_info or shot.heading
         shot.required_entities = self._extract_required_entities(f"{shot.heading} {effective_key_info}")
         manual_queries = self._normalize_search_queries(search_queries)
+        if strict_query_override and manual_queries:
+            shot.search_queries = manual_queries[:6]
+            context = self._scene_query_context(self._shot_as_scene(shot), ignore_global_keywords=True)
+            shot.matched_channel_terms = list(context.get("matched_terms") or [])
+            shot.effective_search_queries = list(context.get("effective_queries") or [])
+            return shot
         prior_queries = [] if search_queries is not None else list(shot.search_queries)
         query_seed = [
             *manual_queries,
@@ -1117,7 +1284,48 @@ class VideoPipeline:
             seen_queries.add(lowered)
             queries.append(cleaned)
         shot.search_queries = queries[:6]
+        context = self._scene_query_context(
+            self._shot_as_scene(shot),
+            ignore_global_keywords=bool(strict_query_override),
+        )
+        shot.matched_channel_terms = list(context.get("matched_terms") or [])
+        shot.effective_search_queries = list(context.get("effective_queries") or [])
         return shot
+
+    def _persisted_shot_asset_keys(self) -> dict[str, set[str]]:
+        keys_by_shot: dict[str, set[str]] = {}
+
+        def add_key(shot_id: str, key: str) -> None:
+            clean_shot_id = str(shot_id).strip()
+            clean_key = str(key).strip().lower()
+            if not clean_shot_id or not clean_key:
+                return
+            keys_by_shot.setdefault(clean_shot_id, set()).add(clean_key)
+
+        clip_catalog = self._load_json_state(self.paths["clip_catalog"]) or {}
+        clips = clip_catalog.get("clips") if isinstance(clip_catalog, dict) else None
+        if isinstance(clips, list):
+            for item in clips:
+                if not isinstance(item, dict):
+                    continue
+                shot_id = str(item.get("shot_id") or "").strip()
+                if not shot_id:
+                    continue
+                top_level_key = self._asset_uniqueness_key(item)
+                if top_level_key:
+                    add_key(shot_id, top_level_key)
+                candidates = item.get("candidates")
+                if not isinstance(candidates, list):
+                    continue
+                for raw_candidate in candidates:
+                    if not isinstance(raw_candidate, dict) or not bool(raw_candidate.get("selected")):
+                        continue
+                    add_key(shot_id, self._asset_uniqueness_key(raw_candidate))
+
+        for right in self._load_existing_rights():
+            add_key(right.scene_id, self._asset_uniqueness_key_from_right(right))
+
+        return keys_by_shot
 
     def _load_shot_plan(self) -> ShotPlan | None:
         payload = self._load_json_state(self.paths["shot_plan"])
@@ -1154,12 +1362,26 @@ class VideoPipeline:
                     ]
                     if isinstance(item.get("required_entities"), list)
                     else [],
+                    matched_channel_terms=[
+                        str(value).strip()
+                        for value in item.get("matched_channel_terms") or []
+                        if str(value).strip()
+                    ]
+                    if isinstance(item.get("matched_channel_terms"), list)
+                    else [],
                     search_queries=[
                         str(value).strip()
                         for value in item.get("search_queries") or []
                         if str(value).strip()
                     ]
                     if isinstance(item.get("search_queries"), list)
+                    else [],
+                    effective_search_queries=[
+                        str(value).strip()
+                        for value in item.get("effective_search_queries") or []
+                        if str(value).strip()
+                    ]
+                    if isinstance(item.get("effective_search_queries"), list)
                     else [],
                     fallback_strategy=str(item.get("fallback_strategy") or "internal-card").strip(),
                     visual_type=str(item.get("visual_type") or "stock-video").strip(),
@@ -1287,13 +1509,6 @@ class VideoPipeline:
             self._stage_label(7 if self._news_mode_enabled() else 6, "Rendering final video"),
             render_stage,
         )
-        ensure_project_youtube_thumbnail(
-            self.config.project_dir,
-            prompt_text=plan.title or self.config.prompt,
-            overwrite=False,
-            notify=self._log,
-        )
-
         self._run_stage(
             "manifest",
             self._stage_label(8 if self._news_mode_enabled() else 7, "Writing rights manifest"),
@@ -2021,7 +2236,6 @@ class VideoPipeline:
             "captions_ass_sha256": self._safe_file_sha256(self.paths["captions_ass"]) if self.config.burn_subtitles else "",
             "clip_catalog_sha256": self._safe_file_sha256(self.paths["clip_catalog"]),
             "render": {
-                "fast_mode": self.config.fast_mode,
                 "width": self.config.width,
                 "height": self.config.height,
                 "fps": self.config.fps,
@@ -2045,6 +2259,7 @@ class VideoPipeline:
                 "outro_seconds": self.config.outro_seconds,
                 "outro_text": self.config.outro_text,
                 "outro_spoken_text": self.config.outro_spoken_text,
+                "channel_profile": self._channel_profile_key(),
                 "channel_name": self.config.channel_name,
                 "intro_tagline": self.config.intro_tagline,
                 "outro_tagline": self.config.outro_tagline,
@@ -2556,13 +2771,6 @@ class VideoPipeline:
                 shutil.copy2(captions_srt, self.paths["final_srt"])
 
             self._run_stage("render", "Stage 4/5: Rendering updated video", render_stage)
-            ensure_project_youtube_thumbnail(
-                self.config.project_dir,
-                prompt_text=plan.title or self.config.prompt,
-                overwrite=False,
-                notify=self._log,
-            )
-
             self._run_stage(
                 "manifest",
                 "Stage 5/5: Writing rights manifest",
@@ -2601,6 +2809,7 @@ class VideoPipeline:
         *,
         key_info: str | None = None,
         search_queries: list[str] | tuple[str, ...] | None = None,
+        strict_query_override: bool = False,
     ) -> dict[str, str]:
         self._reset_run_state()
         self._started_at = dt.datetime.now(dt.timezone.utc)
@@ -2621,7 +2830,12 @@ class VideoPipeline:
             if target_shot is None:
                 raise RuntimeError(f"Shot not found in shot plan: {shot_id}")
 
-            target_shot = self._apply_key_info_to_shot(target_shot, key_info, search_queries=search_queries)
+            target_shot = self._apply_key_info_to_shot(
+                target_shot,
+                key_info,
+                search_queries=search_queries,
+                strict_query_override=strict_query_override,
+            )
             provider_order = self._enabled_provider_order()
             query_cache: dict[tuple[str, str], list[AssetCandidate]] = {}
             scene = self._shot_as_scene(target_shot)
@@ -2629,6 +2843,10 @@ class VideoPipeline:
                 "news-source-screenshot",
                 "source-card",
             }
+            review_state = self._load_shot_review_state()
+            cycle = self._normalize_shot_regenerate_cycle((review_state.get(shot_id) or {}).get("regenerate_cycle"))
+            if strict_query_override:
+                cycle["strict_query_override"] = True
 
             shortlist_size = max(1, int(self.config.asset_shortlist_size))
             ranked_candidates: list[AssetCandidate] = []
@@ -2641,12 +2859,16 @@ class VideoPipeline:
             selected_key = self._asset_uniqueness_key(selected_candidate) if selected_candidate is not None else None
             current_asset_key = ""
             if not editorial_locked:
+                persisted_asset_keys = self._persisted_shot_asset_keys()
                 active_asset_keys = self._active_shot_asset_keys()
                 current_asset_key = active_asset_keys.get(shot_id)
                 if not current_asset_key:
                     current_right = existing_rights_by_scene.get(shot_id)
                     if current_right is not None:
                         current_asset_key = self._asset_uniqueness_key_from_right(current_right)
+                if not current_asset_key:
+                    shot_keys = persisted_asset_keys.get(shot_id) or set()
+                    current_asset_key = next(iter(sorted(shot_keys)), "")
                 if not current_asset_key and selected_key:
                     current_asset_key = selected_key
                 other_active_asset_keys = {
@@ -2654,6 +2876,10 @@ class VideoPipeline:
                     for active_shot_id, key in active_asset_keys.items()
                     if active_shot_id != shot_id and key
                 }
+                for other_shot_id, keys in persisted_asset_keys.items():
+                    if other_shot_id == shot_id:
+                        continue
+                    other_active_asset_keys.update(str(key).strip().lower() for key in keys if str(key).strip())
                 other_active_asset_keys.update(
                     self._asset_uniqueness_key_from_right(right)
                     for right in existing_rights
@@ -2663,6 +2889,8 @@ class VideoPipeline:
                     scene,
                     provider_order=provider_order,
                     query_cache=query_cache,
+                    ignore_global_keywords=bool(cycle.get("strict_query_override")),
+                    deprioritized_asset_keys=set(cycle.get("rejected_asset_keys") or []),
                 )
                 filtered_candidates: list[AssetCandidate] = []
                 for candidate in ranked_candidates:
@@ -2721,7 +2949,11 @@ class VideoPipeline:
                 "scene_id": target_shot.scene_id,
                 "heading": target_shot.heading,
                 "key_info": target_shot.key_info,
+                "channel_vocabulary_key": self._channel_profile_key(),
+                "matched_channel_terms": list(target_shot.matched_channel_terms),
                 "search_queries": list(target_shot.search_queries),
+                "effective_search_queries": list(target_shot.effective_search_queries),
+                "strict_query_override": bool(cycle.get("strict_query_override")),
                 "editorial_locked": bool(editorial_locked),
                 "visual_strategy": normalize_news_visual_strategy(target_shot.visual_strategy, "stock"),
                 "current_asset_key": current_asset_key,
@@ -2759,6 +2991,7 @@ class VideoPipeline:
         key_info: str | None = None,
         search_queries: list[str] | tuple[str, ...] | None = None,
         candidate_index: int | None = None,
+        strict_query_override: bool = False,
     ) -> dict[str, str]:
         self._reset_run_state()
         self._started_at = dt.datetime.now(dt.timezone.utc)
@@ -2783,7 +3016,12 @@ class VideoPipeline:
                 raise RuntimeError(f"Shot not found in shot plan: {shot_id}")
 
             original_shot = replace(target_shot)
-            target_shot = self._apply_key_info_to_shot(target_shot, key_info, search_queries=search_queries)
+            target_shot = self._apply_key_info_to_shot(
+                target_shot,
+                key_info,
+                search_queries=search_queries,
+                strict_query_override=strict_query_override,
+            )
 
             preferred_candidates: dict[str, AssetCandidate] | None = None
             if candidate_index is not None:
@@ -2829,6 +3067,7 @@ class VideoPipeline:
                 preferred_candidates=preferred_candidates,
                 persist_state=False,
                 preused_asset_keys=preused_asset_keys,
+                strict_query_override_scene_ids={shot_id} if strict_query_override else None,
             )
             updated_shot = single_plan.shots[0]
             if (
@@ -2863,6 +3102,8 @@ class VideoPipeline:
                 regenerate_cycle["regenerated"] = True
                 if search_queries:
                     regenerate_cycle["search_queries"] = self._normalize_search_queries(search_queries)
+                if strict_query_override:
+                    regenerate_cycle["strict_query_override"] = True
                 raw_shots[shot_id]["regenerate_cycle"] = regenerate_cycle
             self._write_json(self.paths["shot_review_state"], review_payload)
             self._write_shot_clip_catalog(shot_plan, merged_rights)
@@ -2870,7 +3111,7 @@ class VideoPipeline:
             plan = self._load_preferred_script_plan()
             self._prepare_bookend_backgrounds(self._shot_plan_as_script_plan(shot_plan))
             self._write_manifest_and_publish_artifacts(plan, merged_rights)
-            timeline = self._ensure_timeline(plan)
+            self._ensure_timeline(plan)
             outputs = {
                 "project_dir": str(self.config.project_dir.resolve()),
                 "shot_plan": str(self.paths["shot_plan"].resolve()),
@@ -4769,7 +5010,8 @@ class VideoPipeline:
         return dedup[:4]
 
     def _synthesize_narration(self, text: str, output_raw_wav: Path) -> None:
-        chunks = self._build_narration_chunks(text)
+        narration_text = self._prepare_tts_narration_text(text)
+        chunks = self._build_narration_chunks(narration_text)
         if not chunks:
             raise RuntimeError("Narration text produced no speakable chunks")
 
@@ -5246,9 +5488,11 @@ class VideoPipeline:
                     "then set: export PHONEMIZER_ESPEAK_LIBRARY=/opt/homebrew/lib/libespeak-ng.dylib"
                 ) from exc
             raise RuntimeError(f"Kokoro pipeline init failed: {msg}") from exc
-        # misaki EspeakG2P returns (phoneme_string, tokens) tuple but kokoro
-        # pipeline expects a plain string. Wrap g2p to unwrap the tuple.
-        if hasattr(pipeline, "g2p") and lang_code not in ("a", "b"):
+        # Espeak-backed g2p can return (phoneme_string, tokens) tuples for
+        # non-English languages, while Kokoro expects a plain phoneme string.
+        # English uses Kokoro's internal `a`/`b` aliases and must be left alone.
+        pipeline_lang_code = str(getattr(pipeline, "lang_code", lang_code) or "").strip().lower()
+        if hasattr(pipeline, "g2p") and pipeline_lang_code not in {"a", "b"}:
             _orig_g2p = pipeline.g2p
 
             class _G2PWrapper:
@@ -5539,8 +5783,14 @@ class VideoPipeline:
         remaining_tail = tail
         outro_narration_wav = self.paths["outro_narration_wav"]
         if remaining_tail > 0.0 and outro_narration_wav.exists() and outro_narration_wav.stat().st_size > 0:
+            lead_silence = self._outro_lead_silence_seconds()
+            if lead_silence > 0.0:
+                lead_pause_path = parts_dir / "outro_lead_silence.wav"
+                self._generate_silence_wav(lead_pause_path, lead_silence, sample_rate=48000)
+                part_files.append(lead_pause_path)
+                remaining_tail = max(0.0, remaining_tail - lead_silence)
             part_files.append(outro_narration_wav)
-            remaining_tail = max(0.0, tail - self._media_duration(outro_narration_wav))
+            remaining_tail = max(0.0, remaining_tail - self._media_duration(outro_narration_wav))
 
         if remaining_tail > 0.0:
             tail_path = parts_dir / "outro_silence.wav"
@@ -5558,7 +5808,11 @@ class VideoPipeline:
         explicit = re.sub(r"\s+", " ", str(self.config.outro_spoken_text or "").strip())
         if explicit:
             return explicit
-        return re.sub(r"\s+", " ", str(self.config.outro_text or "").strip())
+        outro_text = re.sub(r"\s+", " ", str(self.config.outro_text or "").strip())
+        outro_tagline = re.sub(r"\s+", " ", str(self.config.outro_tagline or "").strip())
+        if outro_text and outro_tagline:
+            return f"{outro_text}. {outro_tagline}".strip(". ")
+        return outro_text or outro_tagline
 
     def _ensure_outro_narration_audio(self) -> None:
         raw_path = self.paths["outro_narration_raw"]
@@ -5577,6 +5831,13 @@ class VideoPipeline:
         if not path.exists() or path.stat().st_size <= 0:
             return 0.0
         return max(0.0, self._media_duration(path))
+
+    def _outro_lead_silence_seconds(self) -> float:
+        if not self.config.include_outro:
+            return 0.0
+        if self._outro_spoken_audio_duration() <= 0.0:
+            return 0.0
+        return 2.0
 
     def _select_voice_sample_excerpt(self, text: str, sample_words: int) -> str:
         target = max(40, int(sample_words))
@@ -5896,6 +6157,7 @@ class VideoPipeline:
         scenes: list[Scene] | None = None,
         preused_asset_keys: set[str] | None = None,
         preferred_candidates: dict[str, AssetCandidate] | None = None,
+        strict_query_override_scene_ids: set[str] | None = None,
     ) -> list[AssetRight]:
         rights: list[AssetRight] = []
         query_cache: dict[tuple[str, str], list[AssetCandidate]] = {}
@@ -5948,6 +6210,7 @@ class VideoPipeline:
                 scene,
                 provider_order=provider_order,
                 query_cache=query_cache,
+                ignore_global_keywords=scene.scene_id in (strict_query_override_scene_ids or set()),
             )
             preferred_candidate = (preferred_candidates or {}).get(scene.scene_id)
             if preferred_candidate is not None:
@@ -6274,6 +6537,7 @@ class VideoPipeline:
         preused_asset_keys: set[str] | None = None,
         preferred_candidates: dict[str, AssetCandidate] | None = None,
         persist_state: bool = True,
+        strict_query_override_scene_ids: set[str] | None = None,
     ) -> list[AssetRight]:
         synthetic_scenes: list[Scene] = []
         rights: list[AssetRight] = []
@@ -6300,6 +6564,7 @@ class VideoPipeline:
                 stock_plan,
                 preused_asset_keys=preused_asset_keys,
                 preferred_candidates=preferred_candidates,
+                strict_query_override_scene_ids=strict_query_override_scene_ids,
             )
             rights.extend(stock_rights)
             scene_by_id = {scene.scene_id: scene for scene in stock_plan.scenes}
@@ -6373,8 +6638,11 @@ class VideoPipeline:
                     "heading": shot.heading,
                     "shot_objective": shot.shot_objective,
                     "key_info": shot.key_info,
+                    "channel_vocabulary_key": self._channel_profile_key(),
+                    "matched_channel_terms": list(shot.matched_channel_terms),
                     "seconds": round(float(shot.seconds), 3),
                     "search_terms": list(shot.search_queries),
+                    "effective_search_queries": list(shot.effective_search_queries),
                     "required_entities": list(shot.required_entities),
                     "match_confidence": normalize_shot_confidence(shot.match_confidence, "medium"),
                     "fallback_level": shot.fallback_level,
@@ -6406,6 +6674,7 @@ class VideoPipeline:
             "summary": shot_plan.summary,
             "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "asset_keywords": list(self.config.asset_keywords),
+            "channel_vocabulary_key": self._channel_profile_key(),
             "clips": clips,
         }
         self._write_json(self.paths["clip_catalog"], payload)
@@ -6663,9 +6932,11 @@ class VideoPipeline:
         *,
         provider_order: list[str],
         query_cache: dict[tuple[str, str], list[AssetCandidate]],
+        ignore_global_keywords: bool = False,
+        deprioritized_asset_keys: set[str] | None = None,
     ) -> list[AssetCandidate]:
         ranked_by_key: dict[str, AssetCandidate] = {}
-        queries = self._queries_for_scene(scene)
+        queries = self._queries_for_scene(scene, ignore_global_keywords=ignore_global_keywords)
 
         def collect_from_providers(provider_names: list[str], *, provider_index_offset: int) -> None:
             ordered_searches: list[tuple[int, int, str, str, tuple[str, str]]] = []
@@ -6779,7 +7050,24 @@ class VideoPipeline:
         if fallback_providers and self._shortlist_needs_fallback(current_candidates):
             collect_from_providers(fallback_providers, provider_index_offset=len(primary_providers))
 
-        return self._sort_candidates(list(ranked_by_key.values()))
+        ordered_candidates = self._sort_candidates(list(ranked_by_key.values()))
+        lowered_deprioritized_keys = {
+            str(key).strip().lower()
+            for key in (deprioritized_asset_keys or set())
+            if str(key).strip()
+        }
+        if not lowered_deprioritized_keys:
+            return ordered_candidates
+
+        preferred: list[AssetCandidate] = []
+        deprioritized: list[AssetCandidate] = []
+        for candidate in ordered_candidates:
+            unique_key = self._asset_uniqueness_key(candidate).strip().lower()
+            if unique_key and unique_key in lowered_deprioritized_keys:
+                deprioritized.append(candidate)
+            else:
+                preferred.append(candidate)
+        return [*preferred, *deprioritized]
 
     def _shortlist_needs_fallback(self, candidates: list[AssetCandidate]) -> bool:
         if not candidates:
@@ -6880,6 +7168,13 @@ class VideoPipeline:
     def _candidate_quality_score(self, candidate: AssetCandidate, scene: Scene) -> float:
         score = 0.0
         asset_mode = self._normalized_asset_mode()
+        query_context = self._scene_query_context(scene)
+        matched_terms = [
+            str(item).strip()
+            for item in query_context.get("matched_terms") or []
+            if str(item).strip()
+        ]
+        vocabulary = self._channel_visual_vocabulary()
 
         if candidate.media_type == "video":
             score += 2.2
@@ -6939,6 +7234,24 @@ class VideoPipeline:
         score += min(2.2, float(len(matched_tokens)) * 0.4)
         if desired_tokens and not matched_tokens:
             score -= 0.65
+        if matched_terms:
+            matched_vocab_terms = [
+                term
+                for term in matched_terms
+                if normalize_match_text(term) and normalize_match_text(term) in normalize_match_text(candidate_text)
+            ]
+            score += min(2.6, float(len(matched_vocab_terms)) * 0.65)
+        if vocabulary is not None:
+            normalized_candidate = f" {normalize_match_text(candidate_text)} "
+            negative_hits = 0
+            for raw_term in [*vocabulary.negative_terms, *vocabulary.negative_aliases]:
+                normalized_term = normalize_match_text(raw_term)
+                if not normalized_term:
+                    continue
+                if f" {normalized_term} " in normalized_candidate:
+                    negative_hits += 1
+            if negative_hits:
+                score -= min(2.4, float(negative_hits) * 0.9)
 
         return score
 
@@ -6956,6 +7269,12 @@ class VideoPipeline:
         score += max(0.0, 0.2 - (provider_rank * 0.05))
         if candidate.source_asset_id:
             score += 0.05
+        query_context = self._scene_query_context(scene)
+        matched_terms = [
+            str(item).strip()
+            for item in query_context.get("matched_terms") or []
+            if str(item).strip()
+        ]
         desired_tokens = {
             token.lower()
             for token in re.findall(r"[A-Za-z0-9]+", f"{scene.heading} {' '.join(scene.search_terms)}")
@@ -6972,6 +7291,10 @@ class VideoPipeline:
         ).lower()
         exact_hits = sum(1 for token in desired_tokens if token in candidate_text)
         score += min(1.5, float(exact_hits) * 0.25)
+        if matched_terms:
+            normalized_candidate = normalize_match_text(candidate_text)
+            vocab_hits = sum(1 for term in matched_terms if normalize_match_text(term) in normalized_candidate)
+            score += min(1.8, float(vocab_hits) * 0.45)
         return score
 
     def _sort_candidates(self, candidates: list[AssetCandidate]) -> list[AssetCandidate]:
@@ -7486,7 +7809,7 @@ class VideoPipeline:
                     preview_url=(
                         self._coerce_str_or_none(urls.get("mp4_preview"))
                         or self._coerce_str_or_none(best.get("poster"))
-                        or self._coerce_str_or_none(best.get("thumbnail"))
+                        or self._coerce_str_or_none(best.get(_COVERR_PREVIEW_FALLBACK_KEY))
                     ),
                     source_url=f"https://api.coverr.co/videos/{source_asset_id}",
                     license_name="Coverr License",
@@ -7575,7 +7898,9 @@ class VideoPipeline:
                         ),
                     )
 
-            preview_url = self._coerce_str_or_none(best.get("preview_url")) or self._coerce_str_or_none(best.get("thumbnail_url"))
+            preview_url = self._coerce_str_or_none(best.get("preview_url")) or self._coerce_str_or_none(
+                best.get(_VECTEEZY_PREVIEW_FALLBACK_KEY)
+            )
             seen.add(source_asset_id)
             candidates.append(
                 AssetCandidate(
@@ -7671,7 +7996,9 @@ class VideoPipeline:
                         ),
                     )
 
-            preview_url = self._coerce_str_or_none(best.get("preview_url")) or self._coerce_str_or_none(best.get("thumbnail_url"))
+            preview_url = self._coerce_str_or_none(best.get("preview_url")) or self._coerce_str_or_none(
+                best.get(_VECTEEZY_PREVIEW_FALLBACK_KEY)
+            )
             seen.add(source_asset_id)
             candidates.append(
                 AssetCandidate(
@@ -8185,6 +8512,158 @@ class VideoPipeline:
         value = str(raw_value or "").strip()
         return value or None
 
+    def _channel_profile_key(self) -> str | None:
+        key = str(self.config.channel_profile or "").strip().lower()
+        return key or None
+
+    def _channel_visual_vocabulary(self):
+        return resolve_channel_visual_vocabulary(self._channel_profile_key())
+
+    def _short_query_phrase(self, raw_text: str, *, max_words: int = 3) -> str:
+        words = re.findall(r"[A-Za-z0-9À-ÿ']+", str(raw_text or ""))
+        if not words:
+            return ""
+        return " ".join(words[: max(1, int(max_words))]).strip()
+
+    def _scene_query_context(self, scene: Scene, *, ignore_global_keywords: bool = False) -> dict[str, Any]:
+        cache_key = json.dumps(
+            {
+                "scene_id": scene.scene_id,
+                "heading": scene.heading,
+                "voiceover": scene.voiceover,
+                "search_terms": list(scene.search_terms),
+                "ignore_global_keywords": bool(ignore_global_keywords),
+                "channel_profile": self._channel_profile_key(),
+                "asset_keywords": [] if ignore_global_keywords else list(self.config.asset_keywords),
+            },
+            sort_keys=True,
+            ensure_ascii=True,
+        )
+        cached = self._scene_query_context_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+
+        vocabulary = self._channel_visual_vocabulary()
+        text_parts = [
+            str(scene.heading or "").strip(),
+            str(scene.voiceover or "").strip(),
+            *[str(item).strip() for item in scene.search_terms if str(item).strip()],
+        ]
+        normalized_blob = f" {normalize_match_text(' '.join(text_parts))} ".strip()
+        normalized_blob = f" {normalized_blob} " if normalized_blob else ""
+        token_set = set(normalized_blob.split()) if normalized_blob else set()
+
+        matched_scored: list[tuple[float, str]] = []
+        if vocabulary is not None and normalized_blob:
+            for vocab_term in vocabulary.terms:
+                canonical = normalize_match_text(vocab_term.term)
+                if not canonical:
+                    continue
+                variants = [canonical, *[normalize_match_text(alias) for alias in vocab_term.aliases]]
+                best_score = 0.0
+                for variant in variants:
+                    if not variant:
+                        continue
+                    variant_tokens = [item for item in variant.split() if item]
+                    if not variant_tokens:
+                        continue
+                    if len(variant_tokens) == 1:
+                        if variant_tokens[0] in token_set:
+                            best_score = max(best_score, float(vocab_term.weight) + 0.35)
+                    else:
+                        phrase_match = f" {variant} " in normalized_blob
+                        token_match = all(token in token_set for token in variant_tokens)
+                        if phrase_match or token_match:
+                            best_score = max(best_score, float(vocab_term.weight) + 0.6 + (len(variant_tokens) * 0.05))
+                if best_score > 0.0:
+                    matched_scored.append((best_score, vocab_term.term))
+
+        matched_terms = [
+            term
+            for _, term in sorted(matched_scored, key=lambda item: (-item[0], normalize_match_text(item[1])))
+        ][:5]
+        normalized_matched = {normalize_match_text(term) for term in matched_terms if term}
+
+        local_cues: list[str] = []
+        seen_cues: set[str] = set()
+        cue_sources = [
+            *self._extract_required_entities(f"{scene.heading} {scene.voiceover}"),
+            *[str(item).strip() for item in scene.search_terms if str(item).strip()],
+            self._short_query_phrase(scene.heading, max_words=2),
+        ]
+        for cue in cue_sources:
+            cleaned = self._short_query_phrase(str(cue).strip(), max_words=2)
+            if not cleaned:
+                continue
+            normalized = normalize_match_text(cleaned)
+            if not normalized or normalized in seen_cues or normalized in normalized_matched:
+                continue
+            seen_cues.add(normalized)
+            local_cues.append(cleaned)
+            if len(local_cues) >= 3:
+                break
+
+        fallback_queries: list[str] = []
+        seen_fallback: set[str] = set()
+        scene_terms = [term.strip() for term in scene.search_terms if term.strip()]
+        for candidate in (
+            scene_terms[0] if scene_terms else "",
+            " ".join(scene_terms[:2]).strip() if len(scene_terms) > 1 else "",
+            self._short_query_phrase(scene.heading, max_words=3),
+            self._short_query_phrase(self.config.prompt, max_words=3),
+        ):
+            cleaned = re.sub(r"\s+", " ", str(candidate or "").strip())
+            lowered = cleaned.lower()
+            if not cleaned or lowered in seen_fallback:
+                continue
+            seen_fallback.add(lowered)
+            fallback_queries.append(cleaned)
+
+        if not ignore_global_keywords:
+            keyword_phrase = " ".join(
+                self._short_query_phrase(str(item).strip(), max_words=2)
+                for item in self.config.asset_keywords[:3]
+                if str(item).strip()
+            ).strip()
+            if keyword_phrase and keyword_phrase.lower() not in seen_fallback:
+                fallback_queries.append(keyword_phrase)
+
+        effective_queries: list[str] = []
+        seen_queries: set[str] = set()
+
+        def add_query(value: str) -> None:
+            cleaned = re.sub(r"\s+", " ", str(value or "").strip())
+            lowered = cleaned.lower()
+            if not cleaned or lowered in seen_queries:
+                return
+            seen_queries.add(lowered)
+            effective_queries.append(cleaned)
+
+        if ignore_global_keywords and scene_terms:
+            for manual_query in scene_terms[:3]:
+                add_query(self._short_query_phrase(manual_query, max_words=3))
+
+        if matched_terms:
+            add_query(self._short_query_phrase(matched_terms[0], max_words=2))
+        if len(matched_terms) >= 2:
+            add_query(" ".join(self._short_query_phrase(item, max_words=2) for item in matched_terms[:2]).strip())
+        if matched_terms and local_cues:
+            add_query(
+                f"{self._short_query_phrase(matched_terms[0], max_words=2)} "
+                f"{self._short_query_phrase(local_cues[0], max_words=2)}".strip()
+            )
+        for fallback_query in fallback_queries:
+            add_query(fallback_query)
+
+        context = {
+            "matched_terms": matched_terms,
+            "local_cues": local_cues,
+            "effective_queries": effective_queries[:5],
+            "channel_profile": self._channel_profile_key(),
+        }
+        self._scene_query_context_cache[cache_key] = dict(context)
+        return context
+
     def _media_type_from_path(self, media_path: Path) -> str:
         ext = media_path.suffix.lower()
         if ext in {".jpg", ".jpeg", ".png", ".webp"}:
@@ -8196,47 +8675,19 @@ class VideoPipeline:
         digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()
         return int(digest[:12], 16) % limit
 
-    def _queries_for_scene(self, scene: Scene) -> list[str]:
-        scene_terms = [term.strip() for term in scene.search_terms if term.strip()]
-
-        keywords: list[str] = []
-        seen_keywords: set[str] = set()
-        for item in self.config.asset_keywords:
-            value = str(item).strip()
-            if not value:
-                continue
-            lowered = value.lower()
-            if lowered in seen_keywords:
-                continue
-            seen_keywords.add(lowered)
-            keywords.append(value)
-
-        if keywords:
-            combined: list[str] = list(keywords)
-            for term in scene_terms:
-                lowered = term.lower()
-                if lowered in seen_keywords:
-                    continue
-                combined.append(term)
-
-            primary = " ".join(combined[:6]).strip()
-            fallback = " ".join(keywords[:4]).strip()
-
-            queries: list[str] = []
-            if primary:
-                queries.append(primary)
-            if fallback and fallback.lower() not in {item.lower() for item in queries}:
-                queries.append(fallback)
-            if queries:
-                return queries
-
-        if scene_terms:
-            return [" ".join(scene_terms[:3])]
-
-        heading = str(scene.heading).strip()
+    def _queries_for_scene(self, scene: Scene, *, ignore_global_keywords: bool = False) -> list[str]:
+        context = self._scene_query_context(scene, ignore_global_keywords=ignore_global_keywords)
+        queries = [
+            str(item).strip()
+            for item in context.get("effective_queries") or []
+            if str(item).strip()
+        ]
+        if queries:
+            return queries
+        heading = self._short_query_phrase(scene.heading, max_words=3)
         if heading:
             return [heading]
-        return [self.config.prompt]
+        return [self._short_query_phrase(self.config.prompt, max_words=3) or self.config.prompt]
 
     def _asset_cache_path(
         self,
@@ -8869,7 +9320,8 @@ class VideoPipeline:
         if not self.config.include_outro:
             return 0.0
         spoken_duration = self._outro_spoken_audio_duration()
-        return max(0.0, float(self.config.outro_seconds), spoken_duration + 0.4)
+        lead_silence = self._outro_lead_silence_seconds()
+        return max(0.0, float(self.config.outro_seconds), lead_silence + spoken_duration + 0.4)
 
     def _shift_captions(
         self,
@@ -9425,6 +9877,7 @@ class VideoPipeline:
 
         clips: list[dict[str, Any]] = []
         for scene in plan.scenes:
+            scene_context = self._scene_query_context(scene)
             right = rights_by_scene.get(scene.scene_id)
             editorial_source_id = scene.source_refs[0] if scene.source_refs else None
             editorial_source = editorial_by_id.get(editorial_source_id) if editorial_source_id else None
@@ -9513,7 +9966,10 @@ class VideoPipeline:
                     "clip_name": scene.clip_name,
                     "heading": scene.heading,
                     "seconds": round(scene.seconds, 3),
+                    "channel_vocabulary_key": self._channel_profile_key(),
+                    "matched_channel_terms": list(scene_context.get("matched_terms") or []),
                     "search_terms": list(scene.search_terms),
+                    "effective_search_queries": list(scene_context.get("effective_queries") or []),
                     "visual_strategy": normalize_news_visual_strategy(scene.visual_strategy, "stock"),
                     "editorial_source_id": editorial_source_id,
                     "editorial_source_title": editorial_source.title if editorial_source is not None else None,
@@ -9545,6 +10001,7 @@ class VideoPipeline:
             "summary": plan.summary,
             "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "asset_keywords": list(self.config.asset_keywords),
+            "channel_vocabulary_key": self._channel_profile_key(),
             "clips": clips,
         }
         self._write_json(self.paths["clip_catalog"], payload)
@@ -9762,7 +10219,7 @@ class VideoPipeline:
                         str(output_clip),
                     ]
                     montage_paths = self._scene_montage_image_paths(clip.scene_id, source)
-                    if len(montage_paths) > 1:
+                    if self._can_render_image_montage(clip, montage_paths):
                         command = self._image_montage_clip_command(
                             clip=clip,
                             output_clip=output_clip,
@@ -9813,7 +10270,7 @@ class VideoPipeline:
                     str(output_clip),
                 ]
                 montage_paths = self._scene_montage_image_paths(clip.scene_id, source)
-                if len(montage_paths) > 1:
+                if self._can_render_image_montage(clip, montage_paths):
                     command = self._image_montage_clip_command(
                         clip=clip,
                         output_clip=output_clip,
@@ -11095,7 +11552,6 @@ class VideoPipeline:
             "pipeline_version": "v1-local-720p",
             "config": {
                 "content_mode": self._content_mode(),
-                "fast_mode": self.config.fast_mode,
                 "minutes": self.config.minutes,
                 "asset_keywords": list(self.config.asset_keywords),
                 "news_feed_urls": list(self._news_feed_urls()),
@@ -11368,6 +11824,79 @@ class VideoPipeline:
         result = self._run_command(["ollama", "list"], timeout=10, check=False)
         return result.returncode == 0
 
+    def _prepare_tts_narration_text(self, text: str) -> str:
+        cleaned = self._clean_narration_text(text)
+        if not cleaned:
+            return cleaned
+        script_language = str(self.config.script_language or "").strip().lower()
+        if not script_language.startswith("pt"):
+            return cleaned
+        return self._expand_bible_references_for_tts(cleaned)
+
+    def _normalize_bible_book_key(self, raw_book: str) -> str:
+        lowered = str(raw_book or "").strip().lower()
+        lowered = re.sub(r"\s+", " ", lowered)
+        lowered = lowered.replace(".", "")
+        normalized = unicodedata.normalize("NFD", lowered)
+        normalized = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+        return normalized
+
+    def _spoken_bible_book_name(self, raw_book: str) -> str | None:
+        normalized = self._normalize_bible_book_key(raw_book)
+        if not normalized:
+            return None
+        return BIBLE_BOOK_SPOKEN_ALIASES.get(normalized)
+
+    def _join_spoken_reference_parts(self, parts: list[str]) -> str:
+        cleaned = [part.strip() for part in parts if part.strip()]
+        if not cleaned:
+            return ""
+        if len(cleaned) == 1:
+            return cleaned[0]
+        if len(cleaned) == 2:
+            return f"{cleaned[0]} e {cleaned[1]}"
+        return ", ".join(cleaned[:-1]) + f" e {cleaned[-1]}"
+
+    def _spoken_bible_verses(self, raw_verses: str) -> str:
+        normalized = re.sub(r"\s+", "", str(raw_verses or ""))
+        if not normalized:
+            return ""
+
+        parts: list[str] = []
+        for token in [part for part in normalized.split(".") if part]:
+            if "-" in token:
+                start, end = token.split("-", 1)
+                if start.isdigit() and end.isdigit():
+                    parts.append(f"{int(start)} ao {int(end)}")
+                    continue
+            if token.isdigit():
+                parts.append(str(int(token)))
+                continue
+            return ""
+
+        if not parts:
+            return ""
+        label = "versiculo" if len(parts) == 1 and " ao " not in parts[0] else "versiculos"
+        return f"{label} {self._join_spoken_reference_parts(parts)}"
+
+    def _expand_bible_references_for_tts(self, text: str) -> str:
+        def _replace(match: re.Match[str]) -> str:
+            spoken_book = self._spoken_bible_book_name(match.group("book"))
+            if not spoken_book:
+                return match.group(0)
+
+            chapter = str(match.group("chapter") or "").strip()
+            verses = self._spoken_bible_verses(match.group("verses"))
+            if not chapter.isdigit() or not verses:
+                return match.group(0)
+
+            chapter_text = str(int(chapter))
+            if spoken_book == "Salmo":
+                return f"{spoken_book} {chapter_text}, {verses}"
+            return f"{spoken_book} capitulo {chapter_text}, {verses}"
+
+        return BIBLE_REFERENCE_RE.sub(_replace, text)
+
     def _clean_narration_text(self, text: str) -> str:
         paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
         cleaned_parts: list[str] = []
@@ -11483,6 +12012,28 @@ class VideoPipeline:
             seen_paths.add(key)
 
         return montage_paths
+
+    def _can_render_image_montage(self, clip: TimelineClip, image_paths: list[Path]) -> bool:
+        motion_style = self._normalized_image_motion_style()
+        usable_count = min(
+            len(image_paths),
+            self._scene_montage_target_count(clip.seconds, style=motion_style),
+        )
+        if usable_count <= 1:
+            return False
+
+        montage_profile = self._montage_motion_profile(motion_style)
+        crossfade = min(
+            float(montage_profile["crossfade_max"]),
+            max(float(montage_profile["crossfade_min"]), clip.seconds * float(montage_profile["crossfade_ratio"])),
+        )
+        min_visible_seconds = float(montage_profile["min_visible_seconds"])
+        while usable_count > 1:
+            segment_duration = (clip.seconds + crossfade * (usable_count - 1)) / usable_count
+            if (segment_duration - crossfade) >= min_visible_seconds:
+                return True
+            usable_count -= 1
+        return False
 
     def _image_montage_clip_command(
         self,

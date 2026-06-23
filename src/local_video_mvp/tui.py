@@ -24,9 +24,25 @@ import urllib.request
 import warnings
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Deque, Literal, TextIO, TypeVar, cast, overload
+from typing import Any, Callable, Deque, Literal, Optional, TextIO, TypeVar, cast, overload
+
+try:
+    from PIL import Image, ImageColor, ImageDraw, ImageFilter, ImageFont
+except Exception:  # noqa: BLE001
+    Image = None
+    ImageColor = None
+    ImageDraw = None
+    ImageFilter = None
+    ImageFont = None
+
+try:
+    import torch
+    from diffusers import AutoPipelineForText2Image
+except Exception:  # noqa: BLE001
+    torch = None
+    AutoPipelineForText2Image = None
 
 from .cli import _apply_default_brand_bookends, _parse_resolution
 from .models import (
@@ -53,42 +69,7 @@ from .pipeline import (
     kokoro_voice_choices_for_lang,
     normalize_kokoro_lang_code,
 )
-from .thumbnail_studio import (
-    THUMBNAIL_STUDIO_DEFAULT_COMFYUI_URL,
-    THUMBNAIL_STUDIO_DEFAULT_EXPORT_DIR,
-    THUMBNAIL_STUDIO_DEFAULT_PALETTE,
-    THUMBNAIL_STUDIO_DEFAULT_PRESET,
-    THUMBNAIL_STUDIO_PALETTE_CHOICES,
-    THUMBNAIL_STUDIO_PRESET_CHOICES,
-    ThumbnailStudioSession,
-    comfyui_endpoint_reachable,
-    create_thumbnail_studio_session,
-    export_thumbnail_studio_variant,
-    generate_thumbnail_studio_variants,
-    list_thumbnail_studio_sessions,
-    load_thumbnail_studio_session,
-    palette_label,
-    preset_label,
-    rerender_thumbnail_studio_session,
-    save_thumbnail_studio_session,
-    selected_thumbnail_variant,
-    thumbnail_studio_session_dir,
-    thumbnail_studio_session_preview_path,
-)
 from .youtube import (
-    YOUTUBE_THUMBNAIL_ANCHOR_CHOICES,
-    YOUTUBE_THUMBNAIL_DEFAULT_ANCHOR,
-    YOUTUBE_THUMBNAIL_DEFAULT_FONT_COLOR,
-    YOUTUBE_THUMBNAIL_DEFAULT_FONT_SIZE,
-    YOUTUBE_THUMBNAIL_DEFAULT_OUTLINE_COLOR,
-    YOUTUBE_THUMBNAIL_DEFAULT_TEXT_ALIGN,
-    YOUTUBE_THUMBNAIL_DEFAULT_TEXT_PLATE,
-    YOUTUBE_THUMBNAIL_FONT_COLOR_CHOICES,
-    YOUTUBE_THUMBNAIL_FONT_SIZE_CHOICES,
-    YOUTUBE_THUMBNAIL_MAX_OFFSET,
-    YOUTUBE_THUMBNAIL_OUTLINE_COLOR_CHOICES,
-    YOUTUBE_THUMBNAIL_TEXT_PLATE_CHOICES,
-    YOUTUBE_THUMBNAIL_TEXT_ALIGN_CHOICES,
     YOUTUBE_VISIBILITY_CHOICES,
     YouTubeAuthState,
     YouTubePublishDraft,
@@ -97,13 +78,9 @@ from .youtube import (
     ensure_youtube_token,
     draft_review_text,
     ensure_youtube_publish_draft,
-    ensure_project_youtube_thumbnail,
-    export_youtube_thumbnail_work_image,
     publish_youtube_draft,
-    render_youtube_thumbnail_for_draft,
+    resolve_video_package,
     save_youtube_publish_draft,
-    youtube_thumbnail_diagnostics,
-    youtube_thumbnail_text_suggestions,
     youtube_draft_path,
     detect_youtube_auth_state,
 )
@@ -124,7 +101,6 @@ class TuiConfig:
     subtitle_position: str
     subtitle_accent_color: str
     subtitle_box_color: str
-    fast_mode: bool
     script_tone: str
     target_audience: str
     hook_style: str
@@ -142,7 +118,6 @@ class TuiConfig:
     kokoro_lang_code: str
     kokoro_voice: str
     include_intro: bool = False
-    external_editor_command: str = ""
     caption_font_scale: float = 0.9
     subtitle_bold: bool = True
     subtitle_outline: bool = True
@@ -154,10 +129,6 @@ class TuiConfig:
     allow_attribution_required_assets: bool = True
     active_channel: str = "general"
     script_language: str = "en"
-    thumbnail_comfyui_url: str = THUMBNAIL_STUDIO_DEFAULT_COMFYUI_URL
-    thumbnail_comfyui_install_dir: str = ""
-    thumbnail_default_export_dir: str = str(THUMBNAIL_STUDIO_DEFAULT_EXPORT_DIR)
-    thumbnail_use_ollama_hooks: bool = True
 
 
 T = TypeVar("T")
@@ -173,11 +144,44 @@ class ConfigEditResult:
     had_warning: bool = False
 
 
+@dataclass
+class ThumbnailConcept:
+    background_prompt: str
+    headline_text: str
+    headline_position: str
+    headline_color: str
+    outline_color: str
+    accent_color: str
+    style_hint: str
+    subject_hint: str
+    seed: int
+
+
+@dataclass
+class ThumbnailRenderResult:
+    concept: ThumbnailConcept
+    image_path: Path
+
+
+@dataclass
+class ThumbnailGeneratorState:
+    prompt_options: list[str] = field(default_factory=list)
+    selected_prompt_index: int = 0
+    custom_prompt: str = ""
+    custom_prompt_cursor: int = 0
+    generation_index: int = 0
+    render_result: ThumbnailRenderResult | None = None
+    message: str = "Select a prompt and press Enter."
+
+
 class LocalVideoMvpTui:
+    ESC_DELAY_MS = 40
     SPINNER_FRAMES = ["-", "\\", "|", "/"]
     IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
     VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm"}
     SHOT_REVIEW_PREVIEW_IMAGE_ID = 91021
+    THUMBNAIL_PREVIEW_IMAGE_ID = 91022
+    THUMBNAIL_DIFFUSION_MODEL_ID = "stabilityai/sd-turbo"
     STOCK_ENV_KEYS = (
         "PEXELS_API_KEY",
         "PIXABAY_API_KEY",
@@ -300,97 +304,6 @@ class LocalVideoMvpTui:
         "Large": "Noticeably larger captions for stronger on-screen presence.",
         "X-Large": "Maximum preset size for the most prominent caption treatment.",
     }
-    YOUTUBE_THUMBNAIL_COLOR_DETAILS = {
-        "white": "High-contrast default for bright, bold text.",
-        "sunflower": "Warm yellow for a classic YouTube-style pop.",
-        "mint": "Soft green for a fresher, calmer look.",
-        "coral": "Warm red-orange for a stronger urgent feel.",
-        "sky": "Cool blue for a cleaner technical look.",
-        "tangerine": "Bright orange for a warmer headline treatment.",
-        "black": "Dark text only when the frame is bright enough.",
-        "charcoal": "Near-black outline with softer contrast than pure black.",
-        "midnight": "Dark blue outline for cooler scenes.",
-        "navy": "Blue-black outline that stays softer than black.",
-        "crimson": "Dark red outline for a stylized warmer edge.",
-    }
-    YOUTUBE_THUMBNAIL_FONT_SIZE_LABELS = {
-        "small": "Small",
-        "medium": "Medium",
-        "large": "Large",
-        "extra-large": "Extra Large",
-    }
-    YOUTUBE_THUMBNAIL_ANCHOR_LABELS = {
-        "top-left": "Top Left",
-        "top-center": "Top Center",
-        "top-right": "Top Right",
-        "center-left": "Center Left",
-        "center": "Center",
-        "center-right": "Center Right",
-        "bottom-left": "Bottom Left",
-        "bottom-center": "Bottom Center",
-        "bottom-right": "Bottom Right",
-    }
-    YOUTUBE_THUMBNAIL_ALIGN_LABELS = {
-        "left": "Left",
-        "center": "Center",
-        "right": "Right",
-    }
-    YOUTUBE_THUMBNAIL_TEXT_PLATE_LABELS = {
-        "none": "None",
-        "soft": "Soft Plate",
-        "strong": "Strong Plate",
-    }
-    YOUTUBE_THUMBNAIL_TEXT_PLATE_DETAILS = {
-        "none": "No extra plate behind the text. Cleanest look, but less forgiving on busy frames.",
-        "soft": "Adds a subtle dark plate behind the headline for safer contrast.",
-        "strong": "Adds a stronger dark plate for high-contrast banner-style thumbnails.",
-    }
-    YOUTUBE_THUMBNAIL_STYLE_PRESETS = (
-        {
-            "key": "classic-hook",
-            "label": "Classic Hook",
-            "detail": "Large lower-left hook with a soft contrast plate. Best default for most explainers.",
-            "font_color": "white",
-            "outline_color": "charcoal",
-            "font_size_mode": "extra-large",
-            "anchor": "bottom-left",
-            "text_align": "left",
-            "text_plate": "soft",
-        },
-        {
-            "key": "top-banner",
-            "label": "Top Banner",
-            "detail": "Big centered headline across the top with a stronger plate.",
-            "font_color": "white",
-            "outline_color": "charcoal",
-            "font_size_mode": "extra-large",
-            "anchor": "top-center",
-            "text_align": "center",
-            "text_plate": "strong",
-        },
-        {
-            "key": "right-hook",
-            "label": "Right Hook",
-            "detail": "Right-aligned hook that leaves more room for a subject on the left.",
-            "font_color": "sunflower",
-            "outline_color": "charcoal",
-            "font_size_mode": "large",
-            "anchor": "bottom-right",
-            "text_align": "right",
-            "text_plate": "soft",
-        },
-        {
-            "key": "object-focus",
-            "label": "Object Focus",
-            "detail": "Top-centered hook with softer technical styling for single-object thumbnails.",
-            "font_color": "white",
-            "outline_color": "midnight",
-            "font_size_mode": "large",
-            "anchor": "top-center",
-            "text_align": "center",
-            "text_plate": "soft",
-        },
-    )
     VOICE_PROFILE_CHOICES = ("calm-documentary", "balanced", "energetic-explainer")
     CHANNEL_PROFILES: dict[str, dict] = {
         "general": {
@@ -488,6 +401,9 @@ class LocalVideoMvpTui:
         "pt-br": "Veículos autônomos estão transformando a mobilidade, a segurança e o planejamento das cidades em todo o mundo.",
     }
     DEBUG_PIPER_VOICES = tuple(dict(item) for item in PIPER_VOICE_PRESETS)
+    LUCKY_HISTORY_LIMIT = 120
+    LUCKY_RECENT_TOPIC_WINDOW = 18
+    LUCKY_CONTEXT_LIMIT = 6
 
     def __init__(self, config: TuiConfig) -> None:
         self.config = config
@@ -533,7 +449,7 @@ class LocalVideoMvpTui:
         self._pending_shot_review_prompt: dict[str, Any] | None = None
         self._pending_scene_review_prompt: dict[str, Any] | None = None
         self._hitl_stage = "sources" if self._content_mode() == "news" else "draft"
-        self._hitl_enabled = True
+        self._package_layout_prepared = False
 
         self._stock_api_keys: dict[str, str] = {}
         self._stock_key_sources: dict[str, str] = {}
@@ -546,6 +462,11 @@ class LocalVideoMvpTui:
         self._mpv_input_conf_path: Path | None = None
         self._shot_preview_image_cache: dict[tuple[str, str, int], Path] = {}
         self._shot_preview_color_cache: dict[tuple[str, int, int, int], list[bytes]] = {}
+        self._terminal_graphics_image_cache: dict[tuple[str, int], Path] = {}
+        self._voice_inventory_cache: dict[str, Any] | None = None
+        self._voice_inventory_loading = False
+        self._voice_inventory_loaded_at: float | None = None
+        self._voice_inventory_ready_event = threading.Event()
 
         self._started_ollama = False
         self._ollama_process: subprocess.Popen[str] | None = None
@@ -553,6 +474,8 @@ class LocalVideoMvpTui:
         self._ollama_starting = False
         self._ollama_probe_checked_at = 0.0
         self._ollama_probe_online: bool | None = None
+        self._thumbnail_diffusion_pipeline: Any = None
+        self._thumbnail_diffusion_device: str | None = None
         self._started_comfyui = False
         self._comfyui_process: subprocess.Popen[str] | None = None
         self._comfyui_log_handle: TextIO | None = None
@@ -562,7 +485,7 @@ class LocalVideoMvpTui:
         self._comfyui_detected_install_dir: Path | None = None
         self._comfyui_detection_attempted = False
 
-        self._used_trends: list[str] = []
+        self._lucky_history: dict[str, Any] = {"trending": [], "channels": {}}
 
         self._session_log_handle: TextIO | None = None
         self._session_log_path, self._latest_log_path = self._init_session_log_paths()
@@ -572,9 +495,9 @@ class LocalVideoMvpTui:
 
         self._open_session_log()
         self._load_persisted_settings()
-        self._enforce_news_hitl_policy()
         self._refresh_prior_total_seconds()
         self._refresh_stock_key_cache()
+        self._start_voice_inventory_preload()
         self._append_log(f"Session log: {self._session_log_path}")
 
     def run(self) -> int:
@@ -586,12 +509,15 @@ class LocalVideoMvpTui:
 
     def _main(self, stdscr: Any) -> None:
         self._stdscr = stdscr
+        try:
+            curses.set_escdelay(self.ESC_DELAY_MS)
+        except Exception:  # noqa: BLE001
+            pass
         stdscr.nodelay(True)
         stdscr.timeout(120)
         stdscr.keypad(True)
         self._init_colors()
         self._start_ollama_on_launch()
-        self._start_comfyui_on_launch()
 
         try:
             curses.curs_set(0)
@@ -629,6 +555,10 @@ class LocalVideoMvpTui:
             curses.init_pair(5, curses.COLOR_BLUE, -1)
             curses.init_pair(6, curses.COLOR_WHITE, -1)
             curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_BLACK)
+            curses.init_pair(8, curses.COLOR_WHITE, curses.COLOR_BLUE)
+            curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_RED)
+            curses.init_pair(10, curses.COLOR_BLACK, curses.COLOR_WHITE)
+            curses.init_pair(11, curses.COLOR_WHITE, curses.COLOR_GREEN)
             self._color_pairs = {
                 "title": 1,
                 "ok": 2,
@@ -637,6 +567,10 @@ class LocalVideoMvpTui:
                 "accent": 5,
                 "muted": 6,
                 "backdrop": 7,
+                "thumb-blue": 8,
+                "thumb-red": 9,
+                "thumb-white": 10,
+                "thumb-green": 11,
             }
             self._color_enabled = True
         except curses.error:
@@ -676,10 +610,6 @@ class LocalVideoMvpTui:
             self._open_prompt_settings_menu()
             return
 
-        if char in {"t", "T"}:
-            self._open_thumbnail_studio_menu()
-            return
-
         if char in {"s", "S"}:
             self._open_settings_menu()
             return
@@ -688,9 +618,1009 @@ class LocalVideoMvpTui:
             self._open_youtube_publish_menu()
             return
 
+        if char in {"t", "T"}:
+            self._open_thumbnail_sandbox()
+            return
+
         if char in {"c", "C"}:
             self._clean_projects()
             return
+
+    def _thumbnail_runtime_dir(self) -> Path:
+        root = (Path.home() / ".imagine" / "runtime" / "thumbnail-generator").resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _thumbnail_preview_dir(self) -> Path:
+        preview_dir = self._thumbnail_runtime_dir() / "preview"
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        return preview_dir
+
+    def _thumbnail_export_dir(self) -> Path:
+        target = Path("/Users/rafaelbm/Imagine").resolve()
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def _thumbnail_export_path(self, prompt: str) -> Path:
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+        slug = self._slugify(prompt) or "thumbnail"
+        return (self._thumbnail_export_dir() / f"{slug}-thumbnail-{stamp}.jpg").resolve()
+
+    def _thumbnail_fallback_concept(self, prompt: str, seed: int) -> ThumbnailConcept:
+        digest = hashlib.sha1(f"{prompt}|{seed}".encode("utf-8")).hexdigest()
+        _, language_name = self._thumbnail_channel_language_context()
+        headline_words = [word for word in re.findall(r"[0-9A-Za-zÀ-ÿ]+", prompt.upper()) if len(word) > 2][:4]
+        fallback_headline = "GRANDE IDEIA" if language_name == "Brazilian Portuguese" else "BIG IDEA"
+        headline = " ".join(headline_words[:3]).strip() or fallback_headline
+        position = "top" if int(digest[0], 16) % 2 == 0 else "center"
+        headline_color = "yellow" if int(digest[1], 16) % 2 == 0 else "white"
+        accent_color = ["#14b8ff", "#22c55e", "#ef4444", "#8b5cf6", "#f97316"][int(digest[2], 16) % 5]
+        return ThumbnailConcept(
+            background_prompt=f"dramatic simple thumbnail for {prompt}",
+            headline_text=headline,
+            headline_position=position,
+            headline_color=headline_color,
+            outline_color="black",
+            accent_color=accent_color,
+            style_hint="high-contrast hero object",
+            subject_hint=prompt,
+            seed=seed,
+        )
+
+    def _parse_thumbnail_concept_json(self, raw_text: str, *, prompt: str, seed: int) -> ThumbnailConcept:
+        text = str(raw_text or "").strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            text = "\n".join(lines[1:-1] if lines and lines[-1].strip() == "```" else lines[1:])
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return self._thumbnail_fallback_concept(prompt, seed)
+        try:
+            payload = json.loads(text[start : end + 1])
+        except Exception:
+            return self._thumbnail_fallback_concept(prompt, seed)
+        if not isinstance(payload, dict):
+            return self._thumbnail_fallback_concept(prompt, seed)
+
+        headline_text = re.sub(r"\s+", " ", str(payload.get("headline_text") or "")).strip().upper()
+        headline_words = headline_text.split()
+        if not headline_words:
+            headline_text = self._thumbnail_fallback_concept(prompt, seed).headline_text
+        else:
+            headline_text = " ".join(headline_words[:4])
+
+        position_raw = str(payload.get("headline_position") or "center").strip().lower()
+        if position_raw not in {"center", "top"}:
+            position_raw = "center"
+
+        headline_color = str(payload.get("headline_color") or "white").strip().lower()
+        if headline_color not in {"white", "yellow"}:
+            headline_color = "white"
+
+        outline_color = str(payload.get("outline_color") or "black").strip().lower() or "black"
+        accent_color = str(payload.get("accent_color") or "#14b8ff").strip() or "#14b8ff"
+        if accent_color.lower() in {"null", "none"}:
+            accent_color = "#14b8ff"
+        style_hint = re.sub(r"\s+", " ", str(payload.get("style_hint") or "")).strip() or "high-contrast hero object"
+        subject_hint = re.sub(r"\s+", " ", str(payload.get("subject_hint") or "")).strip() or prompt
+        background_prompt = re.sub(r"\s+", " ", str(payload.get("background_prompt") or "")).strip() or prompt
+
+        return ThumbnailConcept(
+            background_prompt=background_prompt,
+            headline_text=headline_text,
+            headline_position=position_raw,
+            headline_color=headline_color,
+            outline_color=outline_color,
+            accent_color=accent_color,
+            style_hint=style_hint,
+            subject_hint=subject_hint,
+            seed=seed,
+        )
+
+    def _generate_thumbnail_concept_with_ollama(self, prompt: str, *, seed: int) -> ThumbnailConcept:
+        if not self._probe_ollama_online(timeout=1.5):
+            raise RuntimeError("Ollama is unavailable. Start it with `ollama serve` and retry.")
+        channel_label, language_name = self._thumbnail_channel_language_context()
+
+        system_prompt = (
+            "You create professional YouTube thumbnail concepts. "
+            "Return only valid JSON. Keep headline_text to 1-4 words, punchy, readable, and click-driven. "
+            "Favor big bold white or yellow text, strong black outline, top or center placement, "
+            "high contrast, one dominant subject, simple composition, modern lighting. "
+            f"headline_text must be written in {language_name} and should fit the channel context."
+        )
+        user_prompt = (
+            f"Topic: {prompt}\n"
+            f"Channel: {channel_label}\n"
+            f"Language: {language_name}\n"
+            f"Variation seed: {seed}\n"
+            "Return JSON with keys: "
+            'background_prompt, headline_text, headline_position, headline_color, outline_color, accent_color, style_hint, subject_hint.\n'
+            'headline_position must be "top" or "center".\n'
+            'headline_color must be "white" or "yellow".\n'
+            "Do not include markdown."
+        )
+        completed = subprocess.run(
+            ["ollama", "run", "qwen2.5:14b", f"{system_prompt}\n\n{user_prompt}"],
+            cwd=str(self._repo_root),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if int(completed.returncode or 0) != 0:
+            stderr_text = str(completed.stderr or "").strip()
+            raise RuntimeError(stderr_text or "Ollama thumbnail concept generation failed.")
+        return self._parse_thumbnail_concept_json(str(completed.stdout or ""), prompt=prompt, seed=seed)
+
+    def _fallback_thumbnail_prompt_options(self, base_prompt: str) -> list[str]:
+        cleaned = re.sub(r"\s+", " ", str(base_prompt or "").strip())
+        if not cleaned:
+            cleaned = "modern science breakthrough"
+        return [
+            f"{cleaned}, dramatic close-up hero subject, high contrast lighting, no text",
+            f"{cleaned}, minimalist cinematic background, one dominant object, strong glow, no text",
+        ]
+
+    def _thumbnail_channel_language_context(self) -> tuple[str, str]:
+        profile = self.CHANNEL_PROFILES.get(self.config.active_channel, self.CHANNEL_PROFILES["general"])
+        script_language = str(profile.get("script_language") or self.config.script_language or "en").strip().lower()
+        channel_label = str(profile.get("label") or self.config.active_channel or "General").strip()
+        language_name = {
+            "pt-br": "Brazilian Portuguese",
+            "pt": "Portuguese",
+            "en": "English",
+        }.get(script_language, script_language or "English")
+        return channel_label, language_name
+
+    def _generate_thumbnail_prompt_options(self, base_prompt: str) -> list[str]:
+        cleaned = re.sub(r"\s+", " ", str(base_prompt or "").strip())
+        if not cleaned:
+            return self._fallback_thumbnail_prompt_options(cleaned)
+        if not self._probe_ollama_online(timeout=1.5):
+            return self._fallback_thumbnail_prompt_options(cleaned)
+        channel_label, language_name = self._thumbnail_channel_language_context()
+
+        system_prompt = (
+            "You create concise prompts for generating YouTube thumbnail backgrounds. "
+            "Return only valid JSON with key `options`. Each option must be a single string. "
+            "Generate exactly 2 options. Each option should describe only the image background, not overlay text. "
+            "Favor one dominant subject, high contrast, cinematic lighting, simple composition, and no text."
+        )
+        user_prompt = (
+            f"Topic: {cleaned}\n"
+            f"Channel: {channel_label}\n"
+            f"Language: {language_name}\n"
+            "Return JSON like {\"options\": [\"...\", \"...\"]}.\n"
+            "Each option should be 8-18 words and should be ready to use as an image-generation prompt."
+        )
+        completed = subprocess.run(
+            ["ollama", "run", "qwen2.5:14b", f"{system_prompt}\n\n{user_prompt}"],
+            cwd=str(self._repo_root),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if int(completed.returncode or 0) != 0:
+            return self._fallback_thumbnail_prompt_options(cleaned)
+
+        text = str(completed.stdout or "").strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            text = "\n".join(lines[1:-1] if lines and lines[-1].strip() == "```" else lines[1:])
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return self._fallback_thumbnail_prompt_options(cleaned)
+        try:
+            payload = json.loads(text[start : end + 1])
+        except Exception:
+            return self._fallback_thumbnail_prompt_options(cleaned)
+        options = payload.get("options") if isinstance(payload, dict) else None
+        normalized = [
+            re.sub(r"\s+", " ", str(item or "").strip())
+            for item in options or []
+            if re.sub(r"\s+", " ", str(item or "").strip())
+        ]
+        if len(normalized) < 2:
+            return self._fallback_thumbnail_prompt_options(cleaned)
+        return normalized[:2]
+
+    def _thumbnail_color(self, raw_value: str, default: str) -> tuple[int, int, int]:
+        if ImageColor is None:
+            fallback = {"white": (255, 255, 255), "yellow": (255, 225, 64), "black": (0, 0, 0)}
+            return fallback.get(default, (20, 184, 255))
+        try:
+            return cast(tuple[int, int, int], ImageColor.getrgb(str(raw_value or default)))
+        except Exception:
+            return cast(tuple[int, int, int], ImageColor.getrgb(default))
+
+    def _thumbnail_font_path(self) -> Path | None:
+        candidates = (
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/System/Library/Fonts/Supplemental/DIN Alternate Bold.ttf",
+            "/System/Library/Fonts/Supplemental/Verdana Bold.ttf",
+            "/Library/Fonts/Arial Bold.ttf",
+        )
+        for candidate in candidates:
+            path = Path(candidate)
+            if path.exists():
+                return path
+        return None
+
+    def _thumbnail_font(self, size: int) -> Any:
+        if ImageFont is None:
+            return None
+        font_path = self._thumbnail_font_path()
+        if font_path is not None:
+            try:
+                return ImageFont.truetype(str(font_path), max(12, int(size)))
+            except Exception:
+                pass
+        return ImageFont.load_default()
+
+    def _thumbnail_diffusion_backend_ready(self) -> bool:
+        return torch is not None and AutoPipelineForText2Image is not None and Image is not None
+
+    def _thumbnail_diffusion_runtime(self) -> tuple[str, Any]:
+        if not self._thumbnail_diffusion_backend_ready():
+            raise RuntimeError(
+                "Local thumbnail image backend is not installed. Install torch + diffusers in the Imagine environment."
+            )
+        if torch is not None and torch.backends.mps.is_available():
+            return "mps", torch.float16
+        return "cpu", torch.float32
+
+    def _load_thumbnail_diffusion_pipeline(self) -> Any:
+        cached = self._thumbnail_diffusion_pipeline
+        if cached is not None:
+            return cached
+
+        device, dtype = self._thumbnail_diffusion_runtime()
+        self._set_status(f"Loading local thumbnail model: {self.THUMBNAIL_DIFFUSION_MODEL_ID}")
+        kwargs: dict[str, Any] = {
+            "torch_dtype": dtype,
+            "use_safetensors": True,
+        }
+        if device == "mps":
+            kwargs["variant"] = "fp16"
+        pipe = AutoPipelineForText2Image.from_pretrained(self.THUMBNAIL_DIFFUSION_MODEL_ID, **kwargs)
+        pipe = pipe.to(device)
+        try:
+            pipe.set_progress_bar_config(disable=True)
+        except Exception:
+            pass
+        self._thumbnail_diffusion_pipeline = pipe
+        self._thumbnail_diffusion_device = device
+        return pipe
+
+    def _generate_thumbnail_background_image(self, concept: ThumbnailConcept) -> Any:
+        if Image is None:
+            raise RuntimeError("Pillow is unavailable for thumbnail rendering.")
+        pipe = self._load_thumbnail_diffusion_pipeline()
+        device = self._thumbnail_diffusion_device or "cpu"
+        subject_prompt = re.sub(r"\s+", " ", str(concept.background_prompt or concept.subject_hint or "").strip())
+        if not subject_prompt:
+            subject_prompt = re.sub(r"\s+", " ", str(concept.subject_hint or "dramatic cinematic subject").strip())
+        prompt = (
+            f"dramatic youtube thumbnail background about {subject_prompt}, "
+            "no text, one dominant subject, high contrast"
+        )
+        self._set_status("Generating local thumbnail background.")
+        result = pipe(
+            prompt,
+            num_inference_steps=1,
+            guidance_scale=0.0,
+            height=512,
+            width=896,
+        )
+        image = result.images[0].convert("RGBA")
+        if image.size != (1280, 720):
+            image = image.resize((1280, 720), Image.Resampling.LANCZOS)
+        if device == "mps" and torch is not None:
+            try:
+                torch.mps.empty_cache()
+            except Exception:
+                pass
+        return image
+
+    def _thumbnail_headline_lines(
+        self,
+        draw: Any,
+        headline: str,
+        font: Any,
+        *,
+        max_width: int,
+        max_lines: int = 2,
+    ) -> list[str]:
+        words = [word for word in headline.split() if word]
+        if not words:
+            return ["BIG IDEA"]
+        stroke_width = max(2, int(getattr(font, "size", 40) * 0.08))
+        max_line_count = min(max_lines, max(1, len(words)))
+        for line_count in range(1, max_line_count + 1):
+            grouped: list[str] = []
+            remaining = list(words)
+            while remaining:
+                take = max(1, math.ceil(len(remaining) / max(1, line_count - len(grouped))))
+                grouped.append(" ".join(remaining[:take]))
+                remaining = remaining[take:]
+            widths = []
+            for line in grouped:
+                bbox = draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width)
+                widths.append(bbox[2] - bbox[0])
+            if widths and max(widths) <= max_width:
+                return grouped
+        return [" ".join(words[: max(1, len(words) // 2)]), " ".join(words[max(1, len(words) // 2) :])][:max_line_count]
+
+    def _render_thumbnail_background(self, image: Any, concept: ThumbnailConcept) -> None:
+        if ImageDraw is None or ImageFilter is None:
+            return
+        width, height = image.size
+        accent = self._thumbnail_color(concept.accent_color, "#14b8ff")
+        digest = hashlib.sha1(f"{concept.background_prompt}|{concept.seed}".encode("utf-8")).hexdigest()
+        base_top = (
+            int(digest[0:2], 16) // 2,
+            int(digest[2:4], 16) // 3,
+            int(digest[4:6], 16) // 2,
+        )
+        base_bottom = (
+            max(0, accent[0] // 5),
+            max(0, accent[1] // 5),
+            max(0, accent[2] // 5),
+        )
+        px = image.load()
+        for y in range(height):
+            ratio = y / max(1, height - 1)
+            row_color = tuple(int(base_top[i] * (1.0 - ratio) + base_bottom[i] * ratio) for i in range(3))
+            for x in range(width):
+                px[x, y] = row_color
+
+        overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        subject = concept.subject_hint.lower()
+        hero_box = (int(width * 0.47), int(height * 0.15), int(width * 0.92), int(height * 0.90))
+        if any(token in subject for token in ("face", "human", "person", "man", "woman", "head", "ai")):
+            draw.ellipse(hero_box, fill=accent + (190,))
+            shoulder_box = (int(width * 0.40), int(height * 0.52), int(width * 0.98), int(height * 1.08))
+            draw.ellipse(shoulder_box, fill=(accent[0], accent[1], accent[2], 130))
+        elif any(token in subject for token in ("box", "cube", "package", "console")):
+            draw.rounded_rectangle(hero_box, radius=36, fill=accent + (220,))
+            draw.polygon(
+                [
+                    (hero_box[0], hero_box[1]),
+                    (hero_box[0] + 80, hero_box[1] - 60),
+                    (hero_box[2] + 80, hero_box[1] - 60),
+                    (hero_box[2], hero_box[1]),
+                ],
+                fill=(min(255, accent[0] + 40), min(255, accent[1] + 40), min(255, accent[2] + 40), 160),
+            )
+        elif any(token in subject for token in ("laptop", "screen", "monitor", "phone", "tablet", "tv")):
+            draw.rounded_rectangle(hero_box, radius=32, fill=(245, 245, 245, 230))
+            inner = (hero_box[0] + 28, hero_box[1] + 28, hero_box[2] - 28, hero_box[3] - 70)
+            draw.rounded_rectangle(inner, radius=20, fill=accent + (210,))
+        else:
+            draw.rounded_rectangle(hero_box, radius=48, fill=accent + (210,))
+
+        for index in range(18):
+            offset = int(digest[(index * 2) % len(digest) : (index * 2) % len(digest) + 2], 16)
+            x0 = int(width * 0.45) + (offset * 3) % int(width * 0.5)
+            y0 = (offset * 17 + index * 19) % height
+            x1 = min(width, x0 + 180 + (offset % 140))
+            y1 = min(height, y0 + 2 + (offset % 5))
+            draw.rounded_rectangle((x0, y0, x1, y1), radius=3, fill=(255, 255, 255, 38))
+
+        glow = overlay.filter(ImageFilter.GaussianBlur(radius=32))
+        image.alpha_composite(glow)
+        image.alpha_composite(overlay)
+
+        vignette = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        vignette_draw = ImageDraw.Draw(vignette)
+        for step in range(10):
+            alpha = int(16 + step * 8)
+            inset = step * 18
+            vignette_draw.rounded_rectangle(
+                (inset, inset, width - inset, height - inset),
+                radius=48,
+                outline=(0, 0, 0, alpha),
+                width=22,
+            )
+        image.alpha_composite(vignette)
+
+    def _render_thumbnail_image(self, concept: ThumbnailConcept) -> Path:
+        if Image is None or ImageDraw is None:
+            raise RuntimeError("Pillow is unavailable for thumbnail rendering.")
+        width, height = 1280, 720
+        image = self._generate_thumbnail_background_image(concept)
+        if image.mode != "RGBA":
+            image = image.convert("RGBA")
+
+        draw = ImageDraw.Draw(image)
+        headline_color = self._thumbnail_color(concept.headline_color, "white")
+        outline_color = self._thumbnail_color(concept.outline_color, "black")
+        target_width = int(width * 0.86)
+        target_height = int(height * (0.34 if concept.headline_position == "top" else 0.44))
+        font_size = 168 if concept.headline_position == "top" else 184
+        font = self._thumbnail_font(font_size)
+        lines = [concept.headline_text]
+        stroke_width = 6
+        spacing = 10
+        line_boxes: list[tuple[int, int, int, int]] = []
+        text_width = 0
+        text_height = 0
+
+        while font_size >= 72:
+            font = self._thumbnail_font(font_size)
+            lines = self._thumbnail_headline_lines(
+                draw,
+                concept.headline_text,
+                font,
+                max_width=target_width,
+                max_lines=2,
+            )
+            stroke_width = max(5, int(font_size * 0.09))
+            spacing = max(8, int(font_size * 0.08))
+            line_boxes = [draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width) for line in lines]
+            text_width = max(box[2] - box[0] for box in line_boxes)
+            text_height = sum((box[3] - box[1]) for box in line_boxes) + spacing * max(0, len(line_boxes) - 1)
+            if text_width <= target_width and text_height <= target_height:
+                break
+            font_size -= 10
+
+        if concept.headline_position == "top":
+            text_x = int((width - text_width) / 2)
+            text_y = int(height * 0.08)
+        else:
+            text_x = int((width - text_width) / 2)
+            text_y = int((height - text_height) / 2)
+
+        plate_margin_x = 42
+        plate_margin_y = 28
+        plate_box = (
+            max(18, text_x - plate_margin_x),
+            max(18, text_y - plate_margin_y),
+            min(width - 18, text_x + text_width + plate_margin_x),
+            min(height - 18, text_y + text_height + plate_margin_y),
+        )
+        plate = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        plate_draw = ImageDraw.Draw(plate)
+        plate_draw.rounded_rectangle(plate_box, radius=30, fill=(0, 0, 0, 96))
+        plate = plate.filter(ImageFilter.GaussianBlur(radius=14))
+        image.alpha_composite(plate)
+
+        current_y = text_y
+        for line, box in zip(lines, line_boxes):
+            line_width = box[2] - box[0]
+            line_x = int((width - line_width) / 2)
+            draw.text(
+                (line_x, current_y),
+                line,
+                font=font,
+                fill=headline_color,
+                stroke_width=stroke_width,
+                stroke_fill=outline_color,
+            )
+            current_y += (box[3] - box[1]) + spacing
+
+        final_image = image.convert("RGB")
+        digest = hashlib.sha1(
+            f"{concept.background_prompt}|{concept.headline_text}|{concept.seed}|{concept.style_hint}".encode("utf-8")
+        ).hexdigest()[:16]
+        output_path = self._thumbnail_preview_dir() / f"{digest}.jpg"
+        final_image.save(output_path, format="JPEG", quality=95, optimize=True)
+        return output_path
+
+    def _generate_thumbnail_render(self, prompt: str, *, seed: int) -> ThumbnailRenderResult:
+        prompt_text = re.sub(r"\s+", " ", str(prompt or "").strip())
+        if not prompt_text:
+            raise RuntimeError("Thumbnail prompt is empty.")
+        self._set_status("Asking Ollama for thumbnail concept.")
+        concept = self._generate_thumbnail_concept_with_ollama(prompt_text, seed=seed)
+        self._append_log(
+            f"Thumbnail concept: headline={concept.headline_text!r} position={concept.headline_position} "
+            f"color={concept.headline_color} accent={concept.accent_color} seed={concept.seed}"
+        )
+        self._set_status("Rendering thumbnail image.")
+        image_path = self._render_thumbnail_image(concept)
+        return ThumbnailRenderResult(concept=concept, image_path=image_path)
+
+    def _thumbnail_prompt_lines(
+        self,
+        prompt: str,
+        cursor_pos: int,
+        *,
+        width: int,
+        rows: int,
+    ) -> tuple[list[str], int, int]:
+        if prompt:
+            visible_capacity = max(1, width * rows)
+            visible_start = max(0, cursor_pos - visible_capacity + 1)
+            visible_text = prompt[visible_start : visible_start + visible_capacity]
+            lines = [visible_text[index : index + width] for index in range(0, len(visible_text), width)] or [""]
+            cursor_offset = max(0, cursor_pos - visible_start)
+            return lines, min(rows - 1, cursor_offset // width), cursor_offset % width
+        return ['(example: ethics in ai, glowing face, big text saying MORAL MAZE)'], 0, 0
+
+    def _selected_thumbnail_prompt_text(self, state: ThumbnailGeneratorState) -> str:
+        if state.selected_prompt_index < len(state.prompt_options):
+            return re.sub(r"\s+", " ", str(state.prompt_options[state.selected_prompt_index] or "").strip())
+        return re.sub(r"\s+", " ", str(state.custom_prompt or "").strip())
+
+    def _thumbnail_export_prompt_text(self, state: ThumbnailGeneratorState) -> str:
+        selected_prompt = self._selected_thumbnail_prompt_text(state)
+        if selected_prompt:
+            return selected_prompt
+        if state.render_result is not None:
+            return re.sub(r"\s+", " ", str(state.render_result.concept.headline_text or "").strip())
+        return "thumbnail"
+
+    def _clear_terminal_graphics_image(self, image_id: int) -> None:
+        if not self._graphics_preview_capable():
+            return
+        sequence = f"\x1b_Ga=d,d=i,i={image_id},q=2\x1b\\".encode("ascii")
+        self._write_terminal_escape(sequence)
+
+    def _terminal_graphics_runtime_dir(self) -> Path:
+        root = (Path.home() / ".imagine" / "runtime" / "terminal-graphics").resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _terminal_graphics_image_path(self, image_path: Path) -> Path | None:
+        if not image_path.exists():
+            return None
+        if image_path.suffix.lower() == ".png":
+            return image_path
+        if Image is None:
+            return None
+        try:
+            mtime_ns = int(image_path.stat().st_mtime_ns)
+        except OSError:
+            mtime_ns = 0
+        cache_key = (str(image_path), mtime_ns)
+        cached = self._terminal_graphics_image_cache.get(cache_key)
+        if cached is not None and cached.exists():
+            return cached
+        output_name = hashlib.sha1(f"{image_path}:{mtime_ns}".encode("utf-8")).hexdigest()[:20]
+        output_path = self._terminal_graphics_runtime_dir() / f"{output_name}.png"
+        try:
+            with Image.open(image_path) as source_image:
+                rendered = source_image.convert("RGBA")
+                rendered.save(output_path, format="PNG")
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"WARN: Could not prepare terminal graphics preview for {image_path.name}: {exc}")
+            return None
+        self._terminal_graphics_image_cache[cache_key] = output_path
+        return output_path
+
+    def _draw_terminal_graphics_image(
+        self,
+        *,
+        image_path: Path,
+        top_row: int,
+        left_col: int,
+        cols: int,
+        rows: int,
+        image_id: int,
+    ) -> bool:
+        if not self._graphics_preview_capable():
+            return False
+        graphics_image_path = self._terminal_graphics_image_path(image_path)
+        if graphics_image_path is None:
+            return False
+        encoded_path = base64.standard_b64encode(str(graphics_image_path).encode("utf-8")).decode("ascii")
+        move_cursor = f"\x1b[{top_row};{left_col}H".encode("ascii")
+        draw_image = (
+            f"\x1b_Ga=T,i={image_id},q=2,f=100,t=f,c={max(1, cols)},r={max(1, rows)},C=1;{encoded_path}\x1b\\"
+        ).encode("ascii")
+        return self._write_terminal_escape(move_cursor + draw_image)
+
+    def _draw_thumbnail_preview_image(
+        self,
+        *,
+        image_path: Path,
+        top_row: int,
+        left_col: int,
+        cols: int,
+        rows: int,
+    ) -> bool:
+        self._clear_terminal_region(
+            top_row=top_row,
+            left_col=left_col,
+            cols=cols,
+            rows=rows,
+        )
+        if self._draw_terminal_graphics_image(
+            image_path=image_path,
+            top_row=top_row,
+            left_col=left_col,
+            cols=cols,
+            rows=rows,
+            image_id=self.THUMBNAIL_PREVIEW_IMAGE_ID,
+        ):
+            return True
+        self._clear_terminal_graphics_image(self.THUMBNAIL_PREVIEW_IMAGE_ID)
+        if self._draw_shot_review_color_preview(
+            image_path=image_path,
+            top_row=top_row,
+            left_col=left_col,
+            cols=cols,
+            rows=rows,
+        ):
+            return True
+        return False
+
+    def _export_thumbnail_render(self, render_result: ThumbnailRenderResult, prompt: str) -> Path:
+        target = self._thumbnail_export_path(prompt)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(render_result.image_path, target)
+        return target
+
+    def _open_thumbnail_sandbox(self) -> None:
+        if self._stdscr is None:
+            return
+
+        base_prompt = re.sub(r"\s+", " ", str(self.config.prompt or "").strip())
+        try:
+            prompt_options = self._run_with_spinner_modal(
+                title="Thumbnail",
+                message="Generating prompt options",
+                task=lambda: self._generate_thumbnail_prompt_options(base_prompt),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"WARN: Thumbnail prompt options fallback engaged: {exc}")
+            prompt_options = self._fallback_thumbnail_prompt_options(base_prompt)
+
+        with self._modal_focus():
+            stdscr = self._stdscr
+            state = ThumbnailGeneratorState(
+                prompt_options=list(prompt_options[:2]),
+                selected_prompt_index=0,
+                custom_prompt="",
+                custom_prompt_cursor=0,
+                message="Select a prompt and press Enter.",
+            )
+
+            try:
+                curses.curs_set(1)
+            except curses.error:
+                pass
+
+            while True:
+                self._draw()
+                height, width = stdscr.getmaxyx()
+                self._draw_modal_backdrop(height, width)
+
+                modal_width = min(max(88, width - 6), max(48, width - 2))
+                modal_height = min(max(26, height - 4), max(14, height - 2))
+                if modal_width < 48 or modal_height < 14:
+                    self._set_status("Terminal is too small for Thumbnail.")
+                    break
+
+                top = max(0, (height - modal_height) // 2)
+                left = max(0, (width - modal_width) // 2)
+
+                win = curses.newwin(modal_height, modal_width, top, left)
+                win.keypad(True)
+                win.nodelay(False)
+                win.timeout(-1)
+                win.erase()
+                try:
+                    win.box()
+                except curses.error:
+                    pass
+
+                title = self._trim_tail(" Thumbnail ", max(1, modal_width - 4))
+                canvas_top = 2
+                canvas_left = 3
+                canvas_width = max(34, modal_width - 32)
+                available_canvas_height = max(8, modal_height - 16)
+                canvas_height = max(8, int(canvas_width * 9 / 16))
+                if canvas_height > available_canvas_height:
+                    canvas_height = available_canvas_height
+                    canvas_width = max(34, int(canvas_height * 16 / 9))
+                detail_left = canvas_left + canvas_width + 2
+                detail_width = max(16, modal_width - detail_left - 2)
+                prompt_section_row = canvas_top + canvas_height + 2
+                custom_label = "3. Custom: "
+                custom_col = 2 + len(custom_label)
+                custom_width = max(10, modal_width - custom_col - 2)
+                custom_rows = 2
+                shown_input_lines, cursor_line_offset, cursor_col_offset = self._thumbnail_prompt_lines(
+                    state.custom_prompt,
+                    state.custom_prompt_cursor,
+                    width=custom_width,
+                    rows=custom_rows,
+                )
+
+                try:
+                    win.addstr(0, 2, title, self._attr("accent", bold=True))
+                    win.addstr(canvas_top - 1, canvas_left, "Preview", self._attr("accent", bold=True))
+                    for row_index in range(canvas_height):
+                        win.addstr(canvas_top + row_index, canvas_left, " " * canvas_width, self._attr("backdrop"))
+                    if state.render_result is None:
+                        placeholder = "Press Enter to generate"
+                        placeholder_row = canvas_top + max(0, canvas_height // 2)
+                        placeholder_col = canvas_left + max(0, (canvas_width - len(placeholder)) // 2)
+                        win.addstr(placeholder_row, placeholder_col, placeholder, self._attr("muted"))
+                    win.addstr(canvas_top - 1, detail_left, "Concept", self._attr("accent", bold=True))
+                    detail_lines: list[str] = []
+                    if state.render_result is not None:
+                        concept = state.render_result.concept
+                        detail_lines.extend(
+                            [
+                                f"Headline: {concept.headline_text}",
+                                f"Position: {concept.headline_position}",
+                                f"Text color: {concept.headline_color}",
+                                f"Outline: {concept.outline_color}",
+                                f"Accent: {concept.accent_color}",
+                                f"Style: {concept.style_hint}",
+                            ]
+                        )
+                    else:
+                        detail_lines.extend(
+                            [
+                                "One thumbnail per prompt.",
+                                "AI chooses hook text.",
+                                "Text is burned in locally.",
+                                "Press Enter on a prompt to generate.",
+                            ]
+                        )
+                    for index, line in enumerate(detail_lines[: max(4, canvas_height - 1)]):
+                        win.addstr(canvas_top + index, detail_left, self._trim_tail(line, detail_width), self._attr("muted"))
+                    win.addstr(prompt_section_row - 1, 2, "Prompt Options", self._attr("accent", bold=True))
+                    option_width = modal_width - 4
+                    for option_index, option_text in enumerate(state.prompt_options[:2]):
+                        row = prompt_section_row + option_index
+                        attr = curses.A_REVERSE if state.selected_prompt_index == option_index else 0
+                        win.addstr(row, 2, " " * option_width, attr)
+                        win.addstr(
+                            row,
+                            2,
+                            self._trim_tail(f"{option_index + 1}. {option_text}", option_width),
+                            attr,
+                        )
+                    custom_attr = curses.A_REVERSE if state.selected_prompt_index == 2 else 0
+                    custom_row = prompt_section_row + 2
+                    for fill_index in range(custom_rows):
+                        win.addstr(custom_row + fill_index, 2, " " * option_width, custom_attr)
+                    win.addstr(custom_row, 2, custom_label, custom_attr | self._attr("accent", bold=True))
+                    for index, line in enumerate(shown_input_lines):
+                        attr = custom_attr if state.custom_prompt else (custom_attr | self._attr("muted"))
+                        line_col = custom_col if index == 0 else 2
+                        line_width = custom_width if index == 0 else modal_width - 4
+                        win.addstr(custom_row + index, line_col, self._trim_tail(line, line_width), attr)
+                    export_row = custom_row + custom_rows
+                    export_attr = curses.A_REVERSE if state.selected_prompt_index == 3 else 0
+                    win.addstr(export_row, 2, " " * option_width, export_attr)
+                    export_label = "4. Export current preview"
+                    if state.render_result is None:
+                        export_label += " (generate first)"
+                    win.addstr(
+                        export_row,
+                        2,
+                        self._trim_tail(export_label, option_width),
+                        export_attr | self._attr("accent", bold=True),
+                    )
+                    win.addstr(
+                        export_row + 1,
+                        2,
+                        self._trim_tail(state.message, modal_width - 4),
+                        self._attr("muted"),
+                    )
+                    footer = "Enter run selected | Up/Down select | 1/2/3/4 jump | Esc close"
+                    win.addstr(modal_height - 1, 2, self._trim_tail(footer, modal_width - 4), self._attr("muted"))
+                    if state.selected_prompt_index == 2 and state.custom_prompt:
+                        cursor_line = custom_row + cursor_line_offset
+                        cursor_base_col = custom_col if cursor_line_offset == 0 else 2
+                        cursor_col = min(modal_width - 2, cursor_base_col + cursor_col_offset)
+                        win.move(cursor_line, max(2, cursor_col))
+                    elif state.selected_prompt_index == 2:
+                        win.move(custom_row, custom_col)
+                except curses.error:
+                    pass
+
+                win.refresh()
+                if state.render_result is not None:
+                    self._draw_thumbnail_preview_image(
+                        image_path=state.render_result.image_path,
+                        top_row=top + canvas_top + 1,
+                        left_col=left + canvas_left + 1,
+                        cols=max(8, canvas_width - 2),
+                        rows=max(4, canvas_height - 2),
+                    )
+                try:
+                    key = win.get_wch()
+                except curses.error:
+                    continue
+
+                if isinstance(key, str):
+                    if key == "\x1b":
+                        self._set_status("Thumbnail closed.")
+                        break
+                    if key == "1":
+                        state.selected_prompt_index = 0
+                        continue
+                    if key == "2":
+                        state.selected_prompt_index = 1
+                        continue
+                    if key == "3":
+                        state.selected_prompt_index = 2
+                        continue
+                    if key == "4":
+                        state.selected_prompt_index = 3
+                        continue
+                    if key in ("\n", "\r"):
+                        if state.selected_prompt_index == 3:
+                            if state.render_result is None:
+                                state.message = "Generate a thumbnail before exporting."
+                                self._set_status(state.message)
+                                continue
+                            export_prompt = self._thumbnail_export_prompt_text(state)
+                            try:
+                                export_path = self._export_thumbnail_render(state.render_result, export_prompt)
+                            except Exception as exc:  # noqa: BLE001
+                                state.message = f"Thumbnail export failed: {exc}"
+                                self._append_log(f"ERROR: {state.message}")
+                                self._set_status(state.message)
+                                continue
+                            state.message = f"Exported thumbnail to {export_path}"
+                            self._append_log(state.message)
+                            self._set_status(state.message)
+                            continue
+                        prompt_text = self._selected_thumbnail_prompt_text(state)
+                        if not prompt_text:
+                            state.message = "Pick a prompt or type a custom one first."
+                            self._set_status(state.message)
+                            continue
+                        state.generation_index += 1
+                        try:
+                            render_result = self._run_with_spinner_modal(
+                                title="Thumbnail",
+                                message="Generating thumbnail",
+                                task=lambda: self._generate_thumbnail_render(
+                                    prompt_text,
+                                    seed=state.generation_index,
+                                ),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            state.message = f"Thumbnail generation failed: {exc}"
+                            self._append_log(f"ERROR: {state.message}")
+                            self._set_status(state.message)
+                            continue
+                        state.render_result = render_result
+                        state.message = f"Generated thumbnail: {render_result.concept.headline_text}"
+                        self._append_log(
+                            f"Generated thumbnail preview at {render_result.image_path} from prompt {prompt_text!r}"
+                        )
+                        self._set_status(state.message)
+                        continue
+                    if key in ("\x08", "\x7f"):
+                        if state.selected_prompt_index != 2:
+                            continue
+                        if state.custom_prompt_cursor > 0:
+                            state.custom_prompt = (
+                                state.custom_prompt[: state.custom_prompt_cursor - 1]
+                                + state.custom_prompt[state.custom_prompt_cursor :]
+                            )
+                            state.custom_prompt_cursor -= 1
+                        continue
+                    if len(key) == 1 and ord(key) >= 32:
+                        if state.selected_prompt_index != 2:
+                            state.selected_prompt_index = 2
+                        if len(state.custom_prompt) < 420:
+                            state.custom_prompt = (
+                                state.custom_prompt[: state.custom_prompt_cursor]
+                                + key
+                                + state.custom_prompt[state.custom_prompt_cursor :]
+                            )
+                            state.custom_prompt_cursor += 1
+                        continue
+                else:
+                    if key == 27:
+                        self._set_status("Thumbnail closed.")
+                        break
+                    if key in (10, 13, curses.KEY_ENTER):
+                        if state.selected_prompt_index == 3:
+                            if state.render_result is None:
+                                state.message = "Generate a thumbnail before exporting."
+                                self._set_status(state.message)
+                                continue
+                            export_prompt = self._thumbnail_export_prompt_text(state)
+                            try:
+                                export_path = self._export_thumbnail_render(state.render_result, export_prompt)
+                            except Exception as exc:  # noqa: BLE001
+                                state.message = f"Thumbnail export failed: {exc}"
+                                self._append_log(f"ERROR: {state.message}")
+                                self._set_status(state.message)
+                                continue
+                            state.message = f"Exported thumbnail to {export_path}"
+                            self._append_log(state.message)
+                            self._set_status(state.message)
+                            continue
+                        prompt_text = self._selected_thumbnail_prompt_text(state)
+                        if not prompt_text:
+                            state.message = "Pick a prompt or type a custom one first."
+                            self._set_status(state.message)
+                            continue
+                        state.generation_index += 1
+                        try:
+                            render_result = self._run_with_spinner_modal(
+                                title="Thumbnail",
+                                message="Generating thumbnail",
+                                task=lambda: self._generate_thumbnail_render(
+                                    prompt_text,
+                                    seed=state.generation_index,
+                                ),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            state.message = f"Thumbnail generation failed: {exc}"
+                            self._append_log(f"ERROR: {state.message}")
+                            self._set_status(state.message)
+                            continue
+                        state.render_result = render_result
+                        state.message = f"Generated thumbnail: {render_result.concept.headline_text}"
+                        self._append_log(
+                            f"Generated thumbnail preview at {render_result.image_path} from prompt {prompt_text!r}"
+                        )
+                        self._set_status(state.message)
+                        continue
+                    if key in (curses.KEY_UP, ord("k"), ord("K")):
+                        state.selected_prompt_index = (state.selected_prompt_index - 1) % 4
+                        continue
+                    if key in (curses.KEY_DOWN, ord("j"), ord("J")):
+                        state.selected_prompt_index = (state.selected_prompt_index + 1) % 4
+                        continue
+                    if key == ord("1"):
+                        state.selected_prompt_index = 0
+                        continue
+                    if key == ord("2"):
+                        state.selected_prompt_index = 1
+                        continue
+                    if key == ord("3"):
+                        state.selected_prompt_index = 2
+                        continue
+                    if key == ord("4"):
+                        state.selected_prompt_index = 3
+                        continue
+                    if key == curses.KEY_LEFT:
+                        if state.selected_prompt_index == 2:
+                            state.custom_prompt_cursor = max(0, state.custom_prompt_cursor - 1)
+                        continue
+                    if key == curses.KEY_RIGHT:
+                        if state.selected_prompt_index == 2:
+                            state.custom_prompt_cursor = min(len(state.custom_prompt), state.custom_prompt_cursor + 1)
+                        continue
+                    if key == curses.KEY_HOME:
+                        if state.selected_prompt_index == 2:
+                            state.custom_prompt_cursor = 0
+                        continue
+                    if key == curses.KEY_END:
+                        if state.selected_prompt_index == 2:
+                            state.custom_prompt_cursor = len(state.custom_prompt)
+                        continue
+                    if key in (curses.KEY_BACKSPACE, 127, 8):
+                        if state.selected_prompt_index == 2 and state.custom_prompt_cursor > 0:
+                            state.custom_prompt = (
+                                state.custom_prompt[: state.custom_prompt_cursor - 1]
+                                + state.custom_prompt[state.custom_prompt_cursor :]
+                            )
+                            state.custom_prompt_cursor -= 1
+                        continue
+                    if key == curses.KEY_DC:
+                        if state.selected_prompt_index == 2 and state.custom_prompt_cursor < len(state.custom_prompt):
+                            state.custom_prompt = (
+                                state.custom_prompt[: state.custom_prompt_cursor]
+                                + state.custom_prompt[state.custom_prompt_cursor + 1 :]
+                            )
+                        continue
+            self._clear_terminal_graphics_image(self.THUMBNAIL_PREVIEW_IMAGE_ID)
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
 
     def _start_run_workflow(self) -> None:
         if self._is_running():
@@ -699,33 +1629,6 @@ class LocalVideoMvpTui:
 
         should_run_preflight = self._active_project_dir is None or self._hitl_stage == "done"
         if should_run_preflight and not self._run_preflight():
-            return
-
-        if self._enforce_news_hitl_policy(persist=True):
-            self._set_status("News mode requires HITL. Source review will open before draft.")
-
-        if not self._hitl_enabled:
-            self._refresh_stock_key_cache()
-            if not self._passes_asset_hard_guard_precheck():
-                return
-            if not self._passes_tts_policy_precheck():
-                return
-            workspace = self._prepare_run_workspace()
-            self._hitl_stage = "full"
-            with self._lock:
-                self._pending_unique_asset_prompt = None
-                self._pending_clip_review_prompt = None
-                self._pending_stage_transition_prompt = None
-                self._pending_source_review_prompt = None
-                self._pending_script_review_prompt = None
-                self._pending_shot_review_prompt = None
-                self._pending_scene_review_prompt = None
-
-            self._mark_command_start(workflow_kind="run")
-            self._set_running(True)
-            self._set_status(f"Starting full stage: {workspace.name}")
-            self._worker = threading.Thread(target=self._run_workflow, daemon=True)
-            self._worker.start()
             return
 
         if self._hitl_stage == "source-review" and self._active_project_dir is not None:
@@ -763,7 +1666,7 @@ class LocalVideoMvpTui:
         if self._hitl_stage != "sources" and not self._passes_tts_policy_precheck():
             return
 
-        if self._hitl_stage in {"draft", "full"} and not self._ensure_ollama_available_with_modal():
+        if self._hitl_stage == "draft" and not self._ensure_ollama_available_with_modal():
             return
 
         self._mark_command_start(workflow_kind="run")
@@ -787,14 +1690,14 @@ class LocalVideoMvpTui:
         try:
             stage = self._hitl_stage
             self._append_log("Using preferred profile. Press R to advance workflow.")
-            self._append_log(f"HITL stage: {stage}")
+            self._append_log(f"Workflow stage: {stage}")
             self._append_log(self._asset_preflight_message())
             if self._stock_key_sources:
                 self._append_log(f"Stock key sources: {self._stock_key_sources}")
             for warning in self._stock_key_warnings:
                 self._append_log(f"WARN: {warning}")
 
-            if stage in {"draft", "full"}:
+            if stage == "draft":
                 self._ensure_ollama_running()
 
             run_code = self._run_and_stream(self._build_run_command(workflow_stage=stage), label="run")
@@ -862,35 +1765,15 @@ class LocalVideoMvpTui:
 
                 self._set_status("Finalize complete. Inspecting outputs...")
                 inspect_code = self._run_and_stream(self._build_inspect_command(), label="inspect")
-                exported_mp4, exported_thumbnail = self._export_project_outputs_to_downloads()
+                exported_mp4, _ = self._export_project_outputs_to_downloads()
                 self._hitl_stage = "done"
 
                 if inspect_code == 0 and exported_mp4 is not None:
-                    if exported_thumbnail is not None:
-                        self._set_status(f"Finalize complete. MP4 and thumbnail exported to Downloads.")
-                    else:
-                        self._set_status(f"Finalize complete. MP4 exported to {exported_mp4.name}.")
+                    self._set_status(f"Finalize complete. MP4 exported to {exported_mp4.name}.")
                 elif inspect_code == 0:
                     self._set_status("Finalize complete. MP4 export skipped.")
                 else:
                     self._set_status(f"Finalize succeeded, inspect failed with exit code {inspect_code}.")
-                return
-
-            if stage == "full":
-                self._set_status("Full run complete. Inspecting outputs...")
-                inspect_code = self._run_and_stream(self._build_inspect_command(), label="inspect")
-                exported_mp4, exported_thumbnail = self._export_project_outputs_to_downloads()
-                self._hitl_stage = "done"
-
-                if inspect_code == 0 and exported_mp4 is not None:
-                    if exported_thumbnail is not None:
-                        self._set_status("Full run complete. MP4 and thumbnail exported to Downloads.")
-                    else:
-                        self._set_status(f"Full run complete. MP4 exported to {exported_mp4.name}.")
-                elif inspect_code == 0:
-                    self._set_status("Full run complete. MP4 export skipped.")
-                else:
-                    self._set_status(f"Full run succeeded, inspect failed with exit code {inspect_code}.")
                 return
 
             self._set_status(f"Unknown workflow stage: {stage}")
@@ -960,7 +1843,11 @@ class LocalVideoMvpTui:
         if project_dir is None:
             project_dir = self._prepare_run_workspace()
 
-        stage = str(workflow_stage or self._hitl_stage).strip().lower() or "full"
+        stage = str(workflow_stage or self._hitl_stage).strip().lower() or "draft"
+        profile = self.CHANNEL_PROFILES.get(self.config.active_channel, self.CHANNEL_PROFILES["general"])
+        channel_name = str(profile.get("channel_name") or "").strip() or "IMAGINE"
+        intro_tagline = str(profile.get("intro_tagline") or "").strip()
+        outro_text, outro_tagline, _outro_spoken_text = self._resolved_channel_outro_copy()
 
         command = [
             sys.executable,
@@ -1028,30 +1915,33 @@ class LocalVideoMvpTui:
             "--verbose",
         ]
 
-        if self.config.fast_mode:
-            command.append("--fast-mode")
-        else:
-            command.extend(
-                [
-                    "--video-effects",
-                    "clean",
-                    "--include-intro" if self.config.include_intro else "--no-include-intro",
-                    "--include-outro",
-                    "--outro-seconds",
-                    "4.2",
-                    "--outro-text",
-                    "Thanks for watching",
-                    "--outro-tagline",
-                    "Remember to like the video and subscribe",
-                    "--bookend-style",
-                    "corner-fade",
-                    "--caption-engine",
-                    "faster-whisper",
-                    "--duration-tolerance",
-                    "0.25",
-                    "--require-external-assets",
-                ]
-            )
+        command.extend(
+            [
+                "--video-effects",
+                "clean",
+                "--include-intro" if self.config.include_intro else "--no-include-intro",
+                "--include-outro",
+            "--outro-seconds",
+            "4.2",
+            "--outro-text",
+            outro_text,
+            "--channel-profile",
+            str(self.config.active_channel or "").strip().lower(),
+            "--channel-name",
+            channel_name,
+                "--intro-tagline",
+                intro_tagline,
+                "--outro-tagline",
+                outro_tagline,
+                "--bookend-style",
+                "corner-fade",
+                "--caption-engine",
+                "faster-whisper",
+                "--duration-tolerance",
+                "0.25",
+                "--require-external-assets",
+            ]
+        )
 
         if self.config.tts_engine == "melo":
             command.extend(
@@ -1084,7 +1974,7 @@ class LocalVideoMvpTui:
                 ]
             )
 
-        if stage in {"full", "draft"}:
+        if stage == "draft":
             command.extend(
                 [
                     "--script-engine",
@@ -1122,10 +2012,6 @@ class LocalVideoMvpTui:
         if str(getattr(self.config, "script_engine", "ollama") or "ollama").strip().lower() != "ollama":
             return
         thread = threading.Thread(target=self._ensure_ollama_running, daemon=True)
-        thread.start()
-
-    def _start_comfyui_on_launch(self) -> None:
-        thread = threading.Thread(target=self._ensure_comfyui_running, daemon=True)
         thread.start()
 
     def _ensure_ollama_running(self) -> None:
@@ -1214,445 +2100,6 @@ class LocalVideoMvpTui:
         self._set_status("Ollama unavailable. Start `ollama serve` and retry.")
         return False
 
-    def _thumbnail_comfyui_install_dir(self) -> Path | None:
-        configured = str(getattr(self.config, "thumbnail_comfyui_install_dir", "") or "").strip()
-        if configured:
-            resolved = Path(configured).expanduser().resolve()
-            if self._is_comfyui_install_dir(resolved):
-                return resolved
-        return self._detect_local_comfyui_install_dir()
-
-    def _is_comfyui_install_dir(self, candidate: Path) -> bool:
-        resolved = candidate.expanduser().resolve()
-        if not resolved.is_dir():
-            return False
-        main_py = resolved / "main.py"
-        if not main_py.exists():
-            return False
-        return (resolved / "custom_nodes").exists() or (resolved / "web").exists() or (resolved / "models").exists()
-
-    def _detect_local_comfyui_install_dir(self) -> Path | None:
-        if self._comfyui_detection_attempted:
-            return self._comfyui_detected_install_dir
-
-        candidates: list[Path] = []
-        env_dir = os.environ.get("IMAGINE_THUMBNAIL_COMFYUI_DIR")
-        if env_dir:
-            candidates.append(Path(env_dir).expanduser())
-
-        home = Path.home()
-        candidates.extend(
-            [
-                self._managed_comfyui_install_dir(),
-                home / "ComfyUI",
-                home / "comfyui",
-                home / "Applications" / "ComfyUI",
-                home / "Applications" / "comfyui",
-                home / "Dev" / "ComfyUI",
-                home / "Developer" / "ComfyUI",
-                home / "Documents" / "ComfyUI",
-                home / "Downloads" / "ComfyUI",
-            ]
-        )
-
-        search_roots = [
-            home / "Applications",
-            home / "Dev",
-            home / "Developer",
-            home / "Documents",
-            home / "Downloads",
-        ]
-        for root in search_roots:
-            if not root.exists() or not root.is_dir():
-                continue
-            try:
-                for child in root.iterdir():
-                    if "comfyui" in child.name.lower():
-                        candidates.append(child)
-            except Exception:
-                continue
-
-        checked: set[str] = set()
-        for candidate in candidates:
-            key = str(candidate.expanduser())
-            if key in checked:
-                continue
-            checked.add(key)
-            if self._is_comfyui_install_dir(candidate):
-                resolved = candidate.expanduser().resolve()
-                self._comfyui_detected_install_dir = resolved
-                self._comfyui_detection_attempted = True
-                return resolved
-
-        self._comfyui_detected_install_dir = None
-        self._comfyui_detection_attempted = True
-        return None
-
-    def _comfyui_launch_command(self) -> tuple[list[str], Path] | None:
-        install_dir = self._thumbnail_comfyui_install_dir()
-        if install_dir is None:
-            return None
-        url = self._thumbnail_studio_comfyui_url()
-        parsed = urllib.parse.urlparse(url)
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or 8188
-        python_candidates = [
-            install_dir / ".venv" / "bin" / "python",
-            install_dir / "venv" / "bin" / "python",
-            install_dir / "env" / "bin" / "python",
-            Path(sys.executable).expanduser().resolve(),
-            Path("/usr/bin/python3"),
-        ]
-        python_exec: Path | None = None
-        for candidate in python_candidates:
-            if candidate.exists() and candidate.is_file():
-                python_exec = candidate
-                break
-        if python_exec is None:
-            return None
-        command = [
-            str(python_exec),
-            "main.py",
-            "--listen",
-            host,
-            "--port",
-            str(port),
-        ]
-        return command, install_dir
-
-    def _comfyui_available(self) -> bool:
-        return self._probe_comfyui_online(max_age=0.0)
-
-    def _probe_comfyui_online(self, *, max_age: float = 4.0) -> bool:
-        now = time.monotonic()
-        with self._lock:
-            checked_at = self._comfyui_probe_checked_at
-            cached = self._comfyui_probe_online
-        if cached is not None and max_age > 0 and (now - checked_at) <= max_age:
-            return bool(cached)
-        reachable, _ = comfyui_endpoint_reachable(self._thumbnail_studio_comfyui_url())
-        with self._lock:
-            self._comfyui_probe_online = reachable
-            self._comfyui_probe_checked_at = now
-        return reachable
-
-    def _ensure_comfyui_running(self) -> None:
-        if self._comfyui_available():
-            return
-
-        with self._lock:
-            if self._comfyui_starting:
-                return
-            if self._comfyui_process is not None and self._comfyui_process.poll() is None:
-                return
-            self._comfyui_starting = True
-
-        try:
-            launch = self._comfyui_launch_command()
-            if launch is None:
-                self._append_log("WARN: No local ComfyUI install was detected for auto-start.")
-                return
-            command, install_dir = launch
-            log_path = self._comfyui_log_path()
-            log_handle = log_path.open("a", encoding="utf-8")
-            process = subprocess.Popen(
-                command,
-                cwd=str(install_dir),
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            with self._lock:
-                if self._comfyui_log_handle is not None:
-                    self._comfyui_log_handle.close()
-                self._comfyui_log_handle = log_handle
-                self._comfyui_process = process
-                self._started_comfyui = True
-            self._append_log(f"Started ComfyUI server (pid={process.pid}).")
-            self._append_log(f"ComfyUI install: {install_dir}")
-            self._append_log(f"ComfyUI log: {log_path}")
-            deadline = time.monotonic() + 25.0
-            while time.monotonic() < deadline:
-                if process.poll() is not None:
-                    self._append_log(f"ERROR: ComfyUI exited early with code {process.returncode}.")
-                    return
-                if self._comfyui_available():
-                    self._append_log("ComfyUI server is online.")
-                    return
-                time.sleep(1.0)
-        finally:
-            with self._lock:
-                self._comfyui_starting = False
-
-    def _ensure_comfyui_available_with_modal(self) -> bool:
-        if self._comfyui_available():
-            return True
-
-        self._ensure_comfyui_running()
-        if self._comfyui_available():
-            return True
-
-        install_dir = self._thumbnail_comfyui_install_dir()
-        if install_dir is None:
-            should_install = self._prompt_yes_no(
-                "Install ComfyUI",
-                (
-                    "Thumbnail Studio could not find a local ComfyUI install.\n\n"
-                    f"Imagine can install a managed copy under:\n{self._managed_comfyui_install_dir()}\n\n"
-                    "This keeps setup inside the TUI. Install now?"
-                ),
-                default_yes=True,
-            )
-            if should_install:
-                try:
-                    self._run_with_spinner_modal(
-                        title="Thumbnail ComfyUI",
-                        message="Installing managed ComfyUI",
-                        detail_text=str(self._managed_comfyui_install_dir()),
-                        task=self._install_managed_comfyui,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    self._append_log(f"ERROR: Managed ComfyUI install failed: {exc}")
-                    self._set_status("Managed ComfyUI install failed.")
-                    self._show_paginated_text_modal(
-                        "Managed ComfyUI Install Failed",
-                        "\n".join(
-                            [
-                                "Imagine could not finish the managed ComfyUI install.",
-                                "",
-                                f"Detail: {exc}",
-                                "",
-                                f"Log file: {self._comfyui_log_path()}",
-                            ]
-                        ),
-                    )
-                    return False
-                self._ensure_comfyui_running()
-                if self._comfyui_available():
-                    return True
-                install_dir = self._thumbnail_comfyui_install_dir()
-
-        install_text = str(install_dir) if install_dir is not None else "(not detected)"
-        self._show_paginated_text_modal(
-            "ComfyUI Unavailable",
-            (
-                "Thumbnail generation needs a local ComfyUI API server.\n\n"
-                f"Configured URL: {self._thumbnail_studio_comfyui_url()}\n"
-                f"Detected install: {install_text}\n\n"
-                "The TUI tried to auto-start ComfyUI but it is still unavailable.\n"
-                "Open `Settings -> Thumbnail ComfyUI` if your ComfyUI lives in a custom folder or you want Imagine to install a managed copy.\n"
-                "Check `/tmp/local-video-mvp-comfyui.log` if auto-start launched but failed."
-            ),
-        )
-        self._append_log("WARN: ComfyUI unavailable for Thumbnail Studio.")
-        self._set_status("ComfyUI unavailable. Thumbnail generation is blocked.")
-        return False
-
-    def _install_managed_comfyui(self) -> Path:
-        install_dir = self._managed_comfyui_install_dir()
-        install_dir.parent.mkdir(parents=True, exist_ok=True)
-        repo_url = "https://github.com/comfyanonymous/ComfyUI.git"
-
-        if not self._is_comfyui_install_dir(install_dir):
-            if install_dir.exists() and any(install_dir.iterdir()):
-                raise RuntimeError(
-                    f"Managed ComfyUI folder already exists but is not a valid install: {install_dir}"
-                )
-            clone = subprocess.run(
-                ["git", "clone", "--depth", "1", repo_url, str(install_dir)],
-                capture_output=True,
-                text=True,
-                timeout=1800,
-                check=False,
-            )
-            if int(clone.returncode or 0) != 0:
-                raise RuntimeError(str(clone.stderr or clone.stdout or "git clone failed").strip())
-
-        venv_dir = install_dir / ".venv"
-        python_exec = venv_dir / "bin" / "python"
-        if not python_exec.exists():
-            create_venv = subprocess.run(
-                [sys.executable, "-m", "venv", str(venv_dir)],
-                capture_output=True,
-                text=True,
-                timeout=1200,
-                check=False,
-            )
-            if int(create_venv.returncode or 0) != 0:
-                raise RuntimeError(str(create_venv.stderr or create_venv.stdout or "venv creation failed").strip())
-
-        pip_bootstrap = subprocess.run(
-            [str(python_exec), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"],
-            capture_output=True,
-            text=True,
-            timeout=1800,
-            check=False,
-        )
-        if int(pip_bootstrap.returncode or 0) != 0:
-            raise RuntimeError(str(pip_bootstrap.stderr or pip_bootstrap.stdout or "pip bootstrap failed").strip())
-
-        install_requirements = subprocess.run(
-            [str(python_exec), "-m", "pip", "install", "-r", "requirements.txt"],
-            cwd=str(install_dir),
-            capture_output=True,
-            text=True,
-            timeout=7200,
-            check=False,
-        )
-        if int(install_requirements.returncode or 0) != 0:
-            raise RuntimeError(
-                str(install_requirements.stderr or install_requirements.stdout or "requirements install failed").strip()
-            )
-
-        self.config.thumbnail_comfyui_install_dir = str(install_dir)
-        self._comfyui_detected_install_dir = install_dir
-        self._comfyui_detection_attempted = True
-        self._save_persisted_settings()
-        self._append_log(f"Managed ComfyUI install ready at {install_dir}")
-        return install_dir
-
-    def _comfyui_status_lines(self) -> list[str]:
-        install_dir = self._thumbnail_comfyui_install_dir()
-        reachable, reason = comfyui_endpoint_reachable(self._thumbnail_studio_comfyui_url())
-        checkpoint_count = self._comfyui_checkpoint_count(install_dir)
-        with self._lock:
-            process = self._comfyui_process
-        process_text = "running" if process is not None and process.poll() is None else "not managed"
-        return [
-            f"Status: {'online' if reachable else 'offline'}",
-            f"URL: {self._thumbnail_studio_comfyui_url()}",
-            f"Install dir: {str(install_dir) if install_dir is not None else '(not detected)'}",
-            f"Checkpoints: {checkpoint_count}",
-            f"Managed process: {process_text}",
-            f"Detail: {reason}",
-            f"Log: {self._comfyui_log_path()}",
-        ]
-
-    def _open_thumbnail_comfyui_manager(self) -> None:
-        if self._is_running():
-            self._set_status("A command is already running.")
-            return
-
-        current_option = "Review status"
-        while True:
-            status_text = self._thumbnail_comfyui_summary()
-            install_summary = self._thumbnail_comfyui_install_summary()
-            checkpoint_count = self._comfyui_checkpoint_count(self._thumbnail_comfyui_install_dir())
-            options = [
-                "Review status",
-                "Auto setup managed ComfyUI",
-                "Start ComfyUI now",
-                "Auto-detect install again",
-                "Change ComfyUI URL",
-                "Change install dir",
-                "Open ComfyUI log",
-                "Back",
-            ]
-            option_details = {
-                "Review status": f"Current status: {status_text} | install: {install_summary} | checkpoints: {checkpoint_count}",
-                "Auto setup managed ComfyUI": (
-                    f"Install ComfyUI under {self._managed_comfyui_install_dir()} and prepare a local Python environment."
-                ),
-                "Start ComfyUI now": "Try to auto-start the detected/configured ComfyUI install and wait for the API to come online.",
-                "Auto-detect install again": "Rescan common folders for an existing ComfyUI install and remember it.",
-                "Change ComfyUI URL": f"Current: {self._thumbnail_studio_comfyui_url()}",
-                "Change install dir": (
-                    f"Current: {str(self._thumbnail_comfyui_install_dir()) if self._thumbnail_comfyui_install_dir() is not None else '(auto-detect)'}"
-                ),
-                "Open ComfyUI log": f"Open {self._comfyui_log_path()} in your configured external editor.",
-                "Back": "Return to Settings.",
-            }
-            choice = self._select_from_list(
-                label="Thumbnail ComfyUI",
-                options=options,
-                current_value=current_option if current_option in options else options[0],
-                option_details=option_details,
-            )
-            if choice is None or choice == "Back":
-                self._set_status("Thumbnail ComfyUI settings closed.")
-                return
-            current_option = cast(str, choice)
-
-            if current_option == "Review status":
-                self._show_paginated_text_modal("Thumbnail ComfyUI Status", "\n".join(self._comfyui_status_lines()))
-                continue
-
-            if current_option == "Auto-detect install again":
-                self._comfyui_detection_attempted = False
-                self._comfyui_detected_install_dir = None
-                detected = self._detect_local_comfyui_install_dir()
-                if detected is not None:
-                    self._set_status(f"Detected ComfyUI install: {detected.name}")
-                else:
-                    self._set_status("No local ComfyUI install was detected.")
-                continue
-
-            if current_option == "Change ComfyUI URL":
-                before = self._config_snapshot()
-                result = self._edit_thumbnail_comfyui_url_field()
-                changed = self._commit_config_changes(before)
-                self._report_config_edit(context="Thumbnail ComfyUI", changed=changed, had_warning=result.had_warning)
-                continue
-
-            if current_option == "Change install dir":
-                before = self._config_snapshot()
-                result = self._edit_thumbnail_comfyui_install_dir_field()
-                changed = self._commit_config_changes(before)
-                self._report_config_edit(context="Thumbnail ComfyUI", changed=changed, had_warning=result.had_warning)
-                continue
-
-            if current_option == "Open ComfyUI log":
-                log_path = self._comfyui_log_path()
-                if not log_path.exists():
-                    self._set_status("ComfyUI log file does not exist yet.")
-                    continue
-                if self._open_path_in_external_editor(log_path):
-                    self._set_status("Opened ComfyUI log.")
-                continue
-
-            if current_option == "Auto setup managed ComfyUI":
-                confirm = self._prompt_yes_no(
-                    "Install Managed ComfyUI",
-                    (
-                        f"Install ComfyUI under:\n{self._managed_comfyui_install_dir()}\n\n"
-                        "This stays entirely local and may take a while on first setup. Continue?"
-                    ),
-                    default_yes=True,
-                )
-                if not confirm:
-                    self._set_status("Managed ComfyUI install cancelled.")
-                    continue
-                try:
-                    install_dir = self._run_with_spinner_modal(
-                        title="Thumbnail ComfyUI",
-                        message="Installing managed ComfyUI",
-                        detail_text=str(self._managed_comfyui_install_dir()),
-                        task=self._install_managed_comfyui,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    self._append_log(f"ERROR: Managed ComfyUI install failed: {exc}")
-                    self._show_paginated_text_modal(
-                        "Managed ComfyUI Install Failed",
-                        "\n".join(
-                            [
-                                "Imagine could not finish the managed ComfyUI install.",
-                                "",
-                                f"Detail: {exc}",
-                                "",
-                                f"Log file: {self._comfyui_log_path()}",
-                            ]
-                        ),
-                    )
-                    self._set_status("Managed ComfyUI install failed.")
-                    continue
-                self._set_status(f"Managed ComfyUI installed: {Path(str(install_dir)).name}")
-                continue
-
-            if current_option == "Start ComfyUI now":
-                if self._ensure_comfyui_available_with_modal():
-                    self._set_status("ComfyUI is online.")
-                continue
-
     def _draw(self) -> None:
         if self._stdscr is None:
             return
@@ -1681,15 +2128,14 @@ class LocalVideoMvpTui:
         if mode_text == "news":
             mode_text = f"news ({len(self.config.news_feed_urls)} feeds)"
         self._safe_addstr(5, 2, f"Mode   : {mode_text}  Minutes: {self.config.minutes}", width)
-        self._safe_addstr(6, 2, f"Fast   : {'On' if self.config.fast_mode else 'Off'}", width)
         self._safe_addstr(
-            7,
+            6,
             2,
             f"Voice  : {self._voice_display_value()}  "
             f"profile={self.config.voice_profile} speed={self.config.voice_speed:.2f}",
             width,
         )
-        # Show concise MP4 path: just ~/Downloads/filename instead of full path
+        # Show concise MP4 path under the configured export root instead of the full path.
         mp4_path = self._mp4_output_preview_path()
         home = Path.home()
         try:
@@ -1697,16 +2143,16 @@ class LocalVideoMvpTui:
         except ValueError:
             mp4_display = mp4_path.name
         self._safe_addstr(
-            8,
+            7,
             2,
             f"MP4 out: {self._trim_middle(mp4_display, width - 13)}",
             width,
             attr=self._attr("muted"),
         )
         keywords_text = ", ".join(self.config.asset_keywords) if self.config.asset_keywords else "(auto from script scenes)"
-        self._safe_addstr(9, 2, f"Keywords: {self._trim_tail(keywords_text, width - 14)}", width, attr=self._attr("muted"))
+        self._safe_addstr(8, 2, f"Keywords: {self._trim_tail(keywords_text, width - 14)}", width, attr=self._attr("muted"))
         tts_text, tts_attr = self._tts_status_display()
-        self._safe_addstr(10, 2, f"TTS    : {self._trim_tail(tts_text, width - 14)}", width, attr=tts_attr)
+        self._safe_addstr(9, 2, f"TTS    : {self._trim_tail(tts_text, width - 14)}", width, attr=tts_attr)
 
         self._draw_box(12, 0, 7, width, title=" Runtime ", attr=self._attr("accent"))
         state_text, state_attr = self._state_display()
@@ -1747,7 +2193,7 @@ class LocalVideoMvpTui:
         self._safe_addstr(0, 0, "Imagine TUI", width, attr=self._attr("title", bold=True))
         self._draw_hotkey_hint(row=1, width=width)
         self._safe_addstr(3, 0, f"Prompt: {self._trim_tail(self.config.prompt, width - 8)}", width)
-        self._safe_addstr(4, 0, f"Minutes: {self.config.minutes}  Fast: {'On' if self.config.fast_mode else 'Off'}", width)
+        self._safe_addstr(4, 0, f"Minutes: {self.config.minutes}", width)
         self._safe_addstr(
             5,
             0,
@@ -2098,7 +2544,6 @@ class LocalVideoMvpTui:
             "review": "review",
             "preview": "preview",
             "finalize": "finalize",
-            "full": "full",
             "done": "done",
         }
         return labels.get(stage_value, stage_value.replace("-", " ") or "draft")
@@ -2113,15 +2558,6 @@ class LocalVideoMvpTui:
             return
         self.config.news_feed_urls = default_news_feed_urls()
 
-    def _enforce_news_hitl_policy(self, *, persist: bool = False) -> bool:
-        if self._content_mode() != "news" or self._hitl_enabled:
-            return False
-        self._hitl_enabled = True
-        self._append_log("News mode requires HITL source review. Forcing HITL On.")
-        if persist:
-            self._save_persisted_settings()
-        return True
-
     def _progress_phase_text(self) -> str:
         with self._lock:
             stage_index = self._stage_index
@@ -2134,7 +2570,7 @@ class LocalVideoMvpTui:
                 return "Inspect workflow"
             if workflow_kind == "replace":
                 return "Clip replacement workflow"
-            return f"HITL ready: {self._display_stage_name()}"
+            return f"Workflow ready: {self._display_stage_name()}"
 
         if stage_index is None or stage_total is None or stage_total <= 0:
             return f"Starting {self._display_stage_name()} stage..."
@@ -2647,90 +3083,35 @@ class LocalVideoMvpTui:
             out.append(value)
         return out[:20]
 
-    def _iter_project_workspaces(self) -> list[Path]:
-        root = self.config.project_dir
+    def _is_video_package_dir(self, path: Path) -> bool:
+        if not path.is_dir() or path.name.startswith("."):
+            return False
+
+        metadata_dir = path / "metadata"
+        package_mp4 = path / f"{path.name}.mp4"
+        return metadata_dir.is_dir() or package_mp4.exists()
+
+    def _iter_video_packages(self) -> list[Path]:
+        self._ensure_package_layout_ready()
+        root = self._mp4_export_dir()
         if not root.exists():
             return []
 
-        entries: list[Path] = []
-        for path in root.iterdir():
-            if path.is_dir():
-                entries.append(path)
-
+        entries = [path.resolve() for path in root.iterdir() if self._is_video_package_dir(path)]
         entries.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+        return entries
+
+    def _iter_project_workspaces(self) -> list[Path]:
+        entries: list[Path] = []
+        for package_dir in self._iter_video_packages():
+            metadata_dir = resolve_video_package(package_dir).metadata_dir
+            if metadata_dir.exists():
+                entries.append(metadata_dir)
         return entries
 
     def _latest_project_workspace(self) -> Path | None:
         entries = self._iter_project_workspaces()
         return entries[0] if entries else None
-
-    def _thumbnail_studio_comfyui_url(self) -> str:
-        return (
-            str(getattr(self.config, "thumbnail_comfyui_url", THUMBNAIL_STUDIO_DEFAULT_COMFYUI_URL) or "").strip().rstrip("/")
-            or THUMBNAIL_STUDIO_DEFAULT_COMFYUI_URL
-        )
-
-    def _thumbnail_studio_export_dir(self) -> Path:
-        return Path(
-            str(getattr(self.config, "thumbnail_default_export_dir", THUMBNAIL_STUDIO_DEFAULT_EXPORT_DIR) or "").strip()
-            or str(THUMBNAIL_STUDIO_DEFAULT_EXPORT_DIR)
-        ).expanduser().resolve()
-
-    def _thumbnail_studio_ollama_hooks_enabled(self) -> bool:
-        return bool(getattr(self.config, "thumbnail_use_ollama_hooks", True))
-
-    def _managed_comfyui_install_dir(self) -> Path:
-        return (Path.home() / ".imagine" / "tools" / "ComfyUI").resolve()
-
-    def _comfyui_log_path(self) -> Path:
-        return Path("/tmp/local-video-mvp-comfyui.log").resolve()
-
-    def _comfyui_checkpoint_count(self, install_dir: Path | None = None) -> int:
-        target = (install_dir or self._thumbnail_comfyui_install_dir())
-        if target is None:
-            return 0
-        checkpoints_dir = target / "models" / "checkpoints"
-        if not checkpoints_dir.exists():
-            return 0
-        count = 0
-        try:
-            for path in checkpoints_dir.iterdir():
-                if path.is_file() and path.suffix.lower() in {".ckpt", ".pt", ".pth", ".safetensors"}:
-                    count += 1
-        except Exception:
-            return 0
-        return count
-
-    def _show_thumbnail_studio_setup_help(self, detail: str) -> None:
-        install_dir = self._thumbnail_comfyui_install_dir()
-        body = "\n".join(
-            [
-                "Thumbnail Studio could not generate images yet.",
-                "",
-                f"ComfyUI URL: {self._thumbnail_studio_comfyui_url()}",
-                f"Detected install: {str(install_dir) if install_dir is not None else '(not detected)'}",
-                f"Detail: {detail}",
-                "",
-                "Setup notes:",
-                "- The TUI will auto-start a detected local ComfyUI install when possible.",
-                "- Make sure at least one checkpoint is installed.",
-                "- You can change the ComfyUI URL or install path in Settings.",
-                "- If auto-start fails after launch, inspect /tmp/local-video-mvp-comfyui.log.",
-                "",
-                "You can stay in the studio, edit the prompt/headline, and retry generation.",
-            ]
-        )
-        self._show_paginated_text_modal("Thumbnail Studio Setup", body)
-
-    def _thumbnail_studio_session_option_details(self, session: ThumbnailStudioSession) -> str:
-        variant_count = len(session.variants)
-        updated_text = self._format_timestamp_text(session.updated_at)
-        selected = selected_thumbnail_variant(session)
-        selected_text = selected.variant_id if selected is not None else "none"
-        return (
-            f"{self._trim_tail(session.prompt, 48)} | updated {updated_text} | "
-            f"{variant_count} variants | selected {selected_text}"
-        )
 
     def _format_timestamp_text(self, value: str) -> str:
         raw = str(value or "").strip()
@@ -2741,528 +3122,6 @@ class LocalVideoMvpTui:
             return parsed.astimezone().strftime("%Y-%m-%d %H:%M")
         except Exception:
             return raw
-
-    def _select_recent_thumbnail_studio_session(self) -> ThumbnailStudioSession | None:
-        sessions = list_thumbnail_studio_sessions(limit=30)
-        if not sessions:
-            self._show_paginated_text_modal(
-                "Recent Thumbnail Sessions",
-                "No saved thumbnail sessions were found yet.\n\nChoose `New from prompt` to create the first one.",
-            )
-            self._set_status("No saved thumbnail sessions yet.")
-            return None
-        option_details: dict[str, str] = {}
-        label_to_session: dict[str, ThumbnailStudioSession] = {}
-        labels: list[str] = []
-        for session in sessions:
-            label = self._trim_tail(f"{session.session_id} | {session.prompt}", 88)
-            option_details[label] = self._thumbnail_studio_session_option_details(session)
-            label_to_session[label] = session
-            labels.append(label)
-        selected = self._select_from_list(
-            label="Recent Thumbnail Sessions",
-            options=labels,
-            current_value=labels[0],
-            option_details=option_details,
-        )
-        if selected is None:
-            self._set_status("Recent thumbnail sessions closed.")
-            return None
-        chosen = label_to_session.get(str(selected))
-        if chosen is None:
-            self._set_status("Thumbnail session selection failed.")
-            return None
-        try:
-            return load_thumbnail_studio_session(thumbnail_studio_session_dir(chosen.session_id))
-        except Exception as exc:  # noqa: BLE001
-            self._append_log(f"ERROR: Could not load thumbnail session {chosen.session_id}: {exc}")
-            self._set_status("Could not load thumbnail session. See logs.")
-            return None
-
-    def _create_thumbnail_studio_session_flow(self) -> ThumbnailStudioSession | None:
-        prompt_text = self._prompt_input("Thumbnail prompt", self.config.prompt or "Your thumbnail idea")
-        if prompt_text is None:
-            self._set_status("Thumbnail Studio cancelled.")
-            return None
-        cleaned_prompt = str(prompt_text).strip()
-        if not cleaned_prompt:
-            self._set_status("Thumbnail prompt cannot be empty.")
-            return None
-
-        style_hint = self._prompt_input("Style hint (optional)", "")
-        if style_hint is None:
-            style_hint = ""
-        badge_text = self._prompt_input("Badge text (optional)", "")
-        if badge_text is None:
-            badge_text = ""
-
-        try:
-            session = self._run_with_spinner_modal(
-                title="Thumbnail Studio",
-                message="Creating session",
-                detail_text=cleaned_prompt,
-                task=lambda: create_thumbnail_studio_session(
-                    prompt=cleaned_prompt,
-                    style_hint=str(style_hint or "").strip(),
-                    badge_text=str(badge_text or "").strip(),
-                    use_ollama_hooks=self._thumbnail_studio_ollama_hooks_enabled(),
-                    ollama_model="qwen2.5:14b",
-                    notify=self._append_log,
-                ),
-            )
-        except Exception as exc:  # noqa: BLE001
-            self._append_log(f"ERROR: Could not create thumbnail studio session: {exc}")
-            self._set_status("Thumbnail Studio setup failed. See logs.")
-            return None
-
-        session_obj = cast(ThumbnailStudioSession, session)
-        try:
-            self._generate_thumbnail_studio_batch(session_obj, append=True)
-        except RuntimeError as exc:
-            self._append_log(f"WARN: Thumbnail generation unavailable: {exc}")
-            self._show_thumbnail_studio_setup_help(str(exc))
-        return session_obj
-
-    def _generate_thumbnail_studio_batch(self, session: ThumbnailStudioSession, *, append: bool) -> bool:
-        if not self._ensure_comfyui_available_with_modal():
-            raise RuntimeError("ComfyUI is unavailable.")
-        try:
-            generated = self._run_with_spinner_modal(
-                title="Thumbnail Studio",
-                message="Generating thumbnail variants",
-                detail_text=session.prompt,
-                task=lambda: generate_thumbnail_studio_variants(
-                    session,
-                    comfyui_url=self._thumbnail_studio_comfyui_url(),
-                    variant_count=4,
-                    append=append,
-                    notify=self._append_log,
-                ),
-            )
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(str(exc)) from exc
-        generated_list = cast(list[Any], generated or [])
-        if not generated_list:
-            raise RuntimeError("No thumbnail variants were produced.")
-        latest_variant = generated_list[0]
-        if hasattr(latest_variant, "variant_id"):
-            session.selected_variant_id = str(getattr(latest_variant, "variant_id"))
-        save_thumbnail_studio_session(session)
-        return True
-
-    def _select_thumbnail_studio_variant(self, session: ThumbnailStudioSession) -> bool:
-        if not session.variants:
-            self._set_status("No thumbnail variants are available yet.")
-            return False
-        selected = selected_thumbnail_variant(session)
-        option_details: dict[str, str] = {}
-        labels: list[str] = []
-        for variant in session.variants:
-            label = f"{variant.variant_id} | {preset_label(variant.preset)}"
-            labels.append(label)
-            notes = ", ".join(variant.score_notes) if variant.score_notes else "no notes"
-            option_details[label] = f"Seed {variant.seed} | {notes}"
-        current_label = labels[0]
-        if selected is not None:
-            selected_label = f"{selected.variant_id} | {preset_label(selected.preset)}"
-            if selected_label in labels:
-                current_label = selected_label
-        choice = self._select_from_list(
-            label="Thumbnail Variants",
-            options=labels,
-            current_value=current_label,
-            option_details=option_details,
-        )
-        if choice is None:
-            self._set_status("Thumbnail variant selection cancelled.")
-            return False
-        selected_text = str(choice)
-        for variant in session.variants:
-            label = f"{variant.variant_id} | {preset_label(variant.preset)}"
-            if label == selected_text:
-                session.selected_variant_id = variant.variant_id
-                session.preset = variant.preset
-                save_thumbnail_studio_session(session)
-                return True
-        return False
-
-    def _thumbnail_studio_preview_detail_lines(self, session: ThumbnailStudioSession) -> list[str]:
-        lines = [
-            f"Prompt: {session.prompt}",
-            f"Headline: {session.headline_text or '(empty)'}",
-            f"Badge: {session.badge_text or '(none)'}",
-            f"Preset: {preset_label(session.preset)}",
-            f"Palette: {palette_label(session.palette)}",
-            f"Variants: {len(session.variants)}",
-        ]
-        selected = selected_thumbnail_variant(session)
-        if selected is not None:
-            lines.append(f"Selected: {selected.variant_id} | seed {selected.seed}")
-            for note in selected.score_notes:
-                lines.append(f"Note: {note}")
-        if session.exported_path:
-            lines.append(f"Exported: {session.exported_path}")
-        return lines
-
-    def _show_standalone_thumbnail_preview_modal(self, session: ThumbnailStudioSession) -> None:
-        preview_path = thumbnail_studio_session_preview_path(session)
-        if preview_path is None:
-            self._set_status("No thumbnail preview is available yet.")
-            return
-        if self._stdscr is None:
-            self._play_media_path(
-                preview_path,
-                label=f"thumbnail-studio-{self._safe_filename_token(preview_path.stem)}",
-                audio_only=False,
-            )
-            return
-
-        preview_image_path = self._preview_png_from_media_path(preview_path, media_type="image") or preview_path
-        detail_lines = self._thumbnail_studio_preview_detail_lines(session)
-
-        with self._modal_focus():
-            stdscr = self._stdscr
-            height, width = stdscr.getmaxyx()
-            modal_width = min(max(92, width - 4), max(30, width - 2))
-            modal_height = min(max(22, height - 4), max(14, height - 2))
-            if modal_width < 30 or modal_height < 14:
-                self._show_paginated_text_modal("Thumbnail Preview", "\n".join(detail_lines))
-                return
-
-            top = max(0, (height - modal_height) // 2)
-            left = max(0, (width - modal_width) // 2)
-            preview_box_top = 2
-            preview_box_height = max(10, min(16, modal_height - 9))
-            preview_inner_width = max(12, modal_width - 8)
-            detail_top = preview_box_top + preview_box_height + 1
-            detail_rows = max(3, modal_height - detail_top - 2)
-            win = curses.newwin(modal_height, modal_width, top, left)
-            win.keypad(True)
-            win.nodelay(False)
-            win.timeout(-1)
-
-            while True:
-                self._draw()
-                win.erase()
-                try:
-                    win.box()
-                    win.addstr(0, 2, self._trim_tail(" Thumbnail Preview ", modal_width - 4), self._attr("accent", bold=True))
-                    win.addstr(modal_height - 1, 2, self._trim_tail("Enter/Esc back", modal_width - 4), self._attr("muted"))
-                    win.addstr(preview_box_top, 2, "+" + ("-" * preview_inner_width) + "+", self._attr("muted"))
-                    win.addstr(preview_box_top + preview_box_height - 1, 2, "+" + ("-" * preview_inner_width) + "+", self._attr("muted"))
-                except curses.error:
-                    pass
-                for row in range(max(0, preview_box_height - 2)):
-                    try:
-                        win.addstr(preview_box_top + 1 + row, 2, "|" + (" " * preview_inner_width) + "|")
-                    except curses.error:
-                        pass
-                for row in range(detail_rows):
-                    line = detail_lines[row] if row < len(detail_lines) else ""
-                    try:
-                        win.addstr(detail_top + row, 2, self._trim_tail(line, modal_width - 4), self._attr("muted"))
-                    except curses.error:
-                        pass
-                win.refresh()
-
-                preview_top = top + preview_box_top + 2
-                preview_left = left + 4
-                preview_rows = max(1, preview_box_height - 2)
-                preview_cols = max(1, preview_inner_width)
-                self._clear_terminal_region(
-                    top_row=preview_top,
-                    left_col=preview_left,
-                    cols=preview_cols,
-                    rows=preview_rows,
-                )
-                drew_preview = self._draw_shot_review_graphics_preview(
-                    image_path=preview_image_path,
-                    top_row=preview_top,
-                    left_col=preview_left,
-                    cols=preview_cols,
-                    rows=preview_rows,
-                )
-                if not drew_preview:
-                    self._clear_shot_review_graphics_preview()
-                    self._draw_shot_review_color_preview(
-                        image_path=preview_image_path,
-                        top_row=preview_top,
-                        left_col=preview_left,
-                        cols=preview_cols,
-                        rows=preview_rows,
-                    )
-                key = win.getch()
-                if key in (10, 13, curses.KEY_ENTER, 27):
-                    self._clear_shot_review_graphics_preview()
-                    return
-
-    def _select_thumbnail_studio_preset(self, current_value: str) -> str | None:
-        options = list(THUMBNAIL_STUDIO_PRESET_CHOICES)
-        option_details = {option: preset_label(option) for option in options}
-        selected = self._select_from_list(
-            label="Thumbnail preset",
-            options=options,
-            current_value=current_value if current_value in options else THUMBNAIL_STUDIO_DEFAULT_PRESET,
-            option_details=option_details,
-        )
-        return cast(str | None, selected)
-
-    def _select_thumbnail_studio_palette(self, current_value: str) -> str | None:
-        options = list(THUMBNAIL_STUDIO_PALETTE_CHOICES)
-        option_details = {option: palette_label(option) for option in options}
-        selected = self._select_from_list(
-            label="Thumbnail palette",
-            options=options,
-            current_value=current_value if current_value in options else THUMBNAIL_STUDIO_DEFAULT_PALETTE,
-            option_details=option_details,
-        )
-        return cast(str | None, selected)
-
-    def _edit_standalone_thumbnail_session(self, session: ThumbnailStudioSession) -> None:
-        changed = False
-        while True:
-            preview_path = thumbnail_studio_session_preview_path(session)
-            selected_variant = selected_thumbnail_variant(session)
-            actions: list[str] = []
-            option_details: dict[str, str] = {}
-            if session.variants:
-                actions.append("Preview current variant")
-                option_details["Preview current variant"] = "Open the selected composited thumbnail in a larger preview modal."
-                actions.append("Switch selected variant")
-                option_details["Switch selected variant"] = (
-                    f"Current: {selected_variant.variant_id if selected_variant is not None else '(none)'}"
-                )
-            actions.extend(
-                [
-                    "Edit headline",
-                    "Edit badge",
-                    "Apply preset",
-                    "Edit palette",
-                    "Generate 4 variants" if not session.variants else "Regenerate 4 more variants",
-                    "Export to Downloads",
-                    "Review session details",
-                    "Save and return",
-                ]
-            )
-            option_details["Edit headline"] = f"Current: {session.headline_text or '(empty)'}"
-            option_details["Edit badge"] = f"Current: {session.badge_text or '(none)'}"
-            option_details["Apply preset"] = f"Current: {preset_label(session.preset)}"
-            option_details["Edit palette"] = f"Current: {palette_label(session.palette)}"
-            generate_label = "Generate 4 variants" if not session.variants else "Regenerate 4 more variants"
-            option_details[generate_label] = "Create four fresh prompt-based thumbnail variants with different seeds/presets."
-            option_details["Export to Downloads"] = (
-                f"Current folder: {self._thumbnail_studio_export_dir()}"
-            )
-            option_details["Review session details"] = "Inspect prompt, preset, palette, variant count, and export path."
-            option_details["Save and return"] = "Save this thumbnail session and close the standalone studio."
-
-            action = self._select_thumbnail_studio_action(
-                label=f"Thumbnail Studio ({session.session_id})",
-                actions=actions,
-                current_value=actions[0],
-                option_details=option_details,
-                preview_path=preview_path,
-                preview_title=f"Session: {session.session_id}",
-                preview_details=self._thumbnail_studio_preview_detail_lines(session),
-            )
-            if action is None or action == "Save and return":
-                save_thumbnail_studio_session(session)
-                self._set_status("Thumbnail Studio closed.")
-                return
-
-            if action == "Preview current variant":
-                self._show_standalone_thumbnail_preview_modal(session)
-                self._set_status("Thumbnail preview closed.")
-                continue
-
-            if action == "Switch selected variant":
-                if self._select_thumbnail_studio_variant(session):
-                    changed = True
-                continue
-
-            if action == "Edit headline":
-                updated = self._prompt_input("Thumbnail headline", session.headline_text or "")
-                if updated is None:
-                    continue
-                session.headline_text = str(updated).strip()
-                try:
-                    rerender_thumbnail_studio_session(session, notify=self._append_log)
-                except Exception as exc:  # noqa: BLE001
-                    self._append_log(f"ERROR: Could not rerender thumbnail session: {exc}")
-                    self._set_status("Thumbnail rerender failed. See logs.")
-                    continue
-                changed = True
-                continue
-
-            if action == "Edit badge":
-                updated = self._prompt_input("Thumbnail badge (CLEAR to remove)", session.badge_text or "")
-                if updated is None:
-                    continue
-                badge_value = str(updated).strip()
-                session.badge_text = "" if badge_value.upper() == "CLEAR" else badge_value
-                try:
-                    rerender_thumbnail_studio_session(session, notify=self._append_log)
-                except Exception as exc:  # noqa: BLE001
-                    self._append_log(f"ERROR: Could not rerender thumbnail session: {exc}")
-                    self._set_status("Thumbnail rerender failed. See logs.")
-                    continue
-                changed = True
-                continue
-
-            if action == "Apply preset":
-                selected_preset = self._select_thumbnail_studio_preset(session.preset)
-                if selected_preset is None:
-                    continue
-                session.preset = selected_preset
-                selected_variant = selected_thumbnail_variant(session)
-                if selected_variant is not None:
-                    selected_variant.preset = selected_preset
-                try:
-                    rerender_thumbnail_studio_session(session, notify=self._append_log)
-                except Exception as exc:  # noqa: BLE001
-                    self._append_log(f"ERROR: Could not rerender thumbnail session: {exc}")
-                    self._set_status("Thumbnail rerender failed. See logs.")
-                    continue
-                changed = True
-                continue
-
-            if action == "Edit palette":
-                selected_palette = self._select_thumbnail_studio_palette(session.palette)
-                if selected_palette is None:
-                    continue
-                session.palette = selected_palette
-                try:
-                    rerender_thumbnail_studio_session(session, notify=self._append_log)
-                except Exception as exc:  # noqa: BLE001
-                    self._append_log(f"ERROR: Could not rerender thumbnail session: {exc}")
-                    self._set_status("Thumbnail rerender failed. See logs.")
-                    continue
-                changed = True
-                continue
-
-            if action in {"Generate 4 variants", "Regenerate 4 more variants"}:
-                try:
-                    self._generate_thumbnail_studio_batch(session, append=True)
-                    changed = True
-                    self._set_status("Thumbnail variants generated.")
-                except RuntimeError as exc:
-                    self._append_log(f"WARN: Thumbnail generation unavailable: {exc}")
-                    self._show_thumbnail_studio_setup_help(str(exc))
-                continue
-
-            if action == "Export to Downloads":
-                try:
-                    export_path = self._run_with_spinner_modal(
-                        title="Thumbnail Studio",
-                        message="Exporting thumbnail",
-                        detail_text=session.prompt,
-                        task=lambda: export_thumbnail_studio_variant(
-                            session,
-                            export_dir=self._thumbnail_studio_export_dir(),
-                            notify=self._append_log,
-                        ),
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    self._append_log(f"ERROR: Could not export thumbnail: {exc}")
-                    self._set_status("Thumbnail export failed. See logs.")
-                    continue
-                changed = True
-                self._set_status(f"Thumbnail exported: {cast(Path, export_path).name}")
-                continue
-
-            if action == "Review session details":
-                self._show_paginated_text_modal(
-                    "Thumbnail Session Details",
-                    "\n".join(
-                        [
-                            f"Session: {session.session_id}",
-                            f"Prompt: {session.prompt}",
-                            f"Style hint: {session.style_hint or '(none)'}",
-                            f"Enhanced prompt: {session.enhanced_prompt or '(none)'}",
-                            f"Headline: {session.headline_text or '(empty)'}",
-                            f"Badge: {session.badge_text or '(none)'}",
-                            f"Preset: {preset_label(session.preset)}",
-                            f"Palette: {palette_label(session.palette)}",
-                            f"Variants: {len(session.variants)}",
-                            f"Selected variant: {session.selected_variant_id or '(none)'}",
-                            f"Exported path: {session.exported_path or '(not exported yet)'}",
-                            f"ComfyUI URL: {self._thumbnail_studio_comfyui_url()}",
-                        ]
-                    ),
-                )
-                continue
-
-            if changed:
-                save_thumbnail_studio_session(session)
-
-    def _open_thumbnail_studio_menu(self) -> None:
-        if self._is_running():
-            self._set_status("Cannot open Thumbnail Studio while a command is running.")
-            return
-
-        current_choice = "New from prompt"
-        while True:
-            choice = self._select_from_list(
-                label="Thumbnail Studio",
-                options=["New from prompt", "Recent sessions"],
-                current_value=current_choice,
-                option_details={
-                    "New from prompt": "Create a standalone thumbnail session from a prompt and generate modern thumbnail variants.",
-                    "Recent sessions": "Reopen a saved thumbnail session from ~/.imagine/thumbnail-studio.",
-                },
-            )
-            if choice is None:
-                self._set_status("Thumbnail Studio closed.")
-                return
-            current_choice = str(choice)
-            session: ThumbnailStudioSession | None
-            if current_choice == "New from prompt":
-                session = self._create_thumbnail_studio_session_flow()
-            else:
-                session = self._select_recent_thumbnail_studio_session()
-            if session is None:
-                continue
-            self._edit_standalone_thumbnail_session(session)
-            return
-
-    def _select_thumbnail_studio_workspace(self) -> Path | None:
-        candidates = self._youtube_publish_candidates()
-        if not candidates:
-            self._show_paginated_text_modal(
-                "Thumbnail Studio",
-                "No finalized workspace is available yet.\n\nGenerate a video first, then press T to open Thumbnail Studio on that saved project.",
-            )
-            self._set_status("Thumbnail Studio unavailable: no finalized workspace yet.")
-            return None
-
-        option_details: dict[str, str] = {}
-        label_to_path: dict[str, Path] = {}
-        labels: list[str] = []
-        for project_dir in candidates:
-            label = project_dir.name
-            title = self._project_script_title(project_dir) or project_dir.name
-            has_draft = youtube_draft_path(project_dir).exists()
-            updated_at = dt.datetime.fromtimestamp(project_dir.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-            option_details[label] = (
-                f"{title} | updated {updated_at} | {'draft saved' if has_draft else 'no draft yet'}"
-            )
-            label_to_path[label] = project_dir
-            labels.append(label)
-
-        current_value = labels[0]
-        if self._active_project_dir is not None and self._active_project_dir.name in label_to_path:
-            current_value = self._active_project_dir.name
-
-        selected = self._select_from_list(
-            label="Thumbnail Studio Project",
-            options=labels,
-            current_value=current_value,
-            option_details=option_details,
-        )
-        if selected is None:
-            self._set_status("Thumbnail Studio cancelled.")
-            return None
-        return label_to_path.get(selected)
 
     def _latest_run_report_path(self) -> Path | None:
         for workspace in self._iter_project_workspaces():
@@ -3286,11 +3145,16 @@ class LocalVideoMvpTui:
         return error_text or None
 
     def _youtube_publish_candidates(self) -> list[Path]:
+        self._ensure_package_layout_ready()
+        package_root = self._mp4_export_dir()
         candidates: list[Path] = []
-        for workspace in self._iter_project_workspaces():
-            if (workspace / "output" / "final.mp4").exists():
-                candidates.append(workspace)
-        return candidates
+        for mp4_path in package_root.rglob("*.mp4"):
+            if any(part.startswith(".") for part in mp4_path.parts):
+                continue
+            if "metadata" in mp4_path.parts:
+                continue
+            candidates.append(mp4_path.resolve())
+        return sorted(candidates, key=lambda item: item.stat().st_mtime, reverse=True)
 
     def _project_script_title(self, project_dir: Path) -> str | None:
         script_path = project_dir / "script.json"
@@ -3323,70 +3187,106 @@ class LocalVideoMvpTui:
             out.append(cleaned)
         return out
 
-    def _detect_project_thumbnail_candidate(self, project_dir: Path) -> Path | None:
-        file_candidates = [
-            project_dir / "output" / "thumbnail_yt.png",
-            project_dir / "thumbnail_yt.png",
-            project_dir / "output" / "thumbnail_yt.jpg",
-            project_dir / "thumbnail_yt.jpg",
-            project_dir / "output" / "thumbnail_yt.jpeg",
-            project_dir / "thumbnail_yt.jpeg",
-            project_dir / "output" / "thumbnail_yt.webp",
-            project_dir / "thumbnail_yt.webp",
-        ]
-        for candidate in file_candidates:
-            if candidate.exists() and candidate.is_file():
-                return candidate.resolve()
-
-        debug_dir = project_dir / "review" / "debug" / "thumbnail"
-        if debug_dir.exists() and debug_dir.is_dir():
-            matches = sorted(
-                [
-                    path
-                    for path in debug_dir.iterdir()
-                    if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
-                ],
-                key=lambda item: item.stat().st_mtime,
-                reverse=True,
-            )
-            if matches:
-                return matches[0].resolve()
-        return None
-
-    def _select_youtube_publish_workspace(self) -> Path | None:
+    def _select_youtube_publish_video(self) -> tuple[str, Path | None]:
         candidates = self._youtube_publish_candidates()
         if not candidates:
-            self._set_status("No finalized videos found yet. Finish a project first.")
-            return None
+            self._set_status("No packaged videos found yet in /Users/rafaelbm/Imagine.")
+            return ("cancel", None)
+        if self._stdscr is None:
+            return ("cancel", None)
 
-        option_details: dict[str, str] = {}
-        label_to_path: dict[str, Path] = {}
-        labels: list[str] = []
-        for project_dir in candidates:
-            label = project_dir.name
-            title = self._project_script_title(project_dir) or project_dir.name
-            has_draft = youtube_draft_path(project_dir).exists()
-            updated_at = dt.datetime.fromtimestamp(project_dir.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-            option_details[label] = (
-                f"{title} | updated {updated_at} | {'draft saved' if has_draft else 'no draft yet'}"
-            )
-            label_to_path[label] = project_dir
-            labels.append(label)
+        stdscr = self._stdscr
+        with self._modal_focus():
+            height, width = stdscr.getmaxyx()
+            labels = [path.name for path in candidates]
+            current_index = 0
+            active_video = self._package_video_path(self._active_project_dir) if self._active_project_dir is not None else None
+            if active_video is not None:
+                for index, candidate in enumerate(candidates):
+                    if candidate == active_video:
+                        current_index = index
+                        break
+            detail_rows = 4
+            max_option_len = max(len(label) for label in labels)
+            modal_width = min(max(64, max_option_len + 8), max(20, width - 2))
+            max_modal_height = max(10, height - 2)
+            list_rows = min(len(labels), max(1, max_modal_height - 7))
+            modal_height = max(10, list_rows + 7)
+            top = max(0, (height - modal_height) // 2)
+            left = max(0, (width - modal_width) // 2)
+            win = curses.newwin(modal_height, modal_width, top, left)
+            win.keypad(True)
+            start_index = max(0, current_index - list_rows + 1)
 
-        current_value = labels[0]
-        if self._active_project_dir is not None and self._active_project_dir.name in label_to_path:
-            current_value = self._active_project_dir.name
+            while True:
+                auth_state = detect_youtube_auth_state()
+                self._draw()
+                win.erase()
+                try:
+                    win.box()
+                except curses.error:
+                    pass
 
-        selected = self._select_from_list(
-            label="YouTube Project",
-            options=labels,
-            current_value=current_value,
-            option_details=option_details,
-        )
-        if selected is None:
-            self._set_status("YouTube publish cancelled.")
-            return None
-        return label_to_path.get(selected)
+                if current_index < start_index:
+                    start_index = current_index
+                elif current_index >= start_index + list_rows:
+                    start_index = current_index - list_rows + 1
+
+                selected_path = candidates[current_index]
+                package = resolve_video_package(selected_path)
+                title = self._project_script_title(package.metadata_dir) or package.package_dir.name
+                updated_at = dt.datetime.fromtimestamp(selected_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                draft_state = "draft saved" if youtube_draft_path(package.metadata_dir).exists() else "no draft yet"
+                help_text = "Enter select | S switch account | D disconnect | Esc back"
+                try:
+                    win.addstr(0, 2, self._trim_tail(" YouTube Videos ", modal_width - 4), self._attr("accent", bold=True))
+                    auth_line = f"YouTube: {'linked' if auth_state.linked else 'not linked'}"
+                    win.addstr(1, 2, self._trim_tail(auth_line, modal_width - 4), self._attr("muted"))
+                    win.addstr(modal_height - 1, 2, self._trim_tail(help_text, modal_width - 4), self._attr("muted"))
+                except curses.error:
+                    pass
+
+                for row in range(list_rows):
+                    option_index = start_index + row
+                    if option_index >= len(labels):
+                        break
+                    line = self._trim_tail(f"{'> ' if option_index == current_index else '  '}{labels[option_index]}", modal_width - 2)
+                    attr = curses.A_REVERSE if option_index == current_index else 0
+                    try:
+                        win.addstr(2 + row, 1, line, attr)
+                    except curses.error:
+                        pass
+
+                detail_top = 2 + list_rows
+                detail_lines = [
+                    self._trim_tail(title, modal_width - 4),
+                    self._trim_tail(f"Package: {package.package_dir.name}", modal_width - 4),
+                    self._trim_tail(f"Updated: {updated_at}", modal_width - 4),
+                    self._trim_tail(draft_state, modal_width - 4),
+                ]
+                for index, line in enumerate(detail_lines[:detail_rows]):
+                    try:
+                        win.addstr(detail_top + index, 2, line, self._attr("muted"))
+                    except curses.error:
+                        pass
+
+                win.refresh()
+                key = win.getch()
+                if key in (curses.KEY_UP, ord("k"), ord("K")):
+                    current_index = (current_index - 1) % len(labels)
+                    continue
+                if key in (curses.KEY_DOWN, ord("j"), ord("J")):
+                    current_index = (current_index + 1) % len(labels)
+                    continue
+                if key in (10, 13, curses.KEY_ENTER):
+                    return ("select", selected_path)
+                if key in (ord("s"), ord("S")):
+                    return ("switch", None)
+                if key in (ord("d"), ord("D")):
+                    return ("disconnect", None)
+                if key == 27:
+                    self._set_status("YouTube publish cancelled.")
+                    return ("cancel", None)
 
     def _save_youtube_draft_safe(self, draft: YouTubePublishDraft) -> Path | None:
         try:
@@ -3409,69 +3309,18 @@ class LocalVideoMvpTui:
         if self._is_running():
             self._set_status("Cannot open YouTube publish while a command is running.")
             return
+        self._ensure_package_layout_ready()
+        auth_state = detect_youtube_auth_state()
+        if not auth_state.linked:
+            auth_state = self._link_youtube_auth_flow(force_relink=False, confirm_if_unlinked=False)
+            if auth_state is None:
+                return
 
-        auth_state = self._prepare_youtube_auth_for_publish()
-        if auth_state is None:
-            return
-
-        project_dir = self._select_youtube_publish_workspace()
-        if project_dir is None:
-            return
-
-        try:
-            draft = self._run_with_spinner_modal(
-                title="YouTube Draft",
-                message="Preparing publish draft",
-                detail_text=project_dir.name,
-                task=lambda: ensure_youtube_publish_draft(project_dir, fallback_prompt=self.config.prompt),
-            )
-        except Exception as exc:  # noqa: BLE001
-            self._append_log(f"ERROR: Could not prepare YouTube draft for {project_dir.name}: {exc}")
-            self._set_status("YouTube draft setup failed. See logs.")
-            return
-
-        self._edit_youtube_publish_draft(project_dir, cast(YouTubePublishDraft, draft), auth_state)
-
-    def _prepare_youtube_auth_for_publish(self) -> YouTubeAuthState | None:
         while True:
-            auth_state = detect_youtube_auth_state()
-            if not auth_state.linked:
-                linked_state = self._link_youtube_auth_flow(force_relink=False)
-                if linked_state is None:
-                    return None
-                return linked_state
-
-            choice = self._select_from_list(
-                label="YouTube Account",
-                options=[
-                    "Use linked account",
-                    "Switch linked account/channel",
-                    "Disconnect linked account",
-                    "Review auth status",
-                ],
-                current_value="Use linked account",
-                option_details={
-                    "Use linked account": "Continue with the token that is already linked locally.",
-                    "Switch linked account/channel": "Re-run Google sign-in so you can choose a different account or channel.",
-                    "Disconnect linked account": "Remove the saved token from this machine.",
-                    "Review auth status": "Inspect where the client secrets and token are stored.",
-                },
-            )
-            if choice is None:
-                self._set_status("YouTube publish cancelled.")
-                return None
-            if choice == "Use linked account":
-                self._set_status("YouTube auth detected. Preparing publish draft.")
-                self._append_log("YouTube auth status: linked.")
-                return auth_state
-            if choice == "Review auth status":
-                self._show_paginated_text_modal("YouTube Auth", auth_review_text(auth_state))
-                continue
-            if choice == "Disconnect linked account":
-                if self._disconnect_youtube_auth_flow():
-                    return None
-                continue
-            if choice == "Switch linked account/channel":
+            action, selected_video = self._select_youtube_publish_video()
+            if action == "cancel":
+                return
+            if action == "switch":
                 if not self._prompt_yes_no(
                     "Switch YouTube account",
                     "Disconnect the saved token and choose a different Google account or YouTube channel now?",
@@ -3480,14 +3329,44 @@ class LocalVideoMvpTui:
                     continue
                 if not self._disconnect_youtube_auth_flow(confirm=False, show_success_modal=False):
                     continue
-                linked_state = self._link_youtube_auth_flow(force_relink=True)
-                if linked_state is None:
-                    return None
-                return linked_state
+                auth_state = self._link_youtube_auth_flow(force_relink=True)
+                if auth_state is None:
+                    return
+                continue
+            if action == "disconnect":
+                if not self._disconnect_youtube_auth_flow():
+                    continue
+                if not self._prompt_yes_no("Link YouTube", "Link another YouTube account now?", default_yes=True):
+                    return
+                auth_state = self._link_youtube_auth_flow(force_relink=False, confirm_if_unlinked=False)
+                if auth_state is None:
+                    return
+                continue
+            if action != "select" or selected_video is None:
+                continue
 
-    def _link_youtube_auth_flow(self, *, force_relink: bool) -> YouTubeAuthState | None:
+            package = resolve_video_package(selected_video)
+            try:
+                draft = self._run_with_spinner_modal(
+                    title="YouTube Draft",
+                    message="Preparing publish draft",
+                    detail_text=selected_video.name,
+                    task=lambda: ensure_youtube_publish_draft(
+                        selected_video,
+                        fallback_prompt=self.config.prompt,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._append_log(f"ERROR: Could not prepare YouTube draft for {selected_video.name}: {exc}")
+                self._set_status("YouTube draft setup failed. See logs.")
+                return
+            draft_obj = cast(YouTubePublishDraft, draft)
+            self._edit_youtube_publish_draft(package.metadata_dir, draft_obj, auth_state)
+            return
+
+    def _link_youtube_auth_flow(self, *, force_relink: bool, confirm_if_unlinked: bool = True) -> YouTubeAuthState | None:
         prompt_text = "Choose a YouTube account or channel in your browser." if force_relink else "No saved YouTube token was found. Open Google sign-in now?"
-        if not force_relink and not self._prompt_yes_no("Link YouTube", prompt_text, default_yes=True):
+        if not force_relink and confirm_if_unlinked and not self._prompt_yes_no("Link YouTube", prompt_text, default_yes=True):
             self._set_status("YouTube publish cancelled.")
             return None
 
@@ -3580,15 +3459,20 @@ class LocalVideoMvpTui:
         auth_state: YouTubeAuthState,
     ) -> None:
         with self._modal_focus():
+            current_choice = "Review draft"
             while True:
+                package_name = self._package_dir_for_project(project_dir).name
                 option_details = {
                     "Review draft": "Open the current publish summary before uploading.",
-                    "Review auth status": f"Linked: {'yes' if auth_state.linked else 'no'}.",
                     "Edit title": self._trim_tail(draft.title or "(empty)", 80),
                     "Edit description": self._trim_tail(draft.description.splitlines()[0] if draft.description else "(empty)", 80),
                     "Edit visibility": f"Current: {draft.visibility}",
                     "Edit schedule": f"Current: {draft.schedule_at or 'publish immediately'}",
                     "Edit tags": f"Current: {', '.join(draft.tags) if draft.tags else '(none)'}",
+                    "Add thumbnail": self._trim_tail(
+                        Path(draft.thumbnail_path).name if str(draft.thumbnail_path or "").strip() else "(none selected)",
+                        80,
+                    ),
                     "Upload YouTube captions": (
                         f"{'On' if draft.upload_captions else 'Off'}"
                         + (
@@ -3597,30 +3481,25 @@ class LocalVideoMvpTui:
                             else ""
                         )
                     ),
-                    "Edit thumbnail": (
-                        f"{draft.thumbnail_source}: "
-                        f"{Path(draft.thumbnail_path).name if draft.thumbnail_path else 'no thumbnail selected'}"
-                    ),
                     "Publish now": "Upload the current draft to the linked YouTube account.",
                     "Save draft": "Write the current draft to the project publish folder.",
                 }
                 actions = [
                     "Review draft",
-                    "Review auth status",
                     "Edit title",
                     "Edit description",
                     "Edit visibility",
                     "Edit schedule",
                     "Edit tags",
+                    "Add thumbnail",
                     "Upload YouTube captions",
-                    "Edit thumbnail",
                     "Publish now",
                     "Save draft",
                 ]
                 choice = self._select_from_list(
-                    label=f"YouTube Draft ({project_dir.name})",
+                    label=f"YouTube Draft ({package_name})",
                     options=actions,
-                    current_value="Review draft",
+                    current_value=current_choice,
                     option_details=option_details,
                 )
                 if choice is None:
@@ -3628,18 +3507,14 @@ class LocalVideoMvpTui:
                     if draft_path is not None:
                         self._set_status(f"YouTube draft saved: {draft_path.name}")
                     return
+                current_choice = choice
 
                 changed = False
                 if choice == "Review draft":
                     self._show_paginated_text_modal(
                         "YouTube Draft",
-                        draft_review_text(draft)
-                        + "\n\nUpload status: OAuth/upload wiring still needs to be connected in a later step.",
+                        draft_review_text(draft),
                     )
-                    continue
-
-                if choice == "Review auth status":
-                    self._show_paginated_text_modal("YouTube Auth", auth_review_text(auth_state))
                     continue
 
                 if choice == "Edit title":
@@ -3662,11 +3537,14 @@ class LocalVideoMvpTui:
                     changed = self._edit_youtube_draft_schedule(draft)
                 elif choice == "Edit tags":
                     changed = self._edit_youtube_draft_tags(draft)
+                elif choice == "Add thumbnail":
+                    selected_thumbnail, thumbnail_changed = self._pick_youtube_thumbnail(draft.thumbnail_path)
+                    if thumbnail_changed:
+                        draft.thumbnail_path = str(selected_thumbnail) if selected_thumbnail is not None else None
+                        changed = True
                 elif choice == "Upload YouTube captions":
                     draft.upload_captions = not draft.upload_captions
                     changed = True
-                elif choice == "Edit thumbnail":
-                    changed = self._edit_youtube_thumbnail(project_dir, draft)
                 elif choice == "Publish now":
                     draft_path = self._save_youtube_draft_safe(draft)
                     if draft_path is None:
@@ -3744,23 +3622,218 @@ class LocalVideoMvpTui:
         self._show_paginated_text_modal("YouTube Uploaded", body)
         self._set_status("YouTube upload completed successfully.")
 
-    def _edit_youtube_draft_title(self, draft: YouTubePublishDraft) -> bool:
-        previous_title = str(draft.title or "").strip()
-        previous_thumbnail_text = str(draft.thumbnail_text or "").strip()
-        previous_thumbnail_prompt = str(draft.thumbnail_prompt or "").strip()
-        suggestions = self._dedupe_text_values([draft.title, *draft.title_suggestions])
-        if suggestions:
-            suggestion_options = [*suggestions, "Edit current title"]
-            selected = self._select_from_list(
-                label="Title suggestion",
-                options=suggestion_options,
-                current_value=draft.title if draft.title in suggestion_options else suggestion_options[0],
-            )
-            if selected is None:
-                return False
-            if selected != "Edit current title":
-                draft.title = selected
+    def _iter_youtube_thumbnail_candidates(self) -> list[Path]:
+        root = Path("/Users/rafaelbm/Imagine").resolve()
+        if not root.exists():
+            return []
 
+        candidates: list[Path] = []
+        for path in root.iterdir():
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+                continue
+            if path.name.startswith("."):
+                continue
+            candidates.append(path.resolve())
+
+        candidates.sort(
+            key=lambda candidate: candidate.stat().st_mtime if candidate.exists() else 0.0,
+            reverse=True,
+        )
+        return candidates
+
+    def _pick_youtube_thumbnail(self, current_thumbnail: str | None) -> tuple[Path | None, bool]:
+        if self._stdscr is None:
+            return None, False
+
+        root = Path("/Users/rafaelbm/Imagine").resolve()
+        current_path = Path(current_thumbnail).expanduser().resolve() if str(current_thumbnail or "").strip() else None
+        candidates = self._iter_youtube_thumbnail_candidates()
+        if current_path is not None and current_path.exists() and all(candidate != current_path for candidate in candidates):
+            candidates.insert(0, current_path)
+
+        with self._modal_focus():
+            stdscr = self._stdscr
+            cursor = 0
+            scroll = 0
+            if current_path is not None:
+                for index, candidate in enumerate(candidates):
+                    if candidate == current_path:
+                        cursor = index
+                        break
+
+            try:
+                while True:
+                    self._draw()
+                    height, width = stdscr.getmaxyx()
+                    self._draw_modal_backdrop(height, width)
+
+                    modal_width = min(max(108, width - 6), max(68, width - 2))
+                    modal_height = min(max(28, height - 4), max(16, height - 2))
+                    if modal_width < 68 or modal_height < 16:
+                        self._set_status("Terminal is too small for the thumbnail picker.")
+                        return None, False
+
+                    top = max(0, (height - modal_height) // 2)
+                    left = max(0, (width - modal_width) // 2)
+                    win = curses.newwin(modal_height, modal_width, top, left)
+                    win.keypad(True)
+                    win.nodelay(False)
+                    win.timeout(-1)
+                    win.erase()
+                    try:
+                        win.box()
+                    except curses.error:
+                        pass
+
+                    preview_top = 2
+                    preview_left = 3
+                    preview_width = max(36, int(modal_width * 0.5))
+                    preview_height = max(10, modal_height - 8)
+                    list_left = preview_left + preview_width + 2
+                    list_width = max(22, modal_width - list_left - 2)
+                    list_top = preview_top
+                    visible_rows = max(1, preview_height)
+
+                    selected_path = candidates[cursor] if candidates else None
+                    if candidates:
+                        cursor = max(0, min(cursor, len(candidates) - 1))
+                        if cursor < scroll:
+                            scroll = cursor
+                        elif cursor >= scroll + visible_rows:
+                            scroll = cursor - visible_rows + 1
+                        scroll = max(0, min(scroll, max(0, len(candidates) - visible_rows)))
+                        selected_path = candidates[cursor]
+                    else:
+                        scroll = 0
+
+                    try:
+                        win.addstr(0, 2, self._trim_tail(" Thumbnail Picker ", max(1, modal_width - 4)), self._attr("accent", bold=True))
+                        win.addstr(preview_top - 1, preview_left, "Preview", self._attr("accent", bold=True))
+                        win.addstr(list_top - 1, list_left, "Choose Thumbnail", self._attr("accent", bold=True))
+                        for row_index in range(preview_height):
+                            win.addstr(preview_top + row_index, preview_left, " " * preview_width, self._attr("backdrop"))
+
+                        if selected_path is None:
+                            placeholder = "No thumbnails found in /Users/rafaelbm/Imagine"
+                            win.addstr(
+                                preview_top + max(0, preview_height // 2),
+                                preview_left + 1,
+                                self._trim_tail(placeholder, max(1, preview_width - 2)),
+                                self._attr("muted"),
+                            )
+
+                        current_label = current_path.name if current_path is not None else "(none selected)"
+                        win.addstr(
+                            preview_top + preview_height + 2,
+                            preview_left,
+                            self._trim_tail(f"Current: {current_label}", preview_width),
+                            self._attr("muted"),
+                        )
+                        if selected_path is not None:
+                            try:
+                                relative = str(selected_path.relative_to(root))
+                            except ValueError:
+                                relative = str(selected_path)
+                            win.addstr(
+                                preview_top + preview_height + 3,
+                                preview_left,
+                                self._trim_tail(f"Candidate: {relative}", preview_width),
+                                self._attr("muted"),
+                            )
+
+                        if not candidates:
+                            win.addstr(list_top, list_left, "No image files available.", self._attr("muted"))
+                        else:
+                            for row in range(visible_rows):
+                                index = scroll + row
+                                if index >= len(candidates):
+                                    break
+                                candidate = candidates[index]
+                                try:
+                                    relative = str(candidate.relative_to(root))
+                                except ValueError:
+                                    relative = candidate.name
+                                prefix = "* " if current_path is not None and candidate == current_path else "  "
+                                attr = curses.A_REVERSE if index == cursor else 0
+                                win.addstr(list_top + row, list_left, " " * list_width, attr)
+                                win.addstr(
+                                    list_top + row,
+                                    list_left,
+                                    self._trim_tail(prefix + relative, list_width),
+                                    attr,
+                                )
+
+                        footer = "Enter select | C clear | Up/Down move | Esc back"
+                        win.addstr(modal_height - 1, 2, self._trim_tail(footer, modal_width - 4), self._attr("muted"))
+                    except curses.error:
+                        pass
+
+                    win.refresh()
+                    if selected_path is not None:
+                        self._draw_thumbnail_preview_image(
+                            image_path=selected_path,
+                            top_row=top + preview_top + 1,
+                            left_col=left + preview_left + 1,
+                            cols=max(8, preview_width - 2),
+                            rows=max(4, preview_height - 2),
+                        )
+
+                    try:
+                        key = win.get_wch()
+                    except curses.error:
+                        continue
+
+                    if isinstance(key, str):
+                        if key == "\x1b":
+                            return None, False
+                        if key in ("\n", "\r"):
+                            if selected_path is None:
+                                self._set_status("No thumbnail selected.")
+                                continue
+                            self._set_status(f"Selected thumbnail: {selected_path.name}")
+                            return selected_path, True
+                        if key in ("c", "C"):
+                            self._set_status("Cleared YouTube thumbnail selection.")
+                            return None, True
+                        if key in ("j", "J") and candidates:
+                            cursor = min(len(candidates) - 1, cursor + 1)
+                            continue
+                        if key in ("k", "K") and candidates:
+                            cursor = max(0, cursor - 1)
+                            continue
+                    else:
+                        if key == 27:
+                            return None, False
+                        if key in (10, 13, curses.KEY_ENTER):
+                            if selected_path is None:
+                                self._set_status("No thumbnail selected.")
+                                continue
+                            self._set_status(f"Selected thumbnail: {selected_path.name}")
+                            return selected_path, True
+                        if key == curses.KEY_UP and candidates:
+                            cursor = max(0, cursor - 1)
+                            continue
+                        if key == curses.KEY_DOWN and candidates:
+                            cursor = min(len(candidates) - 1, cursor + 1)
+                            continue
+                        if key == curses.KEY_PPAGE and candidates:
+                            cursor = max(0, cursor - visible_rows)
+                            continue
+                        if key == curses.KEY_NPAGE and candidates:
+                            cursor = min(len(candidates) - 1, cursor + visible_rows)
+                            continue
+                        if key == curses.KEY_HOME and candidates:
+                            cursor = 0
+                            continue
+                        if key == curses.KEY_END and candidates:
+                            cursor = len(candidates) - 1
+                            continue
+            finally:
+                self._clear_terminal_graphics_image(self.THUMBNAIL_PREVIEW_IMAGE_ID)
+
+    def _edit_youtube_draft_title(self, draft: YouTubePublishDraft) -> bool:
         updated = self._prompt_input("YouTube title", draft.title)
         if updated is not None:
             draft.title = updated.strip()
@@ -3769,12 +3842,6 @@ class LocalVideoMvpTui:
             return False
 
         draft.title_suggestions = self._dedupe_text_values([draft.title, *draft.title_suggestions])
-        if not draft.thumbnail_prompt:
-            draft.thumbnail_prompt = draft.title
-        if previous_thumbnail_text in {"", previous_title, previous_thumbnail_prompt}:
-            suggestions = self._youtube_thumbnail_text_suggestions_for_draft(draft)
-            draft.thumbnail_text = suggestions[0] if suggestions else draft.title
-            draft.thumbnail_prompt = draft.title
         return True
 
     def _edit_youtube_draft_schedule(self, draft: YouTubePublishDraft) -> bool:
@@ -3815,981 +3882,228 @@ class LocalVideoMvpTui:
         return True
 
     def _edit_youtube_draft_tags(self, draft: YouTubePublishDraft) -> bool:
-        current_value = ", ".join(draft.tags)
-        updated = self._prompt_input("YouTube tags (comma-separated, CLEAR to empty)", current_value)
-        if updated is None:
+        option_details = {
+            "Add keywords": f"Current: {', '.join(draft.tags) if draft.tags else '(none)'}",
+            "Edit all tags": "Edit the full comma-separated tag list in place.",
+            "Auto Add Tags": "Ask the local Ollama model to suggest related YouTube tags and append them.",
+            "Clear all tags": "Remove every current YouTube tag.",
+        }
+        selected = self._select_from_list(
+            label="YouTube tags",
+            options=["Add keywords", "Edit all tags", "Auto Add Tags", "Clear all tags"],
+            current_value="Add keywords",
+            option_details=option_details,
+        )
+        if selected is None:
             return False
 
-        cleaned = str(updated).strip()
-        if cleaned.upper() == "CLEAR":
+        if selected == "Clear all tags":
             draft.tags = []
             return True
 
-        parsed = [part.strip() for part in re.split(r"[,;\n]+", cleaned) if part.strip()]
-        draft.tags = self._dedupe_text_values(parsed)[:12]
-        return True
-
-    def _youtube_thumbnail_text_suggestions_for_draft(self, draft: YouTubePublishDraft) -> list[str]:
-        project_dir = Path(draft.project_dir or self._active_project_dir or self.config.project_dir).expanduser().resolve()
-        suggestions = youtube_thumbnail_text_suggestions(
-            project_dir,
-            title=draft.title,
-            fallback_prompt=draft.thumbnail_prompt or self.config.prompt,
-            preferred_text=draft.thumbnail_text,
-        )
-        return self._dedupe_text_values(suggestions)
-
-    def _ensure_youtube_thumbnail_draft_defaults(self, draft: YouTubePublishDraft) -> None:
-        suggestions = self._youtube_thumbnail_text_suggestions_for_draft(draft)
-        default_text = str(draft.thumbnail_text or (suggestions[0] if suggestions else "") or draft.thumbnail_prompt or draft.title or self.config.prompt or "Why This Matters").strip()
-        draft.thumbnail_text = default_text
-        draft.thumbnail_badge_text = str(getattr(draft, "thumbnail_badge_text", "") or "").strip()
-        if not draft.thumbnail_prompt:
-            draft.thumbnail_prompt = draft.title or default_text
-        if not draft.thumbnail_font_color:
-            draft.thumbnail_font_color = YOUTUBE_THUMBNAIL_DEFAULT_FONT_COLOR
-        if not draft.thumbnail_outline_color:
-            draft.thumbnail_outline_color = YOUTUBE_THUMBNAIL_DEFAULT_OUTLINE_COLOR
-        if not draft.thumbnail_font_size_mode:
-            draft.thumbnail_font_size_mode = YOUTUBE_THUMBNAIL_DEFAULT_FONT_SIZE
-        if not draft.thumbnail_anchor:
-            draft.thumbnail_anchor = YOUTUBE_THUMBNAIL_DEFAULT_ANCHOR
-        if not draft.thumbnail_text_align:
-            draft.thumbnail_text_align = YOUTUBE_THUMBNAIL_DEFAULT_TEXT_ALIGN
-        if not getattr(draft, "thumbnail_text_plate", ""):
-            draft.thumbnail_text_plate = YOUTUBE_THUMBNAIL_DEFAULT_TEXT_PLATE
-
-    def _youtube_thumbnail_is_generated(self, draft: YouTubePublishDraft) -> bool:
-        return draft.thumbnail_source in {"auto", "generated"}
-
-    def _youtube_thumbnail_font_size_label(self, value: str) -> str:
-        return self.YOUTUBE_THUMBNAIL_FONT_SIZE_LABELS.get(value, value.replace("-", " ").title())
-
-    def _youtube_thumbnail_anchor_label(self, value: str) -> str:
-        return self.YOUTUBE_THUMBNAIL_ANCHOR_LABELS.get(value, value.replace("-", " ").title())
-
-    def _youtube_thumbnail_align_label(self, value: str) -> str:
-        return self.YOUTUBE_THUMBNAIL_ALIGN_LABELS.get(value, value.replace("-", " ").title())
-
-    def _youtube_thumbnail_color_label(self, value: str) -> str:
-        return value.replace("-", " ").title()
-
-    def _youtube_thumbnail_text_plate_label(self, value: str) -> str:
-        return self.YOUTUBE_THUMBNAIL_TEXT_PLATE_LABELS.get(value, value.replace("-", " ").title())
-
-    def _reset_youtube_thumbnail_style(self, draft: YouTubePublishDraft) -> None:
-        draft.thumbnail_font_color = YOUTUBE_THUMBNAIL_DEFAULT_FONT_COLOR
-        draft.thumbnail_outline_color = YOUTUBE_THUMBNAIL_DEFAULT_OUTLINE_COLOR
-        draft.thumbnail_font_size_mode = YOUTUBE_THUMBNAIL_DEFAULT_FONT_SIZE
-        draft.thumbnail_anchor = YOUTUBE_THUMBNAIL_DEFAULT_ANCHOR
-        draft.thumbnail_offset_x = 0
-        draft.thumbnail_offset_y = 0
-        draft.thumbnail_text_align = YOUTUBE_THUMBNAIL_DEFAULT_TEXT_ALIGN
-        draft.thumbnail_text_plate = YOUTUBE_THUMBNAIL_DEFAULT_TEXT_PLATE
-
-    def _render_thumbnail_studio_image(
-        self,
-        project_dir: Path,
-        draft: YouTubePublishDraft,
-    ) -> Path | None:
-        self._ensure_youtube_thumbnail_draft_defaults(draft)
-        try:
-            rendered = self._run_with_spinner_modal(
-                title="Thumbnail Studio",
-                message="Rendering thumbnail",
-                detail_text=draft.thumbnail_text,
-                task=lambda: render_youtube_thumbnail_for_draft(draft, notify=self._append_log),
-            )
-        except Exception as exc:  # noqa: BLE001
-            self._append_log(f"ERROR: YouTube thumbnail rendering failed: {exc}")
-            self._set_status("YouTube thumbnail rendering failed. See logs.")
-            return None
-        if rendered is None or not cast(Path, rendered).exists():
-            self._set_status("YouTube thumbnail rendering failed. See logs.")
-            return None
-        rendered_path = cast(Path, rendered)
-        draft.thumbnail_path = str(rendered_path.resolve())
-        draft.thumbnail_source = "generated"
-        return rendered_path.resolve()
-
-    def _youtube_thumbnail_diagnostic_lines(self, draft: YouTubePublishDraft) -> list[str]:
-        diagnostics = youtube_thumbnail_diagnostics(
-            draft.thumbnail_text,
-            font_color=draft.thumbnail_font_color,
-            text_plate=getattr(draft, "thumbnail_text_plate", YOUTUBE_THUMBNAIL_DEFAULT_TEXT_PLATE),
-        )
-        lines = [
-            f"CTR check: {str(diagnostics.get('rating') or 'fair').title()}",
-            f"Words: {int(diagnostics.get('word_count') or 0)} | Wrapped lines: {int(diagnostics.get('line_count') or 0)}",
-        ]
-        badge_text = str(getattr(draft, "thumbnail_badge_text", "") or "").strip()
-        if badge_text:
-            lines.append(f"Badge: {badge_text}")
-        for note in diagnostics.get("notes") or []:
-            lines.append(f"Note: {note}")
-        for warning in diagnostics.get("warnings") or []:
-            lines.append(f"Warn: {warning}")
-        return lines
-
-    def _show_youtube_thumbnail_preview_modal(
-        self,
-        *,
-        image_path: Path,
-        draft: YouTubePublishDraft,
-    ) -> None:
-        if self._stdscr is None:
-            self._play_media_path(
-                image_path,
-                label=f"youtube-thumbnail-{self._safe_filename_token(image_path.stem)}",
-                audio_only=False,
-            )
-            return
-
-        preview_image_path = self._preview_png_from_media_path(image_path, media_type="image") or image_path
-        detail_lines = [
-            f"Text: {draft.thumbnail_text}",
-            f"Badge: {str(getattr(draft, 'thumbnail_badge_text', '') or '').strip() or '(none)'}",
-            f"Font: {self._youtube_thumbnail_font_size_label(draft.thumbnail_font_size_mode)} | "
-            f"{self._youtube_thumbnail_color_label(draft.thumbnail_font_color)} on "
-            f"{self._youtube_thumbnail_text_plate_label(getattr(draft, 'thumbnail_text_plate', YOUTUBE_THUMBNAIL_DEFAULT_TEXT_PLATE))}",
-            (
-                f"Layout: {self._youtube_thumbnail_anchor_label(draft.thumbnail_anchor)} | "
-                f"{self._youtube_thumbnail_align_label(draft.thumbnail_text_align)} | "
-                f"X {int(draft.thumbnail_offset_x):+d}px | Y {int(draft.thumbnail_offset_y):+d}px"
-            ),
-            *self._youtube_thumbnail_diagnostic_lines(draft),
-        ]
-
-        with self._modal_focus():
-            stdscr = self._stdscr
-            height, width = stdscr.getmaxyx()
-            modal_width = min(max(92, width - 4), max(30, width - 2))
-            modal_height = min(max(22, height - 4), max(14, height - 2))
-            if modal_width < 30 or modal_height < 14:
-                self._show_paginated_text_modal("Thumbnail Preview", "\n".join(detail_lines))
-                return
-
-            top = max(0, (height - modal_height) // 2)
-            left = max(0, (width - modal_width) // 2)
-            preview_box_top = 2
-            preview_box_height = max(10, min(16, modal_height - 9))
-            preview_inner_width = max(12, modal_width - 8)
-            detail_top = preview_box_top + preview_box_height + 1
-            detail_rows = max(3, modal_height - detail_top - 2)
-            win = curses.newwin(modal_height, modal_width, top, left)
-            win.keypad(True)
-            win.nodelay(False)
-            win.timeout(-1)
-
-            while True:
-                self._draw()
-                win.erase()
-                try:
-                    win.box()
-                except curses.error:
-                    pass
-                try:
-                    win.addstr(0, 2, self._trim_tail(" Thumbnail Preview ", modal_width - 4), self._attr("accent", bold=True))
-                    win.addstr(modal_height - 1, 2, self._trim_tail("Enter/Esc back", modal_width - 4), self._attr("muted"))
-                    win.addstr(preview_box_top, 2, "+" + ("-" * preview_inner_width) + "+", self._attr("muted"))
-                    win.addstr(
-                        preview_box_top + preview_box_height - 1,
-                        2,
-                        "+" + ("-" * preview_inner_width) + "+",
-                        self._attr("muted"),
-                    )
-                except curses.error:
-                    pass
-
-                for row in range(max(0, preview_box_height - 2)):
-                    try:
-                        win.addstr(
-                            preview_box_top + 1 + row,
-                            2,
-                            "|" + (" " * preview_inner_width) + "|",
-                        )
-                    except curses.error:
-                        pass
-
-                for row in range(detail_rows):
-                    line = detail_lines[row] if row < len(detail_lines) else ""
-                    try:
-                        win.addstr(detail_top + row, 2, self._trim_tail(line, modal_width - 4), self._attr("muted"))
-                    except curses.error:
-                        pass
-
-                win.refresh()
-                preview_top = top + preview_box_top + 2
-                preview_left = left + 4
-                preview_rows = max(1, preview_box_height - 2)
-                preview_cols = max(1, preview_inner_width)
-                self._clear_terminal_region(
-                    top_row=preview_top,
-                    left_col=preview_left,
-                    cols=preview_cols,
-                    rows=preview_rows,
+        if selected == "Auto Add Tags":
+            if not self._probe_ollama_online(timeout=1.5):
+                self._set_status("Ollama required. Start Ollama to use auto tag suggestions.")
+                return False
+            try:
+                suggested = self._run_with_spinner_modal(
+                    title="Auto Add Tags",
+                    message="Generating YouTube tag suggestions",
+                    detail_text=draft.title or Path(draft.video_path).name,
+                    task=lambda: self._suggest_youtube_tags_from_draft(draft),
+                    allow_cancel=True,
                 )
-                drew_preview = self._draw_shot_review_graphics_preview(
-                    image_path=preview_image_path,
-                    top_row=preview_top,
-                    left_col=preview_left,
-                    cols=preview_cols,
-                    rows=preview_rows,
-                )
-                if not drew_preview:
-                    self._clear_shot_review_graphics_preview()
-                    self._draw_shot_review_color_preview(
-                        image_path=preview_image_path,
-                        top_row=preview_top,
-                        left_col=preview_left,
-                        cols=preview_cols,
-                        rows=preview_rows,
-                    )
-                key = win.getch()
-                if key in (10, 13, curses.KEY_ENTER, 27):
-                    self._clear_shot_review_graphics_preview()
-                    return
+            except Exception as exc:  # noqa: BLE001
+                self._append_log(f"ERROR: YouTube tag auto-add failed: {exc}")
+                self._set_status("Could not generate YouTube tags. See logs.")
+                self._safe_flush_input()
+                return False
+            self._safe_flush_input()
+            normalized = self._dedupe_text_values([*draft.tags, *cast(list[str], suggested)])
+            added_count = max(0, len(normalized) - len(draft.tags))
+            draft.tags = normalized[:12]
+            self._set_status(f"Added {added_count} suggested tag(s). Total: {len(draft.tags)}.")
+            return added_count > 0
 
-    def _youtube_thumbnail_preview_detail_lines(self, draft: YouTubePublishDraft, *, current_path: Path | None) -> list[str]:
-        lines = [
-            f"File: {current_path.name if current_path is not None else '(none selected)'}",
-            f"Text: {draft.thumbnail_text}",
-        ]
-        badge_text = str(getattr(draft, "thumbnail_badge_text", "") or "").strip()
-        if badge_text:
-            lines.append(f"Badge: {badge_text}")
-        lines.extend(
-            [
-                f"Font: {self._youtube_thumbnail_font_size_label(draft.thumbnail_font_size_mode)} | {self._youtube_thumbnail_color_label(draft.thumbnail_font_color)}",
-                (
-                    f"Layout: {self._youtube_thumbnail_anchor_label(draft.thumbnail_anchor)} | "
-                    f"{self._youtube_thumbnail_align_label(draft.thumbnail_text_align)} | "
-                    f"{self._youtube_thumbnail_text_plate_label(getattr(draft, 'thumbnail_text_plate', YOUTUBE_THUMBNAIL_DEFAULT_TEXT_PLATE))}"
-                ),
-                *self._youtube_thumbnail_diagnostic_lines(draft),
-            ]
-        )
-        return lines
-
-    def _select_thumbnail_studio_action(
-        self,
-        *,
-        label: str,
-        actions: list[str],
-        current_value: str,
-        option_details: dict[str, str],
-        preview_path: Path | None,
-        preview_title: str,
-        preview_details: list[str],
-    ) -> str | None:
-        if self._stdscr is None or preview_path is None:
-            return self._select_from_list(
-                label=label,
-                options=actions,
-                current_value=current_value,
-                option_details=option_details,
-            )
-
-        with self._modal_focus():
-            stdscr = self._stdscr
-            height, width = stdscr.getmaxyx()
-            if width < 96 or height < 22:
-                return self._select_from_list(
-                    label=label,
-                    options=actions,
-                    current_value=current_value,
-                    option_details=option_details,
-                )
-
-            normalized = [str(option).strip() for option in actions if str(option).strip()]
-            selected = normalized.index(current_value) if current_value in normalized else 0
-            max_option_len = max(len(item) for item in normalized)
-            modal_width = min(max(108, max_option_len + 44), max(24, width - 2))
-            modal_height = min(max(22, height - 2), max(18, height - 2))
-            top = max(0, (height - modal_height) // 2)
-            left = max(0, (width - modal_width) // 2)
-
-            list_width = min(max(34, max_option_len + 4), max(34, modal_width // 3))
-            preview_width = max(28, modal_width - list_width - 5)
-            interior_height = modal_height - 2
-            preview_box_top = 2
-            preview_box_height = max(10, min(16, interior_height - 8))
-            detail_top = preview_box_top + preview_box_height + 1
-            detail_rows = max(4, interior_height - preview_box_height - 3)
-            list_rows = max(1, interior_height)
-
-            preview_image_path = self._preview_png_from_media_path(preview_path, media_type="image") or preview_path
-            start_index = max(0, selected - list_rows + 1)
-            win = curses.newwin(modal_height, modal_width, top, left)
-            win.keypad(True)
-            win.nodelay(False)
-            win.timeout(-1)
-
-            while True:
-                current_label = normalized[selected]
-                current_detail = option_details.get(current_label, "")
-                detail_lines = self._wrap_shot_review_detail_text(
-                    "\n".join([*preview_details, "", f"Action: {current_label}", current_detail]),
-                    width=max(18, preview_width - 2),
-                    limit=detail_rows,
-                )
-                self._draw()
-                win.erase()
-                try:
-                    win.box()
-                except curses.error:
-                    pass
-
-                title_text = self._trim_tail(f" {label} ", max(1, modal_width - 4))
-                help_text = "Enter choose | Up/Down move | Esc back"
-                divider_x = list_width + 2
-                preview_inner_width = max(4, preview_width - 2)
-                try:
-                    win.addstr(0, 2, title_text, self._attr("accent", bold=True))
-                    win.addstr(modal_height - 1, 2, self._trim_tail(help_text, modal_width - 4), self._attr("muted"))
-                    for row in range(1, modal_height - 1):
-                        win.addch(row, divider_x, ord("|"), self._attr("muted"))
-                    win.addstr(1, divider_x + 2, self._trim_tail(preview_title, preview_width), self._attr("muted", bold=True))
-                    win.addstr(preview_box_top, divider_x + 2, "+" + ("-" * preview_inner_width) + "+", self._attr("muted"))
-                    win.addstr(
-                        preview_box_top + preview_box_height - 1,
-                        divider_x + 2,
-                        "+" + ("-" * preview_inner_width) + "+",
-                        self._attr("muted"),
-                    )
-                except curses.error:
-                    pass
-
-                if selected < start_index:
-                    start_index = selected
-                elif selected >= start_index + list_rows:
-                    start_index = selected - list_rows + 1
-
-                for row in range(list_rows):
-                    option_index = start_index + row
-                    if option_index >= len(normalized):
-                        break
-                    item = normalized[option_index]
-                    prefix = ">" if option_index == selected else " "
-                    line = self._trim_tail(f"{prefix} {item}", list_width)
-                    attr = curses.A_REVERSE if option_index == selected else 0
-                    try:
-                        win.addstr(1 + row, 1, line.ljust(list_width), attr)
-                    except curses.error:
-                        pass
-
-                for row in range(max(0, preview_box_height - 2)):
-                    try:
-                        win.addstr(
-                            preview_box_top + 1 + row,
-                            divider_x + 2,
-                            "|" + (" " * preview_inner_width) + "|",
-                        )
-                    except curses.error:
-                        pass
-
-                for row in range(detail_rows):
-                    line = detail_lines[row] if row < len(detail_lines) else ""
-                    try:
-                        win.addstr(detail_top + row, divider_x + 2, self._trim_tail(line, preview_width), self._attr("muted"))
-                    except curses.error:
-                        pass
-
-                win.refresh()
-                preview_top = top + preview_box_top + 2
-                preview_left = left + divider_x + 4
-                preview_rows = max(1, preview_box_height - 2)
-                preview_cols = max(1, preview_inner_width)
-                self._clear_terminal_region(
-                    top_row=preview_top,
-                    left_col=preview_left,
-                    cols=preview_cols,
-                    rows=preview_rows,
-                )
-                drew_preview = self._draw_shot_review_graphics_preview(
-                    image_path=preview_image_path,
-                    top_row=preview_top,
-                    left_col=preview_left,
-                    cols=preview_cols,
-                    rows=preview_rows,
-                )
-                if not drew_preview:
-                    self._clear_shot_review_graphics_preview()
-                    self._draw_shot_review_color_preview(
-                        image_path=preview_image_path,
-                        top_row=preview_top,
-                        left_col=preview_left,
-                        cols=preview_cols,
-                        rows=preview_rows,
-                    )
-
-                key = win.getch()
-                if key in (curses.KEY_UP, ord("k"), ord("K")):
-                    selected = (selected - 1) % len(normalized)
-                    continue
-                if key in (curses.KEY_DOWN, ord("j"), ord("J")):
-                    selected = (selected + 1) % len(normalized)
-                    continue
-                if key in (10, 13, curses.KEY_ENTER):
-                    self._clear_shot_review_graphics_preview()
-                    return normalized[selected]
-                if key in (27,):
-                    self._clear_shot_review_graphics_preview()
-                    return None
-
-    def _select_youtube_thumbnail_text(self, draft: YouTubePublishDraft) -> str | None:
-        suggestion_options = self._youtube_thumbnail_text_suggestions_for_draft(draft)
-        current_text = str(draft.thumbnail_text or "").strip()
-        options = self._dedupe_text_values([current_text, *suggestion_options, "Write custom text"])
-        option_details: dict[str, str] = {}
-        for suggestion in suggestion_options:
-            option_details[suggestion] = "Short hook suggestion tuned for mobile readability."
-        if current_text:
-            option_details[current_text] = "Current thumbnail text."
-        option_details["Write custom text"] = "Type your own custom headline."
-        selected = self._select_from_list(
-            label="Thumbnail text",
-            options=options,
-            current_value=current_text if current_text in options else options[0],
-            option_details=option_details,
-        )
-        if selected is None:
-            return None
-        if selected == "Write custom text":
-            updated = self._prompt_input("Thumbnail text", current_text)
+        current_value = ", ".join(draft.tags)
+        if selected == "Edit all tags":
+            updated = self._edit_text_inline("YouTube tags (comma-separated)", current_value)
             if updated is None:
-                return None
-            selected = updated.strip()
-        return str(selected).strip() or None
+                return False
+            cleaned = str(updated).strip()
+            if cleaned.upper() == "CLEAR":
+                draft.tags = []
+                return True
+            parsed = [part.strip() for part in re.split(r"[,;\n]+", cleaned) if part.strip()]
+            draft.tags = self._dedupe_text_values(parsed)[:12]
+            return True
 
-    def _select_youtube_thumbnail_badge_text(self, draft: YouTubePublishDraft) -> str | None:
-        current_text = str(getattr(draft, "thumbnail_badge_text", "") or "").strip()
-        updated = self._prompt_input(
-            "Thumbnail badge text (CLEAR to remove)",
-            current_text or "e.g. DAY 97 / $599",
-        )
+        updated = self._prompt_input("Add YouTube tags (comma-separated)", current_value)
         if updated is None:
-            return None
-        cleaned = str(updated).strip()
-        if cleaned.upper() == "CLEAR":
-            return ""
-        return cleaned[:24].strip()
-
-    def _select_youtube_thumbnail_text_plate(self, current_value: str) -> str | None:
-        option_labels = [self._youtube_thumbnail_text_plate_label(choice) for choice in YOUTUBE_THUMBNAIL_TEXT_PLATE_CHOICES]
-        label_to_value = {
-            self._youtube_thumbnail_text_plate_label(choice): choice
-            for choice in YOUTUBE_THUMBNAIL_TEXT_PLATE_CHOICES
-        }
-        option_details = {
-            self._youtube_thumbnail_text_plate_label(choice): self.YOUTUBE_THUMBNAIL_TEXT_PLATE_DETAILS.get(choice, "")
-            for choice in YOUTUBE_THUMBNAIL_TEXT_PLATE_CHOICES
-        }
-        selected = self._select_from_list(
-            label="Thumbnail text plate",
-            options=option_labels,
-            current_value=self._youtube_thumbnail_text_plate_label(current_value),
-            option_details=option_details,
-        )
-        if selected is None:
-            return None
-        return label_to_value.get(selected)
-
-    def _apply_youtube_thumbnail_style_preset(self, draft: YouTubePublishDraft, preset_key: str) -> bool:
-        preset = next(
-            (item for item in self.YOUTUBE_THUMBNAIL_STYLE_PRESETS if item.get("key") == preset_key),
-            None,
-        )
-        if preset is None:
             return False
-        draft.thumbnail_font_color = str(preset.get("font_color") or YOUTUBE_THUMBNAIL_DEFAULT_FONT_COLOR)
-        draft.thumbnail_outline_color = str(preset.get("outline_color") or YOUTUBE_THUMBNAIL_DEFAULT_OUTLINE_COLOR)
-        draft.thumbnail_font_size_mode = str(preset.get("font_size_mode") or YOUTUBE_THUMBNAIL_DEFAULT_FONT_SIZE)
-        draft.thumbnail_anchor = str(preset.get("anchor") or YOUTUBE_THUMBNAIL_DEFAULT_ANCHOR)
-        draft.thumbnail_text_align = str(preset.get("text_align") or YOUTUBE_THUMBNAIL_DEFAULT_TEXT_ALIGN)
-        draft.thumbnail_text_plate = str(preset.get("text_plate") or YOUTUBE_THUMBNAIL_DEFAULT_TEXT_PLATE)
-        draft.thumbnail_offset_x = 0
-        draft.thumbnail_offset_y = 0
+
+        parsed = [part.strip() for part in re.split(r"[,;\n]+", str(updated).strip()) if part.strip()]
+        draft.tags = self._dedupe_text_values([*draft.tags, *parsed])[:12]
         return True
 
-    def _select_youtube_thumbnail_style_preset(self) -> str | None:
-        options = [str(item["label"]) for item in self.YOUTUBE_THUMBNAIL_STYLE_PRESETS]
-        label_to_key = {str(item["label"]): str(item["key"]) for item in self.YOUTUBE_THUMBNAIL_STYLE_PRESETS}
-        option_details = {str(item["label"]): str(item["detail"]) for item in self.YOUTUBE_THUMBNAIL_STYLE_PRESETS}
-        selected = self._select_from_list(
-            label="Thumbnail style preset",
-            options=options,
-            current_value=options[0],
-            option_details=option_details,
+    def _suggest_youtube_tags_from_draft(self, draft: YouTubePublishDraft) -> list[str]:
+        profile = self.CHANNEL_PROFILES.get(self.config.active_channel, self.CHANNEL_PROFILES["general"])
+        script_language = str(profile.get("script_language") or self.config.script_language or "en").strip().lower()
+        channel_label = str(profile.get("label") or self.config.active_channel or "General").strip()
+        channel_description = str(profile.get("description") or "").strip()
+        lang_label = {
+            "pt-br": "Brazilian Portuguese",
+            "es": "Spanish",
+            "fr": "French",
+        }.get(script_language, "English")
+        title = str(draft.title or "").strip()
+        description = str(draft.description or "").strip()
+        existing = ", ".join(draft.tags[:12]) if draft.tags else "(none)"
+        prompt = (
+            f"Channel: {channel_label}\n"
+            f"Channel context: {channel_description}\n"
+            f"Language: {lang_label}. Return all tags entirely in {lang_label}.\n\n"
+            f"Video title: {title}\n\n"
+            f"Video description:\n{description}\n\n"
+            f"Existing tags: {existing}\n\n"
+            "Suggest 8-10 additional YouTube tags related to this video.\n"
+            "Rules:\n"
+            "- Tags should be short and relevant\n"
+            "- Prefer 1-3 words each\n"
+            "- Avoid duplicates of existing tags\n"
+            "- No hashtags\n"
+            "- Match the channel audience and market\n"
+            "- No explanations\n"
+            "Return ONLY a JSON array of strings."
         )
-        if selected is None:
-            return None
-        return label_to_key.get(selected)
-
-    def _open_thumbnail_in_external_editor(
-        self,
-        *,
-        project_dir: Path,
-        draft: YouTubePublishDraft,
-        current_path: Path | None,
-    ) -> bool:
-        if not str(self.config.external_editor_command).strip():
-            self._set_status("External editor is not configured in Settings.")
-            return False
-        source_path = current_path if current_path is not None and current_path.exists() else None
-        work_path = export_youtube_thumbnail_work_image(
-            draft,
-            source_path=source_path,
-            notify=self._append_log,
-        )
-        if work_path is None or not work_path.exists():
-            self._set_status("Could not prepare thumbnail_work.png for external editing.")
-            return False
         try:
-            prior_mtime = int(work_path.stat().st_mtime_ns)
-        except OSError:
-            prior_mtime = 0
-        if not self._open_path_in_external_editor(work_path):
-            return False
-        try:
-            updated_mtime = int(work_path.stat().st_mtime_ns)
-        except OSError:
-            updated_mtime = prior_mtime
-        if updated_mtime == prior_mtime:
-            self._set_status("External editor closed with no thumbnail_work.png change detected.")
-            return False
-        if not self._prompt_yes_no(
-            "Use edited thumbnail",
-            f"Use {work_path.name} as the current thumbnail for {project_dir.name}?",
-            default_yes=True,
-        ):
-            self._set_status("Edited thumbnail was kept on disk but not selected.")
-            return False
-        draft.thumbnail_path = str(work_path.resolve())
-        draft.thumbnail_source = "manual"
-        self._set_status(f"Using edited thumbnail: {work_path.name}")
-        return True
-
-    def _select_youtube_thumbnail_color(
-        self,
-        *,
-        label: str,
-        current_value: str,
-        choices: tuple[str, ...],
-    ) -> str | None:
-        option_labels = [self._youtube_thumbnail_color_label(choice) for choice in choices]
-        label_to_value = {self._youtube_thumbnail_color_label(choice): choice for choice in choices}
-        option_details = {
-            self._youtube_thumbnail_color_label(choice): self.YOUTUBE_THUMBNAIL_COLOR_DETAILS.get(choice, "")
-            for choice in choices
-        }
-        selected = self._select_from_list(
-            label=label,
-            options=option_labels,
-            current_value=self._youtube_thumbnail_color_label(current_value),
-            option_details=option_details,
-        )
-        if selected is None:
-            return None
-        return label_to_value.get(selected)
-
-    def _select_youtube_thumbnail_font_size(self, current_value: str) -> str | None:
-        option_labels = [self._youtube_thumbnail_font_size_label(choice) for choice in YOUTUBE_THUMBNAIL_FONT_SIZE_CHOICES]
-        label_to_value = {
-            self._youtube_thumbnail_font_size_label(choice): choice
-            for choice in YOUTUBE_THUMBNAIL_FONT_SIZE_CHOICES
-        }
-        selected = self._select_from_list(
-            label="Thumbnail font size",
-            options=option_labels,
-            current_value=self._youtube_thumbnail_font_size_label(current_value),
-        )
-        if selected is None:
-            return None
-        return label_to_value.get(selected)
-
-    def _select_youtube_thumbnail_anchor(self, current_value: str) -> str | None:
-        option_labels = [self._youtube_thumbnail_anchor_label(choice) for choice in YOUTUBE_THUMBNAIL_ANCHOR_CHOICES]
-        label_to_value = {self._youtube_thumbnail_anchor_label(choice): choice for choice in YOUTUBE_THUMBNAIL_ANCHOR_CHOICES}
-        selected = self._select_from_list(
-            label="Thumbnail anchor",
-            options=option_labels,
-            current_value=self._youtube_thumbnail_anchor_label(current_value),
-        )
-        if selected is None:
-            return None
-        return label_to_value.get(selected)
-
-    def _select_youtube_thumbnail_align(self, current_value: str) -> str | None:
-        option_labels = [self._youtube_thumbnail_align_label(choice) for choice in YOUTUBE_THUMBNAIL_TEXT_ALIGN_CHOICES]
-        label_to_value = {self._youtube_thumbnail_align_label(choice): choice for choice in YOUTUBE_THUMBNAIL_TEXT_ALIGN_CHOICES}
-        selected = self._select_from_list(
-            label="Thumbnail text alignment",
-            options=option_labels,
-            current_value=self._youtube_thumbnail_align_label(current_value),
-        )
-        if selected is None:
-            return None
-        return label_to_value.get(selected)
-
-    def _select_youtube_thumbnail_offset(self, *, axis: str, current_value: int) -> int | None:
-        values = list(range(-YOUTUBE_THUMBNAIL_MAX_OFFSET, YOUTUBE_THUMBNAIL_MAX_OFFSET + 1, 40))
-        if 0 not in values:
-            values.append(0)
-        if current_value not in values:
-            values.append(current_value)
-        values = sorted(set(values))
-        labels: list[str] = []
-        label_to_value: dict[str, int] = {}
-        for value in values:
-            if value == 0:
-                label = "0 (No nudge)"
-            elif axis == "horizontal":
-                label = f"{value:+d}px ({'Right' if value > 0 else 'Left'})"
-            else:
-                label = f"{value:+d}px ({'Down' if value > 0 else 'Up'})"
-            labels.append(label)
-            label_to_value[label] = value
-        current_label = next((label for label, value in label_to_value.items() if value == current_value), labels[0])
-        selected = self._select_from_list(
-            label=f"{axis.title()} nudge",
-            options=labels,
-            current_value=current_label,
-        )
-        if selected is None:
-            return None
-        return label_to_value.get(selected)
-
-    def _edit_youtube_thumbnail_position(self, draft: YouTubePublishDraft) -> bool:
-        selected_anchor = self._select_youtube_thumbnail_anchor(draft.thumbnail_anchor)
-        if selected_anchor is None:
-            return False
-        selected_offset_x = self._select_youtube_thumbnail_offset(axis="horizontal", current_value=int(draft.thumbnail_offset_x))
-        if selected_offset_x is None:
-            return False
-        selected_offset_y = self._select_youtube_thumbnail_offset(axis="vertical", current_value=int(draft.thumbnail_offset_y))
-        if selected_offset_y is None:
-            return False
-        draft.thumbnail_anchor = selected_anchor
-        draft.thumbnail_offset_x = selected_offset_x
-        draft.thumbnail_offset_y = selected_offset_y
-        return True
-
-    def _edit_youtube_thumbnail(self, project_dir: Path, draft: YouTubePublishDraft) -> bool:
-        self._ensure_youtube_thumbnail_draft_defaults(draft)
-        changed = False
-
-        while True:
-            current_path = Path(draft.thumbnail_path).expanduser().resolve() if draft.thumbnail_path else None
-            if current_path is not None and not current_path.exists():
-                current_path = None
-            detected_path = self._detect_project_thumbnail_candidate(project_dir)
-            generated_mode = self._youtube_thumbnail_is_generated(draft)
-
-            if generated_mode:
-                rendered_path = self._render_thumbnail_studio_image(project_dir, draft)
-                if rendered_path is not None:
-                    current_path = rendered_path
-
-            actions: list[str] = []
-            option_details: dict[str, str] = {}
-            if current_path is not None:
-                actions.append("Preview current thumbnail")
-                option_details["Preview current thumbnail"] = "Render the current managed settings if needed, then preview the thumbnail inline."
-            if detected_path is not None and (current_path is None or detected_path != current_path):
-                actions.append(f"Use detected file ({detected_path.name})")
-                option_details[f"Use detected file ({detected_path.name})"] = "Use the thumbnail file already found in this project."
-            actions.append("Generate thumbnail")
-            option_details["Generate thumbnail"] = "Render the managed project thumbnail using the current text and style settings."
-            if generated_mode:
-                actions.extend(
-                    [
-                        "Apply style preset",
-                        "Edit text",
-                        "Edit badge text",
-                        "Edit font color",
-                        "Edit outline color",
-                        "Edit font size",
-                        "Edit text plate",
-                        "Edit position",
-                        "Edit alignment",
-                        "Regenerate background thumbnail",
-                        "Reset style to defaults",
-                    ]
-                )
-                option_details["Apply style preset"] = "Apply a curated thumbnail layout tuned for higher-contrast YouTube hooks."
-                option_details["Edit text"] = "Pick a short hook suggestion or write custom text."
-                option_details["Edit badge text"] = (
-                    f"Current: {str(getattr(draft, 'thumbnail_badge_text', '') or '').strip() or '(none)'}"
-                )
-                option_details["Edit font color"] = f"Current: {self._youtube_thumbnail_color_label(draft.thumbnail_font_color)}"
-                option_details["Edit outline color"] = f"Current: {self._youtube_thumbnail_color_label(draft.thumbnail_outline_color)}"
-                option_details["Edit font size"] = f"Current: {self._youtube_thumbnail_font_size_label(draft.thumbnail_font_size_mode)}"
-                option_details["Edit text plate"] = f"Current: {self._youtube_thumbnail_text_plate_label(getattr(draft, 'thumbnail_text_plate', YOUTUBE_THUMBNAIL_DEFAULT_TEXT_PLATE))}"
-                option_details["Edit position"] = (
-                    f"{self._youtube_thumbnail_anchor_label(draft.thumbnail_anchor)} | "
-                    f"X {int(draft.thumbnail_offset_x):+d}px | Y {int(draft.thumbnail_offset_y):+d}px"
-                )
-                option_details["Edit alignment"] = f"Current: {self._youtube_thumbnail_align_label(draft.thumbnail_text_align)}"
-                option_details["Regenerate background thumbnail"] = "Keep the text styling, but switch to a different background/frame choice."
-                option_details["Reset style to defaults"] = "Restore the default generated-thumbnail style while keeping the current text."
-            else:
-                option_details["Generate thumbnail"] = "Switch back to the managed generated thumbnail. Editing tools are only available there."
-            actions.append("Pick local thumbnail file")
-            option_details["Pick local thumbnail file"] = "Choose a PNG, JPG, JPEG, or WEBP file to use as-is. Styling tools stay disabled for manual files."
-            actions.append("Open in external editor")
-            option_details["Open in external editor"] = "Export publish/thumbnail_work.png, open it in your configured editor, and optionally reimport the edited file."
-            actions.append("Review thumbnail details")
-            option_details["Review thumbnail details"] = "Inspect the current source, style, and positioning values."
-            actions.append("Save and return")
-            option_details["Save and return"] = "Save the current thumbnail selection/settings and return to the YouTube draft."
-
-            action = self._select_thumbnail_studio_action(
-                label=f"Thumbnail Studio ({project_dir.name})",
-                actions=actions,
-                current_value=actions[0],
-                option_details=option_details,
-                preview_path=current_path,
-                preview_title=f"Current thumbnail: {current_path.name if current_path is not None else 'none'}",
-                preview_details=self._youtube_thumbnail_preview_detail_lines(draft, current_path=current_path),
+            completed = subprocess.run(
+                ["ollama", "run", "qwen2.5:14b", prompt],
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                timeout=60,
+                check=False,
             )
-            if action is None:
-                return changed
+        except Exception:
+            return []
+        if completed.returncode != 0:
+            return []
+        text = completed.stdout.strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+        start = text.find("[")
+        end = text.rfind("]")
+        if start == -1 or end == -1 or end < start:
+            return []
+        try:
+            items = json.loads(text[start : end + 1])
+        except Exception:
+            return []
+        return self._dedupe_text_values([str(item).strip() for item in items if str(item).strip()])[:10]
 
-            if action == "Save and return":
-                return changed
-
-            if action == "Preview current thumbnail":
-                if current_path is None:
-                    self._set_status("No thumbnail is selected yet.")
-                    continue
-                if generated_mode:
-                    rendered_path = self._render_thumbnail_studio_image(project_dir, draft)
-                    if rendered_path is None:
-                        continue
-                    current_path = rendered_path
-                self._show_youtube_thumbnail_preview_modal(image_path=current_path, draft=draft)
-                self._set_status("Thumbnail preview closed. Keep editing or press Esc to return.")
-                continue
-
-            if action.startswith("Use detected file ("):
-                if detected_path is None:
-                    self._set_status("No detected thumbnail file is available.")
-                    continue
-                draft.thumbnail_path = str(detected_path)
-                draft.thumbnail_source = "auto" if detected_path.name == "thumbnail_yt.jpg" else "manual"
-                changed = True
-                continue
-
-            if action == "Apply style preset":
-                selected_preset = self._select_youtube_thumbnail_style_preset()
-                if selected_preset is None:
-                    continue
-                if not self._apply_youtube_thumbnail_style_preset(draft, selected_preset):
-                    continue
-                if self._render_thumbnail_studio_image(project_dir, draft) is None:
-                    continue
-                changed = True
-                continue
-
-            if action == "Edit text":
-                selected_text = self._select_youtube_thumbnail_text(draft)
-                if selected_text is None:
-                    continue
-                draft.thumbnail_text = selected_text
-                draft.thumbnail_prompt = draft.thumbnail_text
-                rendered_path = self._render_thumbnail_studio_image(project_dir, draft)
-                if rendered_path is None:
-                    continue
-                changed = True
-                continue
-
-            if action == "Edit badge text":
-                selected_badge = self._select_youtube_thumbnail_badge_text(draft)
-                if selected_badge is None:
-                    continue
-                draft.thumbnail_badge_text = selected_badge
-                rendered_path = self._render_thumbnail_studio_image(project_dir, draft)
-                if rendered_path is None:
-                    continue
-                changed = True
-                continue
-
-            if action == "Edit font color":
-                selected_color = self._select_youtube_thumbnail_color(
-                    label="Thumbnail font color",
-                    current_value=draft.thumbnail_font_color,
-                    choices=YOUTUBE_THUMBNAIL_FONT_COLOR_CHOICES,
-                )
-                if selected_color is None:
-                    continue
-                draft.thumbnail_font_color = selected_color
-                if self._render_thumbnail_studio_image(project_dir, draft) is None:
-                    continue
-                changed = True
-                continue
-
-            if action == "Edit outline color":
-                selected_color = self._select_youtube_thumbnail_color(
-                    label="Thumbnail outline color",
-                    current_value=draft.thumbnail_outline_color,
-                    choices=YOUTUBE_THUMBNAIL_OUTLINE_COLOR_CHOICES,
-                )
-                if selected_color is None:
-                    continue
-                draft.thumbnail_outline_color = selected_color
-                if self._render_thumbnail_studio_image(project_dir, draft) is None:
-                    continue
-                changed = True
-                continue
-
-            if action == "Edit font size":
-                selected_size = self._select_youtube_thumbnail_font_size(draft.thumbnail_font_size_mode)
-                if selected_size is None:
-                    continue
-                draft.thumbnail_font_size_mode = selected_size
-                if self._render_thumbnail_studio_image(project_dir, draft) is None:
-                    continue
-                changed = True
-                continue
-
-            if action == "Edit text plate":
-                selected_plate = self._select_youtube_thumbnail_text_plate(
-                    getattr(draft, "thumbnail_text_plate", YOUTUBE_THUMBNAIL_DEFAULT_TEXT_PLATE)
-                )
-                if selected_plate is None:
-                    continue
-                draft.thumbnail_text_plate = selected_plate
-                if self._render_thumbnail_studio_image(project_dir, draft) is None:
-                    continue
-                changed = True
-                continue
-
-            if action == "Edit position":
-                if not self._edit_youtube_thumbnail_position(draft):
-                    continue
-                if self._render_thumbnail_studio_image(project_dir, draft) is None:
-                    continue
-                changed = True
-                continue
-
-            if action == "Edit alignment":
-                selected_align = self._select_youtube_thumbnail_align(draft.thumbnail_text_align)
-                if selected_align is None:
-                    continue
-                draft.thumbnail_text_align = selected_align
-                if self._render_thumbnail_studio_image(project_dir, draft) is None:
-                    continue
-                changed = True
-                continue
-
-            if action == "Reset style to defaults":
-                self._reset_youtube_thumbnail_style(draft)
-                if self._render_thumbnail_studio_image(project_dir, draft) is None:
-                    continue
-                changed = True
-                continue
-
-            if action == "Regenerate background thumbnail":
-                draft.thumbnail_background_variant = max(0, int(draft.thumbnail_background_variant)) + 1
-                if self._render_thumbnail_studio_image(project_dir, draft) is None:
-                    continue
-                changed = True
-                continue
-
-            if action == "Pick local thumbnail file":
-                default_path = str(current_path or (project_dir / "thumbnail_yt.png"))
-                updated = self._prompt_input("Thumbnail file path", default_path)
-                if updated is None:
-                    continue
-                selected_path = Path(str(updated).strip()).expanduser().resolve()
-                if not selected_path.exists() or not selected_path.is_file():
-                    self._set_status("Thumbnail file was not found.")
-                    continue
-                if selected_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
-                    self._set_status("Thumbnail file must be PNG, JPG, JPEG, or WEBP.")
-                    continue
-                draft.thumbnail_path = str(selected_path)
-                draft.thumbnail_source = "manual"
-                changed = True
-                continue
-
-            if action == "Open in external editor":
-                if self._open_thumbnail_in_external_editor(project_dir=project_dir, draft=draft, current_path=current_path):
-                    changed = True
-                continue
-
-            if action == "Review thumbnail details":
-                self._show_paginated_text_modal(
-                    "Thumbnail Details",
-                    "\n".join(
-                        [
-                            f"Source: {draft.thumbnail_source}",
-                            f"Current file: {draft.thumbnail_path or '(none selected)'}",
-                            f"Detected file: {str(detected_path) if detected_path is not None else '(none)'}",
-                            f"Text: {draft.thumbnail_text}",
-                            f"Badge text: {str(getattr(draft, 'thumbnail_badge_text', '') or '').strip() or '(none)'}",
-                            f"Font color: {self._youtube_thumbnail_color_label(draft.thumbnail_font_color)}",
-                            f"Outline color: {self._youtube_thumbnail_color_label(draft.thumbnail_outline_color)}",
-                            f"Font size: {self._youtube_thumbnail_font_size_label(draft.thumbnail_font_size_mode)}",
-                            f"Text plate: {self._youtube_thumbnail_text_plate_label(getattr(draft, 'thumbnail_text_plate', YOUTUBE_THUMBNAIL_DEFAULT_TEXT_PLATE))}",
-                            f"Anchor: {self._youtube_thumbnail_anchor_label(draft.thumbnail_anchor)}",
-                            f"Offsets: X {int(draft.thumbnail_offset_x):+d}px | Y {int(draft.thumbnail_offset_y):+d}px",
-                            f"Alignment: {self._youtube_thumbnail_align_label(draft.thumbnail_text_align)}",
-                            f"Background variant: {int(draft.thumbnail_background_variant)}",
-                            "",
-                            *self._youtube_thumbnail_diagnostic_lines(draft),
-                            (
-                                "Editing note: v1 styling tools are only available for generated thumbnails."
-                                if draft.thumbnail_source == "manual"
-                                else "Editing note: this thumbnail is managed by Thumbnail Studio."
-                            ),
-                        ]
-                    ),
-                )
-                continue
-
-            generated_path = self._render_thumbnail_studio_image(project_dir, draft)
-            if generated_path is None:
-                return changed
-            changed = True
-            self._append_log(f"YouTube thumbnail generated: {generated_path}")
-            self._set_status(f"YouTube thumbnail ready: {generated_path.name}")
+    def _safe_flush_input(self) -> None:
+        try:
+            curses.flushinp()
+        except curses.error:
+            pass
 
     def _prepare_run_workspace(self) -> Path:
+        self._ensure_package_layout_ready()
         stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
         prompt_slug = self._slugify(self.config.prompt)[:48]
         base_name = f"{prompt_slug}-{stamp}"
-        candidate = self.config.project_dir / base_name
+        package_root = self._mp4_export_dir()
+        candidate = package_root / base_name
         suffix = 1
         while candidate.exists():
-            candidate = self.config.project_dir / f"{base_name}-{suffix:02d}"
+            candidate = package_root / f"{base_name}-{suffix:02d}"
             suffix += 1
 
         candidate.mkdir(parents=True, exist_ok=False)
-        self._active_project_dir = candidate
-        self._pending_export_path = self._downloads_export_mp4_path(candidate)
-        self._append_log(f"Run workspace: {candidate}")
+        metadata_dir = candidate / "metadata"
+        metadata_dir.mkdir(parents=True, exist_ok=False)
+        self._active_project_dir = metadata_dir
+        self._pending_export_path = self._downloads_export_mp4_path(metadata_dir)
+        self._append_log(f"Run package: {candidate}")
+        self._append_log(f"Run metadata workspace: {metadata_dir}")
         self._append_log(f"Planned MP4 output: {self._pending_export_path}")
-        return candidate
+        return metadata_dir
+
+    def _mp4_export_dir(self) -> Path:
+        return Path("/Users/rafaelbm/Imagine").resolve()
+
+    def _package_dir_for_project(self, project_dir: Path) -> Path:
+        return resolve_video_package(project_dir).package_dir
+
+    def _package_video_path(self, project_dir: Path) -> Path:
+        return resolve_video_package(project_dir).video_path
+
+    def _ensure_package_layout_ready(self) -> None:
+        if self._package_layout_prepared:
+            return
+        package_root = self._mp4_export_dir()
+        package_root.mkdir(parents=True, exist_ok=True)
+        self._migrate_loose_package_mp4s(package_root)
+        self._migrate_legacy_workspaces_to_packages(package_root)
+        self._package_layout_prepared = True
+
+    def _migrate_loose_package_mp4s(self, package_root: Path) -> None:
+        for loose_mp4 in sorted(package_root.glob("*.mp4")):
+            package_name = loose_mp4.stem
+            package_dir = package_root / package_name
+            metadata_dir = package_dir / "metadata"
+            target_mp4 = package_dir / f"{package_name}.mp4"
+            if target_mp4 == loose_mp4:
+                continue
+            if package_dir.exists():
+                self._append_log(f"WARN: Skipping loose MP4 migration because package already exists: {package_dir}")
+                continue
+            try:
+                metadata_dir.mkdir(parents=True, exist_ok=False)
+                shutil.move(str(loose_mp4), str(target_mp4))
+                self._append_log(f"Migrated loose MP4 into package folder: {target_mp4}")
+            except Exception as exc:  # noqa: BLE001
+                self._append_log(f"WARN: Could not migrate loose MP4 {loose_mp4.name}: {exc}")
+
+    def _migrate_legacy_workspaces_to_packages(self, package_root: Path) -> None:
+        legacy_root = self.config.project_dir
+        if legacy_root == package_root or not legacy_root.exists():
+            return
+        for workspace in sorted(path for path in legacy_root.iterdir() if path.is_dir() and not path.name.startswith(".")):
+            source_mp4 = workspace / "output" / "final.mp4"
+            if not source_mp4.exists():
+                continue
+            package_dir = package_root / workspace.name
+            metadata_dir = package_dir / "metadata"
+            target_mp4 = package_dir / f"{workspace.name}.mp4"
+            try:
+                package_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(workspace, metadata_dir, dirs_exist_ok=True)
+                if not target_mp4.exists():
+                    target_mp4.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source_mp4, target_mp4)
+                migrated_srt = metadata_dir / "final.srt"
+                legacy_srt = metadata_dir / "output" / "final.srt"
+                if legacy_srt.exists():
+                    shutil.copy2(legacy_srt, migrated_srt)
+                if (metadata_dir / "script.json").exists() and target_mp4.exists():
+                    shutil.rmtree(workspace)
+                    self._append_log(f"Migrated legacy workspace into package and removed source: {workspace.name}")
+            except Exception as exc:  # noqa: BLE001
+                self._append_log(f"WARN: Could not migrate legacy workspace {workspace.name}: {exc}")
 
     def _downloads_export_mp4_path(self, project_dir: Path) -> Path:
-        downloads_dir = (Path.home() / "Downloads").resolve()
-        project_name = self._slugify(project_dir.name)
-        return downloads_dir / f"{project_name}.mp4"
-
-    def _downloads_export_thumbnail_path(self, project_dir: Path, source_thumbnail: Path) -> Path:
-        downloads_dir = (Path.home() / "Downloads").resolve()
-        project_name = self._slugify(project_dir.name)
-        suffix = source_thumbnail.suffix.lower() or ".jpg"
-        return downloads_dir / f"{project_name}-thumbnail{suffix}"
+        package = resolve_video_package(project_dir)
+        return package.package_dir / f"{self._slugify(package.package_dir.name)}.mp4"
 
     def _mp4_output_preview_path(self) -> Path:
         if self._pending_export_path is not None:
             return self._pending_export_path
 
         base_slug = self._slugify(self.config.prompt)
-        return (Path.home() / "Downloads" / f"{base_slug}-<timestamp>.mp4").resolve()
+        return (self._mp4_export_dir() / f"{base_slug}-<timestamp>.mp4").resolve()
 
     def _export_project_outputs_to_downloads(self) -> tuple[Path | None, Path | None]:
         project_dir = self._active_project_dir
@@ -4805,25 +4119,14 @@ class LocalVideoMvpTui:
         target_mp4 = self._downloads_export_mp4_path(project_dir)
         target_mp4.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_mp4, target_mp4)
+        source_srt = project_dir / "output" / "final.srt"
+        target_srt = project_dir / "final.srt"
+        if source_srt.exists():
+            shutil.copy2(source_srt, target_srt)
 
         self._pending_export_path = target_mp4
         self._append_log(f"Exported final MP4 to {target_mp4}")
-
-        thumbnail_path = ensure_project_youtube_thumbnail(
-            project_dir,
-            prompt_text="",
-            overwrite=False,
-            notify=self._append_log,
-        )
-        if thumbnail_path is None or not thumbnail_path.exists():
-            self._append_log("WARN: No thumbnail available for Downloads export.")
-            return target_mp4, None
-
-        target_thumbnail = self._downloads_export_thumbnail_path(project_dir, thumbnail_path)
-        target_thumbnail.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(thumbnail_path, target_thumbnail)
-        self._append_log(f"Exported thumbnail to {target_thumbnail}")
-        return target_mp4, target_thumbnail
+        return target_mp4, None
 
     def _count_placeholder_scenes(self) -> int:
         project_dir = self._active_project_dir
@@ -5316,81 +4619,6 @@ class LocalVideoMvpTui:
         if approved_path.exists():
             approved_path.unlink()
 
-    def _external_editor_summary(self) -> str:
-        command = str(self.config.external_editor_command).strip()
-        return "configured" if command else "not set"
-
-    def _thumbnail_comfyui_summary(self) -> str:
-        reachable = self._probe_comfyui_online(max_age=4.0)
-        return "online" if reachable else "offline"
-
-    def _thumbnail_comfyui_install_summary(self) -> str:
-        configured = str(getattr(self.config, "thumbnail_comfyui_install_dir", "") or "").strip()
-        if configured:
-            return Path(configured).expanduser().resolve().name or configured
-        detected = self._detect_local_comfyui_install_dir()
-        if detected is not None:
-            return f"auto:{detected.name}"
-        return "not found"
-
-    def _thumbnail_export_dir_summary(self) -> str:
-        export_dir = Path(
-            str(getattr(self.config, "thumbnail_default_export_dir", THUMBNAIL_STUDIO_DEFAULT_EXPORT_DIR) or "").strip()
-            or str(THUMBNAIL_STUDIO_DEFAULT_EXPORT_DIR)
-        ).expanduser().resolve()
-        return export_dir.name or str(export_dir)
-
-    def _thumbnail_ollama_hooks_summary(self) -> str:
-        return "On" if bool(getattr(self.config, "thumbnail_use_ollama_hooks", True)) else "Off"
-
-    def _open_path_in_external_editor(self, file_path: Path) -> bool:
-        resolved_path = file_path.expanduser().resolve()
-        if not resolved_path.exists():
-            self._set_status(f"Editor target not found: {resolved_path}")
-            return False
-
-        command_template = str(self.config.external_editor_command).strip()
-        if not command_template:
-            self._set_status("External editor is not configured in Settings.")
-            return False
-        if "{file}" not in command_template:
-            self._append_log("WARN: External editor command is missing {file}.")
-            self._set_status("External editor command must include {file}.")
-            return False
-
-        command_text = command_template.replace("{file}", shlex.quote(str(resolved_path)))
-        self._append_log(f"$ {command_text}")
-        try:
-            completed = subprocess.run(
-                command_text,
-                shell=True,
-                cwd=str(self._repo_root),
-                timeout=7200,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            self._append_log("ERROR: External editor command timed out after 7200s.")
-            self._set_status("External editor timed out.")
-            return False
-        except Exception as exc:  # noqa: BLE001
-            self._append_log(f"ERROR: External editor launch failed: {exc}")
-            self._set_status("Could not launch external editor.")
-            return False
-
-        if int(completed.returncode) != 0:
-            self._append_log(f"ERROR: External editor exited with code {completed.returncode}.")
-            self._set_status(f"External editor exited with code {completed.returncode}.")
-            return False
-        return True
-
-    def _open_script_in_external_editor(self, project_dir: Path) -> bool:
-        script_path = self._script_path_for_review(project_dir)
-        if not script_path.exists():
-            self._set_status(f"Script file not found: {script_path}")
-            return False
-
-        return self._open_path_in_external_editor(script_path)
-
     def _run_script_review_prompt(self, project_dir: Path) -> str:
         entries = self._load_scene_review_entries(project_dir)
         if not entries:
@@ -5417,7 +4645,6 @@ class LocalVideoMvpTui:
             options = [
                 "Read full script",
                 *scene_labels,
-                "Open in external editor",
                 "Approve script",
                 "Regenerate script",
                 "Open prompt + regenerate",
@@ -5443,10 +4670,6 @@ class LocalVideoMvpTui:
                     self._set_status("Could not open the script review view.")
                     continue
                 self._show_paginated_text_modal("Script Review", body)
-                continue
-
-            if selected == "Open in external editor":
-                self._open_script_in_external_editor(project_dir)
                 continue
 
             if selected == "Approve script":
@@ -5644,8 +4867,14 @@ class LocalVideoMvpTui:
                     "required_entities": list(item.get("required_entities") or [])
                     if isinstance(item.get("required_entities"), list)
                     else [],
+                    "matched_channel_terms": list(item.get("matched_channel_terms") or [])
+                    if isinstance(item.get("matched_channel_terms"), list)
+                    else [],
                     "search_queries": list(item.get("search_queries") or [])
                     if isinstance(item.get("search_queries"), list)
+                    else [],
+                    "effective_search_queries": list(item.get("effective_search_queries") or [])
+                    if isinstance(item.get("effective_search_queries"), list)
                     else [],
                     "match_confidence": str(item.get("match_confidence") or "").strip() or "medium",
                     "fallback_level": str(item.get("fallback_level") or "").strip() or "exact",
@@ -6278,6 +5507,18 @@ class LocalVideoMvpTui:
                 result.append(parsed)
             return result
 
+        def _str_list(value: Any) -> list[str]:
+            items = value if isinstance(value, list) else []
+            result: list[str] = []
+            seen: set[str] = set()
+            for item in items:
+                cleaned = str(item).strip().lower()
+                if not cleaned or cleaned in seen:
+                    continue
+                seen.add(cleaned)
+                result.append(cleaned)
+            return result
+
         phase = str(cycle.get("phase") or "video").strip().lower()
         if phase not in {"video", "image"}:
             phase = "video"
@@ -6294,9 +5535,16 @@ class LocalVideoMvpTui:
             ]
             if isinstance(cycle.get("search_queries"), list)
             else [],
+            "rejected_asset_keys": _str_list(cycle.get("rejected_asset_keys")),
+            "strict_query_override": bool(cycle.get("strict_query_override")),
         }
 
-    def _fresh_regenerate_cycle(self, search_queries: list[str] | None = None) -> dict[str, Any]:
+    def _fresh_regenerate_cycle(
+        self,
+        search_queries: list[str] | None = None,
+        *,
+        strict_query_override: bool = False,
+    ) -> dict[str, Any]:
         return {
             "phase": "video",
             "video_tried": [],
@@ -6304,6 +5552,8 @@ class LocalVideoMvpTui:
             "exhausted": False,
             "regenerated": False,
             "search_queries": [str(item).strip() for item in (search_queries or []) if str(item).strip()],
+            "rejected_asset_keys": [],
+            "strict_query_override": bool(strict_query_override),
         }
 
     def _save_shot_regenerate_cycle(
@@ -6351,8 +5601,14 @@ class LocalVideoMvpTui:
         tried_video = {int(item) for item in cycle.get("video_tried") or []}
         tried_image = {int(item) for item in cycle.get("image_tried") or []}
         current_asset_key = str(manifest.get("current_asset_key") or "").strip().lower()
+        rejected_asset_keys = {
+            str(item).strip().lower()
+            for item in cycle.get("rejected_asset_keys") or []
+            if str(item).strip()
+        }
 
         def pick(pool: list[dict[str, Any]], tried: set[int]) -> dict[str, Any] | None:
+            deprioritized_match: dict[str, Any] | None = None
             for candidate in pool:
                 shortlist_index = int(candidate.get("shortlist_index") or -1)
                 if shortlist_index < 0:
@@ -6364,8 +5620,12 @@ class LocalVideoMvpTui:
                 candidate_key = self._shot_candidate_uniqueness_key(candidate)
                 if current_asset_key and candidate_key and candidate_key.lower() == current_asset_key:
                     continue
+                if candidate_key and candidate_key.lower() in rejected_asset_keys:
+                    if deprioritized_match is None:
+                        deprioritized_match = candidate
+                    continue
                 return candidate
-            return None
+            return deprioritized_match
 
         if str(media_type).strip().lower() == "image":
             candidate = pick(image_candidates, tried_image)
@@ -6401,6 +5661,7 @@ class LocalVideoMvpTui:
         key_info: str,
         *,
         search_queries: list[str] | None = None,
+        strict_query_override: bool = False,
         use_spinner: bool = False,
         detail_text: str | None = None,
     ) -> bool:
@@ -6421,6 +5682,8 @@ class LocalVideoMvpTui:
             cleaned = re.sub(r"\s+", " ", str(query).strip())
             if cleaned:
                 command.extend(["--search-query", cleaned])
+        if strict_query_override:
+            command.append("--strict-query-override")
         if use_spinner:
             code = self._run_command_with_spinner(
                 command,
@@ -6549,6 +5812,8 @@ class LocalVideoMvpTui:
                 option_details[label] = (
                     f"Objective: {str(entry.get('shot_objective') or '').strip()}\n\n"
                     f"Key info: {str(entry.get('key_info') or '').strip()}\n\n"
+                    f"Matched channel terms: {', '.join(str(item).strip() for item in entry.get('matched_channel_terms') or [] if str(item).strip()) or '(none)'}\n\n"
+                    f"Effective queries: {', '.join(str(item).strip() for item in entry.get('effective_search_queries') or [] if str(item).strip()) or '(none)'}\n\n"
                     f"Confidence: {str(entry.get('match_confidence') or 'medium').strip()} | "
                     f"Fallback: {str(entry.get('fallback_level') or 'exact').strip()}"
                 )
@@ -6598,7 +5863,7 @@ class LocalVideoMvpTui:
                 )
                 action = self._select_from_list(
                     label=f"Shot {shot_id}",
-                    options=["Play", "Approve", "Regenerate", "Try still image", "Refine keywords"],
+                    options=["Play", "Approve", "Regenerate", "Try still image", "Override keywords"],
                     current_value=action_choice,
                 )
                 if action is None:
@@ -6636,7 +5901,7 @@ class LocalVideoMvpTui:
                         current_shot_id = shot_id
                         continue
                     continue
-                if action == "Refine keywords":
+                if action == "Override keywords":
                     if self._regenerate_shot_entry(project_dir, refreshed_entry, mode="refine"):
                         state = self._load_shot_review_state(project_dir)
                         entries = self._load_shot_review_entries(project_dir)
@@ -6668,6 +5933,7 @@ class LocalVideoMvpTui:
             cycle["search_queries"] = list(current_search_queries)
 
         desired_queries = list(cycle.get("search_queries") or current_search_queries)
+        strict_query_override = bool(cycle.get("strict_query_override"))
         if mode == "refine":
             updated_key_info, updated_queries = self._prompt_shot_regenerate_refinement(
                 shot_id,
@@ -6678,7 +5944,10 @@ class LocalVideoMvpTui:
                 return False
             current_key_info = updated_key_info
             desired_queries = list(updated_queries)
-            cycle = self._fresh_regenerate_cycle(desired_queries)
+            prior_rejected_asset_keys = list(cycle.get("rejected_asset_keys") or [])
+            cycle = self._fresh_regenerate_cycle(desired_queries, strict_query_override=True)
+            cycle["rejected_asset_keys"] = prior_rejected_asset_keys
+            strict_query_override = True
             self._save_shot_regenerate_cycle(project_dir, state, shot_id, cycle)
 
         if not self._prepare_shot_candidates_for_entry(
@@ -6686,6 +5955,7 @@ class LocalVideoMvpTui:
             shot_id,
             current_key_info,
             search_queries=desired_queries,
+            strict_query_override=strict_query_override,
             use_spinner=True,
             detail_text=detail_text,
         ):
@@ -6694,7 +5964,7 @@ class LocalVideoMvpTui:
 
         if bool(manifest.get("editorial_locked")):
             if mode != "refine":
-                self._set_status("Editorial shot is locked. Use Refine keywords for this shot.")
+                self._set_status("Editorial shot is locked. Use Override keywords for this shot.")
                 return False
             command = [
                 sys.executable,
@@ -6711,6 +5981,8 @@ class LocalVideoMvpTui:
             ]
             for query in desired_queries:
                 command.extend(["--search-query", re.sub(r"\s+", " ", query.strip())])
+            if strict_query_override:
+                command.append("--strict-query-override")
             code = self._run_command_with_spinner(
                 command,
                 label="run",
@@ -6769,6 +6041,13 @@ class LocalVideoMvpTui:
             self._set_status("Selected shot candidate is invalid.")
             return False
 
+        current_asset_key = str(manifest.get("current_asset_key") or "").strip().lower()
+        if current_asset_key:
+            rejected_asset_keys = list(cycle.get("rejected_asset_keys") or [])
+            if current_asset_key not in rejected_asset_keys:
+                rejected_asset_keys.append(current_asset_key)
+            cycle["rejected_asset_keys"] = rejected_asset_keys
+
         if media_type == "image":
             tried = list(cycle.get("image_tried") or [])
             if shortlist_index not in tried:
@@ -6784,6 +6063,7 @@ class LocalVideoMvpTui:
         cycle["exhausted"] = False
         cycle["regenerated"] = True
         cycle["search_queries"] = list(desired_queries)
+        cycle["strict_query_override"] = bool(strict_query_override)
         self._save_shot_regenerate_cycle(project_dir, state, shot_id, cycle)
 
         command = [
@@ -6803,6 +6083,8 @@ class LocalVideoMvpTui:
         ]
         for query in desired_queries:
             command.extend(["--search-query", re.sub(r"\s+", " ", query.strip())])
+        if strict_query_override:
+            command.append("--strict-query-override")
         code = self._run_command_with_spinner(
             command,
             label="run",
@@ -6851,7 +6133,7 @@ class LocalVideoMvpTui:
         current_search_queries: list[str],
     ) -> tuple[str | None, list[str]]:
         keywords_value = self._prompt_input(
-            f"Shot keywords ({shot_id})",
+            f"Shot keyword override ({shot_id})",
             ", ".join(current_search_queries),
         )
         if keywords_value is None:
@@ -7808,7 +7090,7 @@ class LocalVideoMvpTui:
                 page = 1 + (offset // max(1, view_rows))
                 page_total = max(1, math.ceil(len(wrapped_lines) / max(1, view_rows)))
                 title_text = self._trim_tail(f" {title} [{page}/{page_total}] ", max(1, modal_width - 4))
-                footer = "Up/Down scroll | Esc back"
+                footer = "Up/Down scroll | PgUp/PgDn page | Esc back"
                 try:
                     win.addstr(0, 2, title_text, self._attr("accent", bold=True))
                     win.addstr(modal_height - 1, 2, self._trim_tail(footer, modal_width - 4), self._attr("muted"))
@@ -7827,7 +7109,7 @@ class LocalVideoMvpTui:
 
                 win.refresh()
                 key = win.getch()
-                if key in (10, 13, curses.KEY_ENTER, 27):
+                if key == 27:
                     return
                 if key in (curses.KEY_UP, ord("k"), ord("K")):
                     offset = max(0, offset - 1)
@@ -7946,7 +7228,7 @@ class LocalVideoMvpTui:
                     pass
 
     def _multiline_submit_help_text(self) -> str:
-        return "Ctrl-Enter submit | Esc back"
+        return "Ctrl-G submit | Enter newline | Esc back"
 
     def _normalize_scene_voiceover_text(self, raw_text: str, *, wrap_width: int | None = None) -> str:
         text = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
@@ -8626,8 +7908,6 @@ class LocalVideoMvpTui:
 
     def _config_snapshot(self) -> tuple[Any, ...]:
         return (
-            bool(self._hitl_enabled),
-            bool(self.config.fast_mode),
             self.config.prompt,
             self._content_mode(),
             tuple(self.config.asset_keywords),
@@ -8665,11 +7945,6 @@ class LocalVideoMvpTui:
             self._normalized_image_motion_style(),
             bool(self.config.allow_attribution_required_assets),
             bool(self.config.include_intro),
-            str(self.config.external_editor_command).strip(),
-            str(getattr(self.config, "thumbnail_comfyui_url", THUMBNAIL_STUDIO_DEFAULT_COMFYUI_URL) or "").strip(),
-            str(getattr(self.config, "thumbnail_comfyui_install_dir", "") or "").strip(),
-            str(getattr(self.config, "thumbnail_default_export_dir", THUMBNAIL_STUDIO_DEFAULT_EXPORT_DIR) or "").strip(),
-            bool(getattr(self.config, "thumbnail_use_ollama_hooks", True)),
         )
 
     def _commit_config_changes(self, before: tuple[Any, ...]) -> bool:
@@ -8771,11 +8046,14 @@ class LocalVideoMvpTui:
 
             if action == "accept":
                 self._apply_lucky_prompt_result(result)
+                self._record_lucky_history(result, decision="accept")
                 self._set_status("Video concept applied from trending topic.")
                 return ConfigEditResult()
             elif action == "retry":
+                self._record_lucky_history(result, decision="retry")
                 continue  # Loop again to get a different trend
             else:  # cancel
+                self._record_lucky_history(result, decision="cancel")
                 return ConfigEditResult()
 
     def _generate_lucky_prompt(self) -> dict[str, Any] | None:
@@ -8792,19 +8070,9 @@ class LocalVideoMvpTui:
         if not topics:
             raise RuntimeError("No trending topics available. Check your internet connection.")
 
-        # Filter out already-used trends
-        available_topics = [t for t in topics if t not in self._used_trends]
-
-        # If we've used all trends, reset the list
-        if not available_topics:
-            self._used_trends.clear()
-            available_topics = topics.copy()
-
-        # Pick the first available trend
-        trend = available_topics[0]
-
-        # Mark as used
-        self._used_trends.append(trend)
+        trend = self._select_next_lucky_trend(topics)
+        if not trend:
+            raise RuntimeError("Could not choose a trending topic for lucky mode.")
 
         # Generate concept from trend using Ollama
         # Use the same hardcoded model as the pipeline
@@ -8812,6 +8080,8 @@ class LocalVideoMvpTui:
             trend=trend,
             ollama_model="qwen2.5:14b",
             timeout=120,
+            recent_concepts=self._recent_lucky_briefs(limit=self.LUCKY_CONTEXT_LIMIT),
+            rejected_concepts=self._recent_lucky_briefs(decision="retry", limit=3),
         )
 
         if concept is None:
@@ -9048,9 +8318,11 @@ class LocalVideoMvpTui:
             f"Audience: {target_audience}\n"
             f"Language: {lang_label} — respond entirely in that language.\n\n"
             f"Suggest a compelling YouTube video topic for this channel.\n"
+            "Make it feel distinct from recent attempts when prior examples are provided.\n"
             "For asset_keywords: provide 10-12 short stock footage search terms. "
             "1-2 words each — single words preferred. These are search terms, not descriptions. "
             "No underscores, no hyphens. Think: nouns, emotions, objects, places.\n"
+            f"{self._channel_lucky_history_prompt_block(self.config.active_channel)}"
             "Return ONLY valid JSON (no markdown, no code blocks).\n"
             'JSON schema: { "brief": "2-3 sentence video concept", "asset_keywords": ["keyword one", "keyword two", ...], "rationale": "why this works" }'
         )
@@ -9208,11 +8480,14 @@ class LocalVideoMvpTui:
                     self.config.asset_keywords = self._normalize_asset_keywords(
                         [str(k).strip().replace("_", " ") for k in keywords if str(k).strip()]
                     )
+                self._record_lucky_history(result, decision="accept", channel_key=self.config.active_channel)
                 self._set_status(f"Topic applied for {channel_label}.")
                 return ConfigEditResult()
             elif action == "retry":
+                self._record_lucky_history(result, decision="retry", channel_key=self.config.active_channel)
                 continue
             else:
+                self._record_lucky_history(result, decision="cancel", channel_key=self.config.active_channel)
                 return ConfigEditResult()
 
     def _edit_content_mode_field(self, *, allow_escape: bool = False) -> ConfigEditResult:
@@ -9231,7 +8506,6 @@ class LocalVideoMvpTui:
         if selected is not None:
             self.config.content_mode = normalize_content_mode(selected, "explainer")
             self._apply_default_news_feeds_if_needed()
-            self._enforce_news_hitl_policy()
         return ConfigEditResult()
 
     def _edit_news_feed_urls_field(self, *, allow_escape: bool = False) -> ConfigEditResult:
@@ -9553,10 +8827,16 @@ class LocalVideoMvpTui:
 
     def _edit_voice_field(self, *, allow_escape: bool = False) -> ConfigEditResult:
         try:
-            voice_entries, entry_by_label, current_label, load_warning = self._run_with_spinner_modal(
-                title="Voice",
-                message="Loading voices",
-                task=self._combined_voice_entries_for_selection,
+            resolved = self._voice_inventory_snapshot()
+            if resolved is None:
+                resolved = self._run_with_spinner_modal(
+                    title="Voice",
+                    message="Loading voices",
+                    task=self._resolve_voice_inventory_for_selection,
+                )
+            voice_entries, entry_by_label, current_label, load_warning = cast(
+                tuple[list[dict[str, Any]], dict[str, dict[str, Any]], str, bool],
+                resolved,
             )
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"WARN: Voice picker failed while loading voices: {exc}")
@@ -9760,98 +9040,6 @@ class LocalVideoMvpTui:
             self.config.include_intro = str(selected).strip().lower() == "on"
         return ConfigEditResult()
 
-    def _edit_external_editor_command_field(self, *, allow_escape: bool = False) -> ConfigEditResult:
-        current_value = str(self.config.external_editor_command).strip() or "code --wait {file}"
-        command_value, escaped = self._parse_escaped_modal_result(
-            self._prompt_input("External editor command", current_value, return_escaped=allow_escape)
-        )
-        if escaped:
-            return ConfigEditResult(escaped=True)
-        if command_value is None:
-            return ConfigEditResult()
-        candidate = str(command_value).strip()
-        if candidate and "{file}" not in candidate:
-            self._append_log("WARN: External editor command must include {file}. Keeping previous value.")
-            return ConfigEditResult(had_warning=True)
-        self.config.external_editor_command = candidate
-        return ConfigEditResult()
-
-    def _edit_thumbnail_comfyui_url_field(self, *, allow_escape: bool = False) -> ConfigEditResult:
-        current_value = str(getattr(self.config, "thumbnail_comfyui_url", THUMBNAIL_STUDIO_DEFAULT_COMFYUI_URL) or "").strip()
-        updated_value, escaped = self._parse_escaped_modal_result(
-            self._prompt_input("Thumbnail ComfyUI URL", current_value or THUMBNAIL_STUDIO_DEFAULT_COMFYUI_URL, return_escaped=allow_escape)
-        )
-        if escaped:
-            return ConfigEditResult(escaped=True)
-        if updated_value is None:
-            return ConfigEditResult()
-        candidate = str(updated_value).strip().rstrip("/")
-        if not candidate:
-            candidate = THUMBNAIL_STUDIO_DEFAULT_COMFYUI_URL
-        self.config.thumbnail_comfyui_url = candidate
-        return ConfigEditResult()
-
-    def _edit_thumbnail_comfyui_install_dir_field(self, *, allow_escape: bool = False) -> ConfigEditResult:
-        current_value = str(getattr(self.config, "thumbnail_comfyui_install_dir", "") or "").strip()
-        detected = self._detect_local_comfyui_install_dir()
-        default_value = current_value or (str(detected) if detected is not None else "")
-        updated_value, escaped = self._parse_escaped_modal_result(
-            self._prompt_input(
-                "Thumbnail ComfyUI install dir (CLEAR for auto-detect)",
-                default_value,
-                return_escaped=allow_escape,
-            )
-        )
-        if escaped:
-            return ConfigEditResult(escaped=True)
-        if updated_value is None:
-            return ConfigEditResult()
-        candidate = str(updated_value).strip()
-        if candidate.upper() == "CLEAR":
-            candidate = ""
-        if candidate:
-            resolved = Path(candidate).expanduser().resolve()
-            if not self._is_comfyui_install_dir(resolved):
-                self._append_log(f"WARN: ComfyUI install dir is invalid: {resolved}")
-                return ConfigEditResult(had_warning=True)
-            self.config.thumbnail_comfyui_install_dir = str(resolved)
-            self._comfyui_detected_install_dir = resolved
-            self._comfyui_detection_attempted = True
-            return ConfigEditResult()
-        self.config.thumbnail_comfyui_install_dir = ""
-        self._comfyui_detected_install_dir = None
-        self._comfyui_detection_attempted = False
-        return ConfigEditResult()
-
-    def _edit_thumbnail_export_dir_field(self, *, allow_escape: bool = False) -> ConfigEditResult:
-        current_value = str(getattr(self.config, "thumbnail_default_export_dir", THUMBNAIL_STUDIO_DEFAULT_EXPORT_DIR) or "").strip()
-        updated_value, escaped = self._parse_escaped_modal_result(
-            self._prompt_input("Thumbnail export folder", current_value or str(THUMBNAIL_STUDIO_DEFAULT_EXPORT_DIR), return_escaped=allow_escape)
-        )
-        if escaped:
-            return ConfigEditResult(escaped=True)
-        if updated_value is None:
-            return ConfigEditResult()
-        candidate = Path(str(updated_value).strip() or str(THUMBNAIL_STUDIO_DEFAULT_EXPORT_DIR)).expanduser().resolve()
-        self.config.thumbnail_default_export_dir = str(candidate)
-        return ConfigEditResult()
-
-    def _edit_thumbnail_ollama_hooks_field(self, *, allow_escape: bool = False) -> ConfigEditResult:
-        selected, escaped = self._parse_escaped_modal_result(
-            self._select_from_list(
-                label="Thumbnail Ollama hooks",
-                options=["On", "Off"],
-                current_value="On" if bool(getattr(self.config, "thumbnail_use_ollama_hooks", True)) else "Off",
-                marked_value="On" if bool(getattr(self.config, "thumbnail_use_ollama_hooks", True)) else "Off",
-                return_escaped=allow_escape,
-            )
-        )
-        if escaped:
-            return ConfigEditResult(escaped=True)
-        if selected is not None:
-            self.config.thumbnail_use_ollama_hooks = str(selected).strip().lower() == "on"
-        return ConfigEditResult()
-
     def _edit_named_config_field(self, field_name: str, *, allow_escape: bool = False) -> ConfigEditResult:
         if field_name == "lucky":
             return self._edit_lucky_field(allow_escape=allow_escape)
@@ -9889,16 +9077,6 @@ class LocalVideoMvpTui:
             return self._edit_voice_speed_field(allow_escape=allow_escape)
         if field_name == "intro":
             return self._edit_intro_title_card_field(allow_escape=allow_escape)
-        if field_name == "external_editor":
-            return self._edit_external_editor_command_field(allow_escape=allow_escape)
-        if field_name == "thumbnail_comfyui":
-            return self._edit_thumbnail_comfyui_url_field(allow_escape=allow_escape)
-        if field_name == "thumbnail_comfyui_install":
-            return self._edit_thumbnail_comfyui_install_dir_field(allow_escape=allow_escape)
-        if field_name == "thumbnail_export_dir":
-            return self._edit_thumbnail_export_dir_field(allow_escape=allow_escape)
-        if field_name == "thumbnail_ollama_hooks":
-            return self._edit_thumbnail_ollama_hooks_field(allow_escape=allow_escape)
         raise RuntimeError(f"Unknown config field editor: {field_name}")
 
     def _open_prompt_settings_menu(self) -> None:
@@ -9947,24 +9125,12 @@ class LocalVideoMvpTui:
             self._set_status("A command is already running.")
             return
 
-        current_option = f"Minutes: {self.config.minutes}"
+        current_option = f"Intro title card: {'On' if self.config.include_intro else 'Off'}"
 
         with self._modal_focus():
             while True:
                 options = [
-                    f"Minutes: {self.config.minutes}",
-                    f"Resolution: {self._resolution_label()}",
-                    "Subtitles",
-                    f"Voice: {self._voice_display_value()}",
-                    f"Voice profile: {self.config.voice_profile}",
-                    f"Voice speed: {self.config.voice_speed:.2f}",
                     f"Intro title card: {'On' if self.config.include_intro else 'Off'}",
-                    f"External editor: {self._external_editor_summary()}",
-                    f"Thumbnail ComfyUI: {self._thumbnail_comfyui_summary()}",
-                    f"Thumbnail export folder: {self._thumbnail_export_dir_summary()}",
-                    f"Thumbnail Ollama hooks: {self._thumbnail_ollama_hooks_summary()}",
-                    f"HITL: {'On' if self._hitl_enabled else 'Off'}",
-                    f"Fast mode: {'On' if self.config.fast_mode else 'Off'}",
                     f"Narration voice policy: {self._tts_policy_summary()}",
                     "Visual Assets",
                 ]
@@ -9980,107 +9146,11 @@ class LocalVideoMvpTui:
                 choice_value = cast(str, choice)
                 current_option = choice_value
 
-                if choice_value.startswith("Minutes:"):
-                    before = self._config_snapshot()
-                    result = self._edit_minutes_field()
-                    changed = self._commit_config_changes(before)
-                    self._report_config_edit(context="Settings", changed=changed, had_warning=result.had_warning)
-                    continue
-
-                if choice_value.startswith("Resolution:"):
-                    before = self._config_snapshot()
-                    result = self._edit_resolution_field()
-                    changed = self._commit_config_changes(before)
-                    self._report_config_edit(context="Settings", changed=changed, had_warning=result.had_warning)
-                    continue
-
-                if choice_value == "Subtitles":
-                    self._open_subtitle_settings_menu()
-                    continue
-
-                if choice_value.startswith("Voice:"):
-                    before = self._config_snapshot()
-                    result = self._edit_voice_field()
-                    changed = self._commit_config_changes(before)
-                    self._report_config_edit(context="Settings", changed=changed, had_warning=result.had_warning)
-                    continue
-
-                if choice_value.startswith("Voice profile:"):
-                    before = self._config_snapshot()
-                    result = self._edit_voice_profile_field()
-                    changed = self._commit_config_changes(before)
-                    self._report_config_edit(context="Settings", changed=changed, had_warning=result.had_warning)
-                    continue
-
-                if choice_value.startswith("Voice speed:"):
-                    before = self._config_snapshot()
-                    result = self._edit_voice_speed_field()
-                    changed = self._commit_config_changes(before)
-                    self._report_config_edit(context="Settings", changed=changed, had_warning=result.had_warning)
-                    continue
-
                 if choice_value.startswith("Intro title card:"):
                     before = self._config_snapshot()
                     result = self._edit_intro_title_card_field()
                     changed = self._commit_config_changes(before)
                     self._report_config_edit(context="Settings", changed=changed, had_warning=result.had_warning)
-                    continue
-
-                if choice_value.startswith("External editor:"):
-                    before = self._config_snapshot()
-                    result = self._edit_external_editor_command_field()
-                    changed = self._commit_config_changes(before)
-                    self._report_config_edit(context="Settings", changed=changed, had_warning=result.had_warning)
-                    continue
-
-                if choice_value.startswith("Thumbnail ComfyUI:"):
-                    self._open_thumbnail_comfyui_manager()
-                    continue
-
-                if choice_value.startswith("Thumbnail export folder:"):
-                    before = self._config_snapshot()
-                    result = self._edit_thumbnail_export_dir_field()
-                    changed = self._commit_config_changes(before)
-                    self._report_config_edit(context="Settings", changed=changed, had_warning=result.had_warning)
-                    continue
-
-                if choice_value.startswith("Thumbnail Ollama hooks:"):
-                    before = self._config_snapshot()
-                    result = self._edit_thumbnail_ollama_hooks_field()
-                    changed = self._commit_config_changes(before)
-                    self._report_config_edit(context="Settings", changed=changed, had_warning=result.had_warning)
-                    continue
-
-                if choice_value.startswith("HITL:"):
-                    if self._content_mode() == "news" and self._hitl_enabled:
-                        self._set_status("News mode requires HITL for source review. Keep HITL On or switch Content mode.")
-                        self._append_log("Settings: HITL remains On because news mode requires manual source review.")
-                        continue
-                    self._hitl_enabled = not self._hitl_enabled
-                    mode = "On" if self._hitl_enabled else "Off"
-                    if not self._hitl_enabled:
-                        with self._lock:
-                            self._pending_unique_asset_prompt = None
-                            self._pending_clip_review_prompt = None
-                            self._pending_stage_transition_prompt = None
-                            self._pending_source_review_prompt = None
-                            self._pending_script_review_prompt = None
-                            self._pending_shot_review_prompt = None
-                            self._pending_scene_review_prompt = None
-                    self._save_persisted_settings()
-                    self._set_status(f"Settings updated: HITL {mode}.")
-                    self._append_log(f"Settings: HITL set to {mode}.")
-                    continue
-
-                if choice_value.startswith("Fast mode:"):
-                    self.config.fast_mode = not self.config.fast_mode
-                    mode = "On" if self.config.fast_mode else "Off"
-                    self._save_persisted_settings()
-                    self._set_status(f"Settings updated: fast mode {mode}.")
-                    self._append_log(
-                        "Settings: fast mode set to "
-                        f"{mode} (shorter run, lower resolution, shorter bookends, burned subtitles kept on)."
-                    )
                     continue
 
                 if choice_value.startswith("Narration voice policy:"):
@@ -10099,7 +9169,7 @@ class LocalVideoMvpTui:
         live_config = self.config
         working_config = copy.deepcopy(self.config)
         before = self._config_snapshot()
-        steps = ["minutes", "resolution", "subtitles"]
+        steps = ["minutes", "resolution", "subtitles", "voice", "profile", "speed"]
         step_index = 0
         had_warning = False
 
@@ -10592,10 +9662,16 @@ class LocalVideoMvpTui:
     def _run_debug_voice_speaker_test(self) -> None:
         project_dir = self._resolve_debug_voice_project_dir()
         try:
-            entries, label_to_entry, current_label, _had_warning = self._run_with_spinner_modal(
-                title="Debug Voices",
-                message="Loading voices",
-                task=self._combined_voice_entries_for_selection,
+            resolved = self._voice_inventory_snapshot()
+            if resolved is None:
+                resolved = self._run_with_spinner_modal(
+                    title="Debug Voices",
+                    message="Loading voices",
+                    task=self._resolve_voice_inventory_for_selection,
+                )
+            entries, label_to_entry, current_label, _had_warning = cast(
+                tuple[list[dict[str, Any]], dict[str, dict[str, Any]], str, bool],
+                resolved,
             )
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"ERROR: Debug voices failed while loading voices: {exc}")
@@ -11064,7 +10140,7 @@ class LocalVideoMvpTui:
             return "EN-IN"
         return value
 
-    def _combined_voice_entries_for_selection(self) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], str, bool]:
+    def _build_voice_inventory_payload(self) -> dict[str, Any]:
         melo_speakers: list[str] = []
         had_warning = False
         try:
@@ -11103,12 +10179,12 @@ class LocalVideoMvpTui:
 
         entries = self._decorate_voice_selection_entries(entries)
         by_label = {str(item.get("label") or ""): item for item in entries if str(item.get("label") or "")}
-        current_label = self._current_voice_selection_label(entries)
-
-        if not current_label and entries:
-            current_label = str(entries[0].get("label") or "")
-
-        return entries, by_label, current_label, had_warning
+        return {
+            "entries": entries,
+            "entry_by_label": by_label,
+            "had_warning": had_warning,
+            "loaded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
 
     def _current_voice_selection_label(self, entries: list[dict[str, Any]]) -> str:
         engine = str(self.config.tts_engine or "melo").strip().lower()
@@ -11628,13 +10704,10 @@ class LocalVideoMvpTui:
             if replace_code == 0:
                 self._set_status("Replacement succeeded. Inspecting outputs...")
                 inspect_code = self._run_and_stream(self._build_inspect_command(), label="inspect")
-                exported_mp4, exported_thumbnail = self._export_project_outputs_to_downloads()
+                exported_mp4, _ = self._export_project_outputs_to_downloads()
 
                 if inspect_code == 0 and exported_mp4 is not None:
-                    if exported_thumbnail is not None:
-                        self._set_status("Replacement complete. MP4 and thumbnail exported to Downloads.")
-                    else:
-                        self._set_status(f"Replacement complete. MP4 exported to {exported_mp4.name}.")
+                    self._set_status(f"Replacement complete. MP4 exported to {exported_mp4.name}.")
                 elif inspect_code == 0:
                     self._set_status("Replacement complete. MP4 export skipped.")
                 else:
@@ -11731,42 +10804,45 @@ class LocalVideoMvpTui:
 
     def _clean_projects(self) -> None:
         if self._is_running():
-            self._set_status("Cannot clean workspaces while run is in progress.")
+            self._set_status("Cannot clean video packages while run is in progress.")
             return
 
-        workspaces = self._iter_project_workspaces()
-        if not workspaces:
-            self._set_status("No workspaces to clean.")
+        packages = self._iter_video_packages()
+        if not packages:
+            self._set_status("No video packages to clean.")
             return
 
-        selected = self._select_multiple_workspaces(workspaces)
+        selected = self._select_multiple_workspaces(packages)
         if selected is None:
             self._set_status("Cleanup cancelled.")
             return
         if not selected:
-            self._set_status("No workspaces selected.")
+            self._set_status("No video packages selected.")
             return
 
         deleted = 0
         failed = 0
-        selected_paths = [workspaces[index] for index in selected]
+        selected_paths = [packages[index] for index in selected]
 
         for path in selected_paths:
             try:
                 shutil.rmtree(path)
                 deleted += 1
-                self._append_log(f"Deleted workspace: {path}")
-                if self._active_project_dir is not None and path == self._active_project_dir:
+                self._append_log(f"Deleted video package: {path}")
+                if (
+                    self._active_project_dir is not None
+                    and resolve_video_package(self._active_project_dir).package_dir == path
+                ):
                     self._active_project_dir = None
                     self._pending_export_path = None
             except Exception as exc:  # noqa: BLE001
                 failed += 1
-                self._append_log(f"ERROR: Failed to delete workspace {path}: {exc}")
+                self._append_log(f"ERROR: Failed to delete video package {path}: {exc}")
 
         if failed > 0:
             self._set_status(f"Cleanup finished: deleted {deleted}, failed {failed}.")
         else:
-            self._set_status(f"Cleanup finished: deleted {deleted} workspace(s).")
+            self._set_status(f"Cleanup finished: deleted {deleted} video package(s).")
 
     def _select_multiple_labels(
         self,
@@ -11897,7 +10973,7 @@ class LocalVideoMvpTui:
                 except curses.error:
                     pass
 
-                title = self._trim_tail(" Clean Workspaces ", max(1, modal_width - 4))
+                title = self._trim_tail(" Clean Video Packages ", max(1, modal_width - 4))
                 footer = "Space mark | A all | Enter delete | Esc cancel"
                 try:
                     win.addstr(0, 2, title, self._attr("accent", bold=True))
@@ -12398,6 +11474,86 @@ class LocalVideoMvpTui:
             self._append_log(f"WARN: Melo speaker inventory unavailable for {language}: {exc}")
             return []
 
+    def _start_voice_inventory_preload(self, *, force: bool = False) -> None:
+        with self._lock:
+            if self._voice_inventory_loading:
+                return
+            if self._voice_inventory_cache is not None and not force:
+                return
+            self._voice_inventory_loading = True
+            self._voice_inventory_ready_event.clear()
+
+        thread = threading.Thread(target=self._preload_voice_inventory, daemon=True)
+        thread.start()
+
+    def _preload_voice_inventory(self) -> None:
+        try:
+            payload = self._build_voice_inventory_payload()
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"WARN: Voice inventory preload failed: {exc}")
+            with self._lock:
+                self._voice_inventory_cache = None
+                self._voice_inventory_loaded_at = None
+                self._voice_inventory_loading = False
+                self._voice_inventory_ready_event.set()
+            return
+
+        with self._lock:
+            self._voice_inventory_cache = payload
+            self._voice_inventory_loaded_at = time.monotonic()
+            self._voice_inventory_loading = False
+            self._voice_inventory_ready_event.set()
+
+    def _voice_inventory_snapshot(
+        self,
+    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], str, bool] | None:
+        with self._lock:
+            payload = self._voice_inventory_cache
+        if not isinstance(payload, dict):
+            return None
+
+        entries = payload.get("entries")
+        entry_by_label = payload.get("entry_by_label")
+        had_warning = bool(payload.get("had_warning"))
+        if not isinstance(entries, list) or not isinstance(entry_by_label, dict):
+            return None
+
+        current_label = self._current_voice_selection_label(entries)
+        if not current_label and entries:
+            current_label = str(entries[0].get("label") or "")
+        return entries, entry_by_label, current_label, had_warning
+
+    def _resolve_voice_inventory_for_selection(self) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], str, bool]:
+        snapshot = self._voice_inventory_snapshot()
+        if snapshot is not None:
+            return snapshot
+
+        should_wait = False
+        with self._lock:
+            should_wait = self._voice_inventory_loading
+        if should_wait:
+            self._voice_inventory_ready_event.wait()
+            snapshot = self._voice_inventory_snapshot()
+            if snapshot is not None:
+                return snapshot
+
+        payload = self._build_voice_inventory_payload()
+        with self._lock:
+            self._voice_inventory_cache = payload
+            self._voice_inventory_loaded_at = time.monotonic()
+            self._voice_inventory_loading = False
+            self._voice_inventory_ready_event.set()
+        entries = cast(list[dict[str, Any]], payload["entries"])
+        current_label = self._current_voice_selection_label(entries)
+        if not current_label and entries:
+            current_label = str(entries[0].get("label") or "")
+        return (
+            entries,
+            cast(dict[str, dict[str, Any]], payload["entry_by_label"]),
+            current_label,
+            bool(payload.get("had_warning")),
+        )
+
     def _piper_voice_option_entries(self) -> list[tuple[str, dict[str, Any]]]:
         options: list[tuple[str, dict[str, Any]]] = []
         for voice_meta in self.DEBUG_PIPER_VOICES:
@@ -12466,7 +11622,7 @@ class LocalVideoMvpTui:
             pass
 
     def _draw_hotkey_hint(self, *, row: int, width: int) -> None:
-        actions = ("Run", "YouTube", "Prompt", "Thumbnail", "Settings", "Clean", "Quit")
+        actions = ("Prompt", "Run", "YouTube", "Thumbnail", "Settings", "Clean", "Quit")
         normal_attr = self._attr("muted")
         hotkey_attr = self._attr("accent", bold=True) | curses.A_UNDERLINE
         col = 0
@@ -12643,6 +11799,201 @@ class LocalVideoMvpTui:
             return Path(configured).expanduser().resolve()
         return (Path.home() / ".imagine" / "tui_settings.json").resolve()
 
+    def _lucky_history_key(self, value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+    def _normalize_lucky_history_entries(
+        self,
+        raw_entries: Any,
+        *,
+        channel_key: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(raw_entries, list):
+            return []
+        normalized: list[dict[str, Any]] = []
+        for item in raw_entries:
+            if not isinstance(item, dict):
+                continue
+            decision = str(item.get("decision") or "").strip().lower()
+            if decision not in {"accept", "retry", "cancel"}:
+                continue
+            topic = re.sub(r"\s+", " ", str(item.get("topic") or "").strip())
+            brief = re.sub(r"\s+", " ", str(item.get("brief") or "").strip())
+            if not topic and not brief:
+                continue
+            entry: dict[str, Any] = {
+                "decision": decision,
+                "recorded_at": str(item.get("recorded_at") or dt.datetime.now(dt.timezone.utc).isoformat()).strip(),
+            }
+            if topic:
+                entry["topic"] = topic
+            if brief:
+                entry["brief"] = brief
+            resolved_channel = channel_key or str(item.get("channel") or "").strip()
+            if resolved_channel:
+                entry["channel"] = resolved_channel
+            normalized.append(entry)
+        return normalized[-self.LUCKY_HISTORY_LIMIT :]
+
+    def _load_lucky_history(self, payload: dict[str, Any]) -> None:
+        self._lucky_history = {"trending": [], "channels": {}}
+        history_payload = payload.get("lucky_history")
+        if not isinstance(history_payload, dict):
+            return
+        self._lucky_history["trending"] = self._normalize_lucky_history_entries(history_payload.get("trending"))
+        channels_payload = history_payload.get("channels")
+        if not isinstance(channels_payload, dict):
+            return
+        normalized_channels: dict[str, list[dict[str, Any]]] = {}
+        for raw_key, raw_entries in channels_payload.items():
+            channel_key = str(raw_key).strip()
+            if not channel_key:
+                continue
+            entries = self._normalize_lucky_history_entries(raw_entries, channel_key=channel_key)
+            if entries:
+                normalized_channels[channel_key] = entries
+        self._lucky_history["channels"] = normalized_channels
+
+    def _serialize_lucky_history(self) -> dict[str, Any]:
+        channels = cast(dict[str, list[dict[str, Any]]], self._lucky_history.get("channels") or {})
+        return {
+            "trending": list(cast(list[dict[str, Any]], self._lucky_history.get("trending") or [])),
+            "channels": {key: list(value) for key, value in sorted(channels.items()) if value},
+        }
+
+    def _lucky_history_entries(self, *, channel_key: str | None = None) -> list[dict[str, Any]]:
+        if channel_key:
+            channels = cast(dict[str, list[dict[str, Any]]], self._lucky_history.get("channels") or {})
+            return list(channels.get(channel_key, []))
+        return list(cast(list[dict[str, Any]], self._lucky_history.get("trending") or []))
+
+    def _recent_lucky_briefs(
+        self,
+        *,
+        channel_key: str | None = None,
+        decision: str | None = None,
+        limit: int | None = None,
+    ) -> list[str]:
+        resolved_limit = limit or self.LUCKY_CONTEXT_LIMIT
+        briefs: list[str] = []
+        seen: set[str] = set()
+        for entry in reversed(self._lucky_history_entries(channel_key=channel_key)):
+            if decision and str(entry.get("decision") or "").strip().lower() != decision:
+                continue
+            brief = re.sub(r"\s+", " ", str(entry.get("brief") or "").strip())
+            if not brief:
+                continue
+            key = self._lucky_history_key(brief)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            briefs.append(brief)
+            if len(briefs) >= resolved_limit:
+                break
+        return briefs
+
+    def _record_lucky_history(
+        self,
+        result: dict[str, Any],
+        *,
+        decision: str,
+        channel_key: str | None = None,
+    ) -> None:
+        normalized_decision = str(decision or "").strip().lower()
+        if normalized_decision not in {"accept", "retry", "cancel"}:
+            return
+        topic = ""
+        brief = ""
+        if channel_key:
+            brief = re.sub(r"\s+", " ", str(result.get("brief") or "").strip())
+        else:
+            topic = re.sub(r"\s+", " ", str(result.get("trend") or "").strip())
+            brief = re.sub(r"\s+", " ", str(result.get("video_brief") or "").strip())
+        if not topic and not brief:
+            return
+        entry: dict[str, Any] = {
+            "decision": normalized_decision,
+            "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        if topic:
+            entry["topic"] = topic
+        if brief:
+            entry["brief"] = brief
+        if channel_key:
+            entry["channel"] = channel_key
+            channels = cast(dict[str, list[dict[str, Any]]], self._lucky_history.setdefault("channels", {}))
+            history = channels.setdefault(channel_key, [])
+            history.append(entry)
+            channels[channel_key] = history[-self.LUCKY_HISTORY_LIMIT :]
+        else:
+            history = cast(list[dict[str, Any]], self._lucky_history.setdefault("trending", []))
+            history.append(entry)
+            self._lucky_history["trending"] = history[-self.LUCKY_HISTORY_LIMIT :]
+        self._save_persisted_settings()
+
+    def _select_next_lucky_trend(self, topics: list[str]) -> str | None:
+        unique_topics: list[str] = []
+        seen_topic_keys: set[str] = set()
+        for item in topics:
+            topic = re.sub(r"\s+", " ", str(item or "").strip())
+            if not topic:
+                continue
+            key = self._lucky_history_key(topic)
+            if not key or key in seen_topic_keys:
+                continue
+            seen_topic_keys.add(key)
+            unique_topics.append(topic)
+        if not unique_topics:
+            return None
+
+        trend_history = self._lucky_history_entries()
+        weighted_counts: dict[str, int] = {}
+        last_seen_index: dict[str, int] = {}
+        for idx, entry in enumerate(trend_history):
+            key = self._lucky_history_key(entry.get("topic"))
+            if not key:
+                continue
+            decision = str(entry.get("decision") or "").strip().lower()
+            weight = 3 if decision == "retry" else 2 if decision == "accept" else 1
+            weighted_counts[key] = weighted_counts.get(key, 0) + weight
+            last_seen_index[key] = idx
+
+        recent_history = trend_history[-self.LUCKY_RECENT_TOPIC_WINDOW :]
+        recent_keys = {self._lucky_history_key(entry.get("topic")) for entry in recent_history if entry.get("topic")}
+        rotation_seed = dt.datetime.now(dt.timezone.utc).date().isoformat()
+
+        def sort_key(topic: str) -> tuple[int, int, int, str]:
+            key = self._lucky_history_key(topic)
+            return (
+                1 if key in recent_keys else 0,
+                weighted_counts.get(key, 0),
+                last_seen_index.get(key, -1),
+                hashlib.sha256(f"{rotation_seed}:{key}".encode("utf-8")).hexdigest(),
+            )
+
+        ranked_topics = sorted(unique_topics, key=sort_key)
+        return ranked_topics[0] if ranked_topics else None
+
+    def _channel_lucky_history_prompt_block(self, channel_key: str) -> str:
+        recent_briefs = self._recent_lucky_briefs(channel_key=channel_key, limit=self.LUCKY_CONTEXT_LIMIT)
+        rejected_briefs = self._recent_lucky_briefs(channel_key=channel_key, decision="retry", limit=3)
+        sections: list[str] = []
+        if recent_briefs:
+            recent_lines = "\n".join(f"- {brief}" for brief in recent_briefs)
+            sections.append(
+                "Avoid repeating or lightly paraphrasing these recently tried concepts:\n"
+                f"{recent_lines}"
+            )
+        if rejected_briefs:
+            rejected_lines = "\n".join(f"- {brief}" for brief in rejected_briefs)
+            sections.append(
+                "These were rejected already. If you stay near them, improve the idea materially instead of rewording it:\n"
+                f"{rejected_lines}"
+            )
+        if not sections:
+            return ""
+        return "\n\n".join(sections) + "\n\n"
+
     def _load_persisted_settings(self) -> None:
         settings_path = self._settings_path()
         if not settings_path.exists():
@@ -12657,13 +12008,7 @@ class LocalVideoMvpTui:
         if not isinstance(payload, dict):
             return
 
-        hitl_value = payload.get("hitl_enabled")
-        if isinstance(hitl_value, bool):
-            self._hitl_enabled = hitl_value
-
-        fast_mode_value = payload.get("fast_mode")
-        if isinstance(fast_mode_value, bool):
-            self.config.fast_mode = fast_mode_value
+        self._load_lucky_history(payload)
 
         burn_subtitles_value = payload.get("burn_subtitles")
         if isinstance(burn_subtitles_value, bool):
@@ -12750,28 +12095,6 @@ class LocalVideoMvpTui:
         include_intro_value = payload.get("include_intro")
         if isinstance(include_intro_value, bool):
             self.config.include_intro = include_intro_value
-
-        external_editor_value = payload.get("external_editor_command")
-        if isinstance(external_editor_value, str):
-            self.config.external_editor_command = external_editor_value.strip()
-
-        thumbnail_comfyui_url_value = payload.get("thumbnail_comfyui_url")
-        if isinstance(thumbnail_comfyui_url_value, str):
-            self.config.thumbnail_comfyui_url = thumbnail_comfyui_url_value.strip().rstrip("/") or THUMBNAIL_STUDIO_DEFAULT_COMFYUI_URL
-
-        thumbnail_comfyui_install_dir_value = payload.get("thumbnail_comfyui_install_dir")
-        if isinstance(thumbnail_comfyui_install_dir_value, str):
-            self.config.thumbnail_comfyui_install_dir = str(Path(thumbnail_comfyui_install_dir_value.strip()).expanduser().resolve()) if thumbnail_comfyui_install_dir_value.strip() else ""
-
-        thumbnail_export_dir_value = payload.get("thumbnail_default_export_dir")
-        if isinstance(thumbnail_export_dir_value, str):
-            self.config.thumbnail_default_export_dir = str(
-                Path(thumbnail_export_dir_value.strip() or str(THUMBNAIL_STUDIO_DEFAULT_EXPORT_DIR)).expanduser().resolve()
-            )
-
-        thumbnail_ollama_hooks_value = payload.get("thumbnail_use_ollama_hooks")
-        if isinstance(thumbnail_ollama_hooks_value, bool):
-            self.config.thumbnail_use_ollama_hooks = thumbnail_ollama_hooks_value
 
         prompt_value = payload.get("prompt")
         if isinstance(prompt_value, str):
@@ -12924,10 +12247,8 @@ class LocalVideoMvpTui:
         settings_path = self._settings_path()
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "schema_version": 17,
+            "schema_version": 18,
             "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "hitl_enabled": bool(self._hitl_enabled),
-            "fast_mode": bool(self.config.fast_mode),
             "burn_subtitles": bool(self.config.burn_subtitles),
             "subtitle_preset": self._normalized_subtitle_preset(),
             "subtitle_position": self._normalized_subtitle_position(),
@@ -12945,17 +12266,6 @@ class LocalVideoMvpTui:
             "image_motion_style": self._normalized_image_motion_style(),
             "allow_attribution_required_assets": bool(self.config.allow_attribution_required_assets),
             "include_intro": bool(self.config.include_intro),
-            "external_editor_command": str(self.config.external_editor_command).strip(),
-            "thumbnail_comfyui_url": str(getattr(self.config, "thumbnail_comfyui_url", THUMBNAIL_STUDIO_DEFAULT_COMFYUI_URL) or "").strip()
-            or THUMBNAIL_STUDIO_DEFAULT_COMFYUI_URL,
-            "thumbnail_comfyui_install_dir": str(getattr(self.config, "thumbnail_comfyui_install_dir", "") or "").strip(),
-            "thumbnail_default_export_dir": str(
-                Path(
-                    str(getattr(self.config, "thumbnail_default_export_dir", THUMBNAIL_STUDIO_DEFAULT_EXPORT_DIR) or "").strip()
-                    or str(THUMBNAIL_STUDIO_DEFAULT_EXPORT_DIR)
-                ).expanduser().resolve()
-            ),
-            "thumbnail_use_ollama_hooks": bool(getattr(self.config, "thumbnail_use_ollama_hooks", True)),
             "prompt": self.config.prompt,
             "content_mode": self._content_mode(),
             "news_feed_urls": list(self.config.news_feed_urls),
@@ -12978,6 +12288,7 @@ class LocalVideoMvpTui:
             "kokoro_voice": self.config.kokoro_voice,
             "active_channel": self.config.active_channel,
             "script_language": self.config.script_language,
+            "lucky_history": self._serialize_lucky_history(),
         }
         settings_path.write_text(
             json.dumps(payload, indent=2, ensure_ascii=True, sort_keys=True) + "\n",
@@ -13030,8 +12341,6 @@ def run_tui(
     kokoro_lang_code: str,
     kokoro_voice: str,
     include_intro: bool = False,
-    external_editor_command: str = "",
-    fast_mode: bool = False,
 ) -> int:
     language_value = str(melo_language).strip().upper() or "EN"
     if language_value not in LocalVideoMvpTui.MELO_LANGUAGE_CHOICES:
@@ -13057,7 +12366,6 @@ def run_tui(
         caption_font_scale=normalize_caption_font_scale(caption_font_scale, 0.9),
         subtitle_bold=bool(subtitle_bold),
         subtitle_outline=bool(subtitle_outline),
-        fast_mode=bool(fast_mode),
         script_tone=str(script_tone).strip() or "conversational",
         target_audience=str(target_audience).strip() or "curious general audience",
         hook_style=str(hook_style).strip() or "surprising-fact",
@@ -13090,7 +12398,6 @@ def run_tui(
         kokoro_lang_code=kokoro_language_value,
         kokoro_voice=str(kokoro_voice).strip() or default_kokoro_voice(kokoro_language_value),
         include_intro=bool(include_intro),
-        external_editor_command=str(external_editor_command).strip(),
     )
     if config.tts_engine not in {"melo", "piper", "kokoro"}:
         config.tts_engine = "melo"

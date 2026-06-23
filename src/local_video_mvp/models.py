@@ -110,7 +110,6 @@ class PipelineConfig:
     news_min_approved_sources: int = 2
     news_jurisdiction: str = "us"
     news_require_manual_source_approval: bool = False
-    fast_mode: bool = False
     minutes: int = 5
     width: int = 1280
     height: int = 720
@@ -172,6 +171,7 @@ class PipelineConfig:
     brand_intro_image_path: str | None = None
     brand_outro_image_path: str | None = None
     brand_use_scene_fallback: bool = False
+    channel_profile: str | None = None
     channel_name: str = "IMAGINE"
     intro_tagline: str = ""
     outro_tagline: str = "Watch next"
@@ -460,7 +460,9 @@ class PlannedShot:
     shot_objective: str
     key_info: str
     required_entities: list[str] = field(default_factory=list)
+    matched_channel_terms: list[str] = field(default_factory=list)
     search_queries: list[str] = field(default_factory=list)
+    effective_search_queries: list[str] = field(default_factory=list)
     fallback_strategy: str = "internal-card"
     visual_type: str = "stock-video"
     match_confidence: str = "medium"
@@ -485,7 +487,9 @@ class PlannedShot:
             "shot_objective": self.shot_objective,
             "key_info": self.key_info,
             "required_entities": list(self.required_entities),
+            "matched_channel_terms": list(self.matched_channel_terms),
             "search_queries": list(self.search_queries),
+            "effective_search_queries": list(self.effective_search_queries),
             "fallback_strategy": self.fallback_strategy,
             "visual_type": self.visual_type,
             "match_confidence": normalize_shot_confidence(self.match_confidence, "medium"),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -113,6 +114,8 @@ def generate_video_concept_from_trend(
     ollama_model: str,
     ollama_base_url: str = "http://localhost:11434",
     timeout: int = 60,
+    recent_concepts: list[str] | None = None,
+    rejected_concepts: list[str] | None = None,
 ) -> dict[str, Any] | None:
     """
     Use Ollama LLM to generate complete video concept from trend.
@@ -126,44 +129,37 @@ def generate_video_concept_from_trend(
         ollama_model: Ollama model to use (e.g., "qwen2.5:14b")
         ollama_base_url: Base URL for Ollama server
         timeout: Maximum time to wait for response in seconds
+        recent_concepts: Recently tried concept briefs to avoid repeating
+        rejected_concepts: Recently rejected briefs that should be improved on, not paraphrased
 
     Returns:
         Dict with keys: video_brief, asset_keywords, script_profile, rationale
         Returns None on failure
     """
-    prompt = f"""You are a YouTube content strategist. Transform this trending topic into a compelling faceless explainer video concept.
+    recent_briefs = _clean_concept_briefs(recent_concepts)
+    rejected_briefs = _clean_concept_briefs(rejected_concepts)
+    recent_keys = {_concept_key(item) for item in recent_briefs}
+    retry_duplicate_brief: str | None = None
 
-Trending topic: {trend}
-
-Generate a video concept that:
-- Takes an educational/explainer angle on the trend
-- Avoids speculation and focuses on facts, context, or mechanisms
-- Would work well for a faceless YouTube video (no on-camera talent)
-- Is suitable for stock footage B-roll
-
-Return ONLY valid JSON (no markdown, no code blocks) with this structure:
-{{
-  "video_brief": "A 1-2 sentence video concept in the form of a topic prompt",
-  "asset_keywords": ["keyword1", "keyword2", "keyword3", "keyword4", "keyword5"],
-  "script_profile": "conversational|educational|narrative|energetic",
-  "rationale": "Brief explanation of why this angle works for the trend"
-}}
-
-The video_brief should be a clear, specific topic that can be used to generate a full script.
-The asset_keywords should be 5-7 visual search terms for stock footage.
-The script_profile should be one of: conversational, educational, narrative, or energetic.
-
-Return ONLY the JSON object, nothing else."""
-
-    try:
-        # Run ollama command
-        result = subprocess.run(
-            ["ollama", "run", ollama_model, prompt],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
+    for _attempt in range(2):
+        prompt = _build_video_concept_prompt(
+            trend=trend,
+            recent_briefs=recent_briefs,
+            rejected_briefs=rejected_briefs,
+            duplicate_brief=retry_duplicate_brief,
         )
+
+        try:
+            # Run ollama command
+            result = subprocess.run(
+                ["ollama", "run", ollama_model, prompt],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except Exception:
+            return None
 
         if result.returncode != 0:
             return None
@@ -172,17 +168,19 @@ Return ONLY the JSON object, nothing else."""
         response_text = result.stdout.strip()
         parsed = _extract_json_object(response_text)
 
-        if parsed is None:
+        if parsed is None or not _validate_concept_dict(parsed):
             return None
 
-        # Validate structure
-        if not _validate_concept_dict(parsed):
+        brief_key = _concept_key(parsed.get("video_brief"))
+        if brief_key and brief_key in recent_keys:
+            if retry_duplicate_brief is None:
+                retry_duplicate_brief = str(parsed.get("video_brief") or "").strip()
+                continue
             return None
 
         return parsed
 
-    except Exception:
-        return None
+    return None
 
 
 def extract_keywords_from_text(text: str, max_keywords: int = 7) -> list[str]:
@@ -300,3 +298,83 @@ def _validate_concept_dict(concept: dict[str, Any]) -> bool:
         return False
 
     return True
+
+
+def _build_video_concept_prompt(
+    *,
+    trend: str,
+    recent_briefs: list[str],
+    rejected_briefs: list[str],
+    duplicate_brief: str | None,
+) -> str:
+    recent_block = _format_brief_list("Previously tried concepts to avoid repeating", recent_briefs)
+    rejected_block = _format_brief_list(
+        "Recently rejected concepts to improve on without paraphrasing",
+        rejected_briefs,
+    )
+    duplicate_instruction = ""
+    if duplicate_brief:
+        duplicate_instruction = (
+            "\nThe last draft repeated this idea too closely, so do not reuse it:\n"
+            f"- {duplicate_brief}\n"
+            "Respond with a materially different angle, hook, or scope.\n"
+        )
+
+    return f"""You are a YouTube content strategist. Transform this trending topic into a compelling faceless explainer video concept.
+
+Trending topic: {trend}
+
+Generate a video concept that:
+- Takes an educational/explainer angle on the trend
+- Avoids speculation and focuses on facts, context, or mechanisms
+- Would work well for a faceless YouTube video (no on-camera talent)
+- Is suitable for stock footage B-roll
+- Feels meaningfully different from prior attempts when prior concepts are provided
+
+{recent_block}{rejected_block}{duplicate_instruction}
+Return ONLY valid JSON (no markdown, no code blocks) with this structure:
+{{
+  "video_brief": "A 1-2 sentence video concept in the form of a topic prompt",
+  "asset_keywords": ["keyword1", "keyword2", "keyword3", "keyword4", "keyword5"],
+  "script_profile": "conversational|educational|narrative|energetic",
+  "rationale": "Brief explanation of why this angle works for the trend"
+}}
+
+The video_brief should be a clear, specific topic that can be used to generate a full script.
+The asset_keywords should be 5-7 visual search terms for stock footage.
+The script_profile should be one of: conversational, educational, narrative, or energetic.
+
+Return ONLY the JSON object, nothing else."""
+
+
+def _clean_concept_briefs(briefs: list[str] | None, limit: int = 6) -> list[str]:
+    if not briefs:
+        return []
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in briefs:
+        cleaned = re.sub(r"\s+", " ", str(item or "").strip())
+        if not cleaned:
+            continue
+        key = _concept_key(cleaned)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(cleaned)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def _format_brief_list(label: str, briefs: list[str]) -> str:
+    if not briefs:
+        return ""
+    lines = "\n".join(f"- {brief}" for brief in briefs)
+    return f"{label}:\n{lines}\n\n"
+
+
+def _concept_key(value: Any) -> str:
+    cleaned = re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+    if not cleaned:
+        return ""
+    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()

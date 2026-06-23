@@ -158,23 +158,6 @@ def _coerce_str(value: Any, default: str) -> str:
     return default
 
 
-def _scaled_fast_mode_resolution(width: int, height: int) -> tuple[int, int]:
-    if width <= 0 or height <= 0:
-        return (640, 360)
-
-    scale = min(1.0, 640.0 / float(width), 360.0 / float(height))
-    if scale >= 1.0:
-        return (width, height)
-
-    scaled_width = max(2, int(width * scale))
-    scaled_height = max(2, int(height * scale))
-    if scaled_width % 2 != 0:
-        scaled_width -= 1
-    if scaled_height % 2 != 0:
-        scaled_height -= 1
-    return (max(2, scaled_width), max(2, scaled_height))
-
-
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -222,22 +205,6 @@ def _apply_default_brand_bookends(config: PipelineConfig) -> None:
     config.brand_intro_image_path = assets.get("brand_intro_image_path") or None
     config.brand_outro_image_path = assets.get("brand_outro_image_path") or None
     config.brand_use_scene_fallback = False
-
-
-def _apply_fast_mode_profile(config: PipelineConfig) -> None:
-    config.fast_mode = True
-    config.minutes = min(config.minutes, 1)
-    config.width, config.height = _scaled_fast_mode_resolution(config.width, config.height)
-    config.fps = min(config.fps, 24)
-    config.video_effects = "clean"
-    config.include_outro = True
-    config.intro_seconds = min(max(0.8, float(config.intro_seconds)), 1.2)
-    config.outro_seconds = min(max(1.0, float(config.outro_seconds)), 1.4)
-    config.caption_engine = "heuristic"
-    config.burn_subtitles = True
-    config.max_duration_adjust_passes = 0
-    config.require_external_assets = False
-    config.max_scenes = min(config.max_scenes, 6)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -303,13 +270,6 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--minutes", type=int, default=5, help="Target duration in minutes (default: 5)")
     run.add_argument("--resolution", default="1280x720", help="Output resolution, default 1280x720")
     run.add_argument("--fps", type=int, default=30, help="Output frame rate")
-    run.add_argument(
-        "--fast-mode",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use a faster debug profile (caps duration, lowers render cost, shortens bookends, keeps burned subtitles)",
-    )
-
     run.add_argument(
         "--script-engine",
         choices=["ollama", "template"],
@@ -395,6 +355,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--intro-seconds", type=float, default=2.8, help="Intro card duration in seconds")
     run.add_argument("--outro-seconds", type=float, default=3.0, help="Outro card duration in seconds")
     run.add_argument("--outro-text", default="Thanks for watching", help="Outro card text")
+    run.add_argument("--channel-profile", default="", help="Stable channel/profile key for channel-aware behavior")
     run.add_argument("--channel-name", default="IMAGINE", help="Brand/channel name used in intro/outro")
     run.add_argument("--intro-tagline", default="", help="Optional small intro tagline")
     run.add_argument("--outro-tagline", default="Watch next", help="Optional small outro tagline")
@@ -674,6 +635,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Optional zero-based candidate index from the stored shot shortlist",
     )
+    regenerate_shot.add_argument(
+        "--strict-query-override",
+        action="store_true",
+        help="Use only the provided shot search queries when regenerating this shot",
+    )
     regenerate_shot.add_argument("--verbose", action="store_true", help="Verbose pipeline logs")
 
     prepare_shot_candidates = subparsers.add_parser(
@@ -688,6 +654,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Optional repeatable search query override used to refresh the shortlist",
+    )
+    prepare_shot_candidates.add_argument(
+        "--strict-query-override",
+        action="store_true",
+        help="Use only the provided shot search queries when refreshing this shortlist",
     )
     prepare_shot_candidates.add_argument("--verbose", action="store_true", help="Verbose pipeline logs")
 
@@ -895,13 +866,6 @@ def build_parser() -> argparse.ArgumentParser:
     tui.add_argument("--tts-engine", choices=["melo", "piper", "kokoro"], default="melo", help="Initial TTS engine")
     tui.add_argument("--piper-voice-id", default="", help="Initial Piper voice id")
     tui.add_argument("--piper-speaker-id", type=int, help="Initial Piper speaker id")
-    tui.add_argument(
-        "--fast-mode",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Initial TUI fast/debug mode state",
-    )
-
     return parser
 
 
@@ -934,7 +898,6 @@ def run_command(args: argparse.Namespace) -> int:
         news_min_approved_sources=max(1, int(args.news_min_approved_sources)),
         news_jurisdiction="us",
         news_require_manual_source_approval=normalize_content_mode(args.content_mode, "explainer") == "news",
-        fast_mode=bool(args.fast_mode),
         minutes=max(1, args.minutes),
         width=width,
         height=height,
@@ -994,6 +957,7 @@ def run_command(args: argparse.Namespace) -> int:
         outro_seconds=outro_seconds,
         outro_text=str(args.outro_text).strip() or "Thanks for watching",
         outro_spoken_text="",
+        channel_profile=(str(args.channel_profile).strip().lower() or None),
         channel_name=str(args.channel_name).strip() or "IMAGINE",
         intro_tagline=str(args.intro_tagline).strip(),
         outro_tagline=str(args.outro_tagline).strip() or "Watch next",
@@ -1012,8 +976,6 @@ def run_command(args: argparse.Namespace) -> int:
         min_scene_seconds=max(1.0, float(args.min_scene_seconds)),
         verbose=bool(args.verbose),
     )
-    if config.fast_mode:
-        _apply_fast_mode_profile(config)
     _apply_default_brand_bookends(config)
 
     pipeline = VideoPipeline(config)
@@ -1121,7 +1083,6 @@ def replace_clips_command(args: argparse.Namespace) -> int:
         prompt=prompt,
         project_dir=project_dir,
         asset_keywords=keywords,
-        fast_mode=_coerce_bool(manifest_config.get("fast_mode"), False),
         minutes=max(1, _coerce_int(manifest_config.get("minutes"), 1)),
         width=width,
         height=height,
@@ -1205,6 +1166,7 @@ def replace_clips_command(args: argparse.Namespace) -> int:
         outro_seconds=max(0.0, _coerce_float(manifest_config.get("outro_seconds"), 0.0)),
         outro_text=_coerce_str(manifest_config.get("outro_text"), "Thanks for watching"),
         outro_spoken_text=_coerce_str(manifest_config.get("outro_spoken_text"), ""),
+        channel_profile=_coerce_str(manifest_config.get("channel_profile"), "") or None,
         channel_name=_coerce_str(manifest_config.get("channel_name"), "IMAGINE"),
         intro_tagline=_coerce_str(manifest_config.get("intro_tagline"), ""),
         outro_tagline=_coerce_str(manifest_config.get("outro_tagline"), "Watch next"),
@@ -1276,6 +1238,7 @@ def regenerate_shot_command(args: argparse.Namespace) -> int:
         key_info=(str(args.key_info).strip() or None),
         search_queries=[str(item).strip() for item in args.search_query or [] if str(item).strip()],
         candidate_index=args.candidate_index,
+        strict_query_override=bool(args.strict_query_override),
     )
     print("\nShot regenerated successfully:\n")
     for key in sorted(outputs):
@@ -1321,7 +1284,6 @@ def _pipeline_config_from_existing_project(project_dir: Path, *, verbose: bool) 
         project_dir=project_dir,
         content_mode=normalize_content_mode(manifest_config.get("content_mode"), "explainer"),
         asset_keywords=asset_keywords,
-        fast_mode=_coerce_bool(manifest_config.get("fast_mode"), False),
         minutes=max(1, _coerce_int(manifest_config.get("minutes"), 1)),
         width=width,
         height=height,
@@ -1341,6 +1303,7 @@ def _pipeline_config_from_existing_project(project_dir: Path, *, verbose: bool) 
         allow_attribution_required_assets=_coerce_bool(manifest_config.get("allow_attribution_required_assets"), True),
         asset_mode=_coerce_str(manifest_config.get("asset_mode"), "prefer-video"),
         image_motion_style=_normalize_image_motion_style(manifest_config.get("image_motion_style"), "slow"),
+        channel_profile=_coerce_str(manifest_config.get("channel_profile"), "") or None,
         tts_engine=_coerce_str(manifest_config.get("tts_engine"), "melo"),
         caption_engine=_coerce_str(manifest_config.get("caption_engine"), "heuristic"),
         caption_style=_coerce_str(manifest_config.get("caption_style"), "engagement"),
@@ -1389,6 +1352,7 @@ def prepare_shot_candidates_command(args: argparse.Namespace) -> int:
         str(args.shot_id).strip(),
         key_info=(str(args.key_info).strip() or None),
         search_queries=[str(item).strip() for item in args.search_query or [] if str(item).strip()],
+        strict_query_override=bool(args.strict_query_override),
     )
     print("\nShot candidates prepared successfully:\n")
     for key in sorted(outputs):
@@ -1628,7 +1592,6 @@ def youtube_publish_command(args: argparse.Namespace) -> int:
     print(f"- video_id: {report.get('video_id')}")
     print(f"- video_url: {report.get('video_url')}")
     print(f"- visibility: {report.get('visibility')}")
-    print(f"- thumbnail_uploaded: {'yes' if report.get('thumbnail_uploaded') else 'no'}")
     print(f"- captions_uploaded: {'yes' if report.get('captions_uploaded') else 'no'}")
     if report.get("publish_at"):
         print(f"- publish_at: {report.get('publish_at')}")
@@ -1883,7 +1846,6 @@ def tui_command(args: argparse.Namespace) -> int:
         tts_engine = "melo"
     piper_voice_id = str(args.piper_voice_id).strip()
     piper_speaker_id = args.piper_speaker_id
-    fast_mode = bool(args.fast_mode)
     subtitle_preset = normalize_subtitle_preset(args.subtitle_preset)
     subtitle_position = normalize_subtitle_position(args.subtitle_position)
     subtitle_accent_color = normalize_subtitle_accent_color(args.subtitle_accent_color)
@@ -1923,7 +1885,6 @@ def tui_command(args: argparse.Namespace) -> int:
         tts_engine=tts_engine,
         piper_voice_id=piper_voice_id,
         piper_speaker_id=piper_speaker_id,
-        fast_mode=fast_mode,
     )
 
 
@@ -1962,7 +1923,6 @@ def imagine_entry() -> int:
         tts_engine="melo",
         piper_voice_id="",
         piper_speaker_id=None,
-        fast_mode=False,
     )
 
 

@@ -181,14 +181,6 @@ local-video-mvp run \
 
 In news mode, source review is mandatory before `draft`. The TUI provides a `Source Review` modal for this, while CLI stages share the same review artifacts under `review/news_source_candidates.json` and `review/news_review_state.json`. After script approval, both news and non-news runs continue through `shot-plan`, which writes `review/shot_plan.json`, `review/shot_review_state.json`, and per-shot mini previews under `review/shots/<shot-id>/`.
 
-For quick debug loops, add `--fast-mode`. This applies a cheaper profile:
-
-- caps target duration to 1 minute
-- lowers render resolution/fps
-- switches captions to `heuristic`
-- keeps shorter intro/outro cards while keeping burned subtitles enabled
-- relaxes external asset requirement so placeholder paths can still complete
-
 Duration control defaults to a +/-25% tolerance around requested minutes.
 Short scripts are expanded during preflight before narration is synthesized. After a script is approved, the pipeline preserves that script and warns if the final narration lands outside the target window instead of rewriting it again.
 
@@ -211,6 +203,7 @@ Asset relevance control:
 
 - `--asset-keywords "cars, roads"` constrains footage search to those terms
 - when keywords are set, stock queries always include them
+- `--channel-profile refugio_da_fe` enables channel-aware visual vocabulary and short stock-query boosts for supported profiles
 - scene clips are assigned uniquely per run (no repeated stock clip across scenes)
 - `--asset-mode prefer-video|balanced|prefer-images|images-only` controls whether scenes should stay video-first or become image-led
 - `--image-motion-style static|slow|balanced|fast` controls how still-image scenes are animated during render
@@ -348,8 +341,9 @@ imagine
 
 Storage behavior with TUI defaults:
 
-- TUI auto-creates a run workspace under `~/.imagine/projects/<prompt-slug>-<timestamp>/`
-- after a successful run, TUI exports only the final MP4 to `~/Downloads/<prompt-slug>-<timestamp>.mp4`
+- TUI auto-creates a package under `/Users/rafaelbm/Imagine/<prompt-slug>-<timestamp>/`
+- the final uploadable video lives at `/Users/rafaelbm/Imagine/<prompt-slug>-<timestamp>/<prompt-slug>-<timestamp>.mp4`
+- supporting artifacts live under `/Users/rafaelbm/Imagine/<prompt-slug>-<timestamp>/metadata/`
 - when `projects/brand-kit/` is present, branded bookend assets are auto-discovered for optional use, but intro stays off unless you enable it
 
 If you want custom startup values, you can still use:
@@ -368,24 +362,21 @@ local-video-mvp tui \
 
 Key bindings:
 
-- `R`: open run preflight (`minutes -> resolution -> subtitles`) and then run/advance HITL flow (`draft -> script review -> shot plan -> shot review -> preview -> finalize`) for the active workspace
+- `R`: open run preflight (`minutes -> resolution -> subtitles`) and then run/advance the staged review flow (`draft -> script review -> shot plan -> shot review -> preview -> finalize`) for the active package
 - in `news` mode, `R` runs `sources -> source review -> draft -> script review -> shot plan -> shot review -> preview -> finalize`
-- `Y`: open the YouTube publish flow for finalized projects (`output/final.mp4`), including linked-account review, switch/disconnect, metadata editing, and thumbnail selection
-- `T`: open the standalone prompt-driven Thumbnail Studio, create thumbnail sessions from scratch, generate variants through local ComfyUI, and export the chosen result to Downloads
+- `Y`: open the YouTube publish flow for packaged videos in `/Users/rafaelbm/Imagine`, with inline auth status plus `S` switch-account and `D` disconnect shortcuts in the picker
+- `T`: open the standalone thumbnail generator, where Ollama proposes two selectable image prompts plus a custom prompt field before the app renders/exports a 16:9 thumbnail image
 - `P`: open the Prompt menu (`Video brief`, `Content mode`, `Script Profile`, `Asset keywords`, and `News sources` in `news` mode)
-- `S`: open settings (`Minutes`, `Resolution`, `Subtitles`, `Voice`, `Voice profile`, `Voice speed`, `Intro title card`, `External editor`, `Thumbnail ComfyUI`, `Thumbnail export folder`, `Thumbnail Ollama hooks`, `HITL`, `Fast mode`, `Narration voice policy`, and `Visual Assets`)
-- `C`: clean old auto-managed workspaces (`Space` marks, `A` selects all, `Enter` deletes)
+- `S`: open settings (`Intro title card`, `Narration voice policy`, and `Visual Assets`)
+- `C`: clean old packaged videos in `/Users/rafaelbm/Imagine` (`Space` marks, `A` selects all, `Enter` deletes the whole package folder)
 - `Q`: quit (stops active run first)
 
-The TUI persists the last values set through the `Prompt` menu, `Settings`, and Run preflight in `~/.imagine/tui_settings.json`, and reuses them on next launch unless the saved file is missing or invalid. The dedicated `Prompt` shortcut now stays small: `Video brief`, `Content mode`, `Script Profile`, `Asset keywords`, plus `News sources` when `Content mode` is `news`. `Script Profile` is a bundled preset that writes the hidden audience/hook/narrative/example settings for generation. When you switch to `news`, the TUI pre-fills a short curated RSS feed set that you can inspect and edit. Subtitle settings still include burned-subtitle on/off, a presentation preset (`regular`, `highlight-follow`, or `highlight-box-follow`), position (`bottom` or `mid-safe`), highlight text color selection from the built-in palette, a separate box background color selector for `highlight-box-follow`, stepped font-size presets, and bold/outline toggles. Asset policy still includes provider toggles for `Pexels` / `Pixabay`, experimental `Coverr` / `Vecteezy` fallbacks, still-image fallback, `asset mode` (`prefer video` through `images only`), `image motion style`, and whether attribution-required sources stay eligible. Voice preview now lives in `Settings -> Voice` (`Enter` selects, `Space` previews). Settings also include `Intro title card`, an `External editor` command template such as `code --wait {file}`, plus standalone thumbnail settings for `Thumbnail ComfyUI`, `Thumbnail export folder`, and `Thumbnail Ollama hooks`. `Thumbnail ComfyUI` is now a guided manager: it can review status, auto-detect an existing install, auto-start it on launch, install a managed local copy, and let you change the URL or install path without leaving the TUI. Narration settings now also surface a strict-safe TTS policy summary in the main UI plus a read-only policy modal in Settings.
+The TUI persists the last values set through the `Prompt` menu, `Settings`, and Run preflight in `~/.imagine/tui_settings.json`, and reuses them on next launch unless the saved file is missing or invalid. The dedicated `Prompt` shortcut now stays small: `Video brief`, `Content mode`, `Script Profile`, `Asset keywords`, plus `News sources` when `Content mode` is `news`. `Script Profile` is a bundled preset that writes the hidden audience/hook/narrative/example settings for generation. When you switch to `news`, the TUI pre-fills a short curated RSS feed set that you can inspect and edit. Run preflight owns the per-run controls for minutes, resolution, subtitles, and voice selection. Subtitle settings still include burned-subtitle on/off, a presentation preset (`regular`, `highlight-follow`, or `highlight-box-follow`), position (`bottom` or `mid-safe`), highlight text color selection from the built-in palette, a separate box background color selector for `highlight-box-follow`, stepped font-size presets, and bold/outline toggles. Asset policy still includes provider toggles for `Pexels` / `Pixabay`, experimental `Coverr` / `Vecteezy` fallbacks, still-image fallback, `asset mode` (`prefer video` through `images only`), `image motion style`, and whether attribution-required sources stay eligible. Settings now focus on `Intro title card`, fast-mode behavior, the read-only narration policy view, and visual-asset policy.
 
 YouTube caption upload now follows the subtitle policy more closely:
 
 - if `Burned subtitles` is `Off`, new YouTube drafts default `Upload YouTube captions` to `On`
 - if `Burned subtitles` is `On`, new YouTube drafts default `Upload YouTube captions` to `Off`
-- finalized projects now auto-generate `output/thumbnail_yt.jpg`, so `Publish now` has a default thumbnail even if you never opened the thumbnail editor
-- `Edit thumbnail` in YouTube publish now opens a Pillow-powered Thumbnail Studio for generated thumbnails, with hook suggestions, style presets, optional badge text, text plate contrast control, text/color/size/alignment/position controls, background regeneration, inline preview, quick CTR diagnostics, and an `Open in external editor` round-trip through `publish/thumbnail_work.png`
-- oversized or unsupported thumbnails are auto-converted to an upload-safe JPEG before YouTube publish when `ffmpeg` is available
 - caption upload requires the OAuth token to include `youtube.force-ssl`
 - Shot Review now shows a miniature preview for the currently highlighted shot in the blocked-shot list, using the selected image directly or a still frame from the selected video before you open the shot
 
@@ -395,12 +386,13 @@ The TUI uses checkpoint modals between stages. In `news` mode it starts with `So
 - `Approve` the shot
 - `Regenerate` tries the next unused video clip
 - `Try still image` tries the next unused still image
-- `Refine keywords` opens the manual key-info/keyword editor
+- `Override keywords` refreshes the shot pool from only the manual shot keywords and demotes previously rejected assets for that shot
+- supported channel profiles now also show matched channel terms and effective stock queries in Shot Review so off-theme search behavior is easier to spot
 - use `Esc` to leave the shot modal and return to the blocked queue
 
 When a manifest is written, the pipeline also exports `publish/youtube_description_credits.txt`. That file contains a YouTube-description-ready credits block plus optional provenance lines, and new YouTube drafts append any required credits block automatically.
 
-After a successful finalize/full/replacement export from TUI, Downloads now gets both the video (`<project>.mp4`) and a separate thumbnail image (`<project>-thumbnail.jpg` when auto-generated).
+After a successful finalize/full/replacement export from TUI, the package root gets the canonical video file (`/Users/rafaelbm/Imagine/<video-id>/<video-id>.mp4`).
 
 Preview is prompted only after shot approval. After preview rendering, TUI leaves the workflow at the finalize checkpoint and shows the `review/preview.mp4` path so you can inspect it in your preferred player before pressing `R` to continue.
 

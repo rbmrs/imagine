@@ -37,174 +37,14 @@ except Exception:  # noqa: BLE001
 
 YOUTUBE_VISIBILITY_CHOICES = ("private", "unlisted", "public")
 YOUTUBE_CATEGORY_DEFAULT = "Education"
-YOUTUBE_DRAFT_SCHEMA_VERSION = 4
+YOUTUBE_DRAFT_SCHEMA_VERSION = 5
 YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 YOUTUBE_FORCE_SSL_SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl"
 YOUTUBE_DEFAULT_SCOPES = (YOUTUBE_UPLOAD_SCOPE,)
 YOUTUBE_OAUTH_TIMEOUT_SECONDS = 300
 YOUTUBE_RESUMABLE_CHUNK_BYTES = 8 * 1024 * 1024
-YOUTUBE_THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024
-YOUTUBE_DEFAULT_THUMBNAIL_PATH = Path("output") / "thumbnail_yt.jpg"
-YOUTUBE_WORKING_THUMBNAIL_PATH = Path("publish") / "thumbnail_work.png"
-YOUTUBE_THUMBNAIL_CANVAS_SIZE = (1280, 720)
-YOUTUBE_THUMBNAIL_PRIMARY_BADGE_FILL = "#D62728"
-YOUTUBE_THUMBNAIL_PRIMARY_BADGE_TEXT = "#FFFFFF"
-YOUTUBE_THUMBNAIL_FONT_COLOR_CHOICES = (
-    "white",
-    "sunflower",
-    "mint",
-    "coral",
-    "sky",
-    "tangerine",
-    "black",
-)
-YOUTUBE_THUMBNAIL_OUTLINE_COLOR_CHOICES = (
-    "charcoal",
-    "black",
-    "midnight",
-    "navy",
-    "crimson",
-)
-YOUTUBE_THUMBNAIL_FONT_SIZE_CHOICES = ("small", "medium", "large", "extra-large")
-YOUTUBE_THUMBNAIL_TEXT_PLATE_CHOICES = ("none", "soft", "strong")
-YOUTUBE_THUMBNAIL_ANCHOR_CHOICES = (
-    "top-left",
-    "top-center",
-    "top-right",
-    "center-left",
-    "center",
-    "center-right",
-    "bottom-left",
-    "bottom-center",
-    "bottom-right",
-)
-YOUTUBE_THUMBNAIL_TEXT_ALIGN_CHOICES = ("left", "center", "right")
-YOUTUBE_THUMBNAIL_DEFAULT_FONT_COLOR = "white"
-YOUTUBE_THUMBNAIL_DEFAULT_OUTLINE_COLOR = "charcoal"
-YOUTUBE_THUMBNAIL_DEFAULT_FONT_SIZE = "medium"
-YOUTUBE_THUMBNAIL_DEFAULT_ANCHOR = "bottom-left"
-YOUTUBE_THUMBNAIL_DEFAULT_TEXT_ALIGN = "left"
-YOUTUBE_THUMBNAIL_DEFAULT_TEXT_PLATE = "soft"
-YOUTUBE_THUMBNAIL_MAX_OFFSET = 240
-YOUTUBE_THUMBNAIL_VARIANT_FRACTIONS = (0.16, 0.32, 0.52, 0.68, 0.82)
-YOUTUBE_ALLOWED_THUMBNAIL_MIME_TYPES = frozenset(
-    {
-        "image/jpeg",
-        "image/png",
-        "image/gif",
-        "image/bmp",
-    }
-)
-YOUTUBE_THUMBNAIL_SCALE_STEPS = (
-    (1280, 720),
-    (1024, 576),
-    (854, 480),
-    (640, 360),
-)
-YOUTUBE_THUMBNAIL_JPEG_QUALITIES = (4, 6, 8, 10, 12, 16, 20, 24, 28)
 YOUTUBE_CATEGORY_IDS = {
     "Education": "27",
-}
-YOUTUBE_THUMBNAIL_COLOR_VALUES = {
-    "white": "0xFFFFFF",
-    "sunflower": "0xFFD54A",
-    "mint": "0xB8F2C8",
-    "coral": "0xFF7663",
-    "sky": "0x7FD7FF",
-    "tangerine": "0xFF9A3C",
-    "black": "0x090909",
-    "charcoal": "0x111111",
-    "midnight": "0x152238",
-    "navy": "0x16324F",
-    "crimson": "0x7A1428",
-}
-YOUTUBE_THUMBNAIL_FONT_SIZE_MULTIPLIERS = {
-    "small": 0.82,
-    "medium": 1.0,
-    "large": 1.24,
-    "extra-large": 1.48,
-}
-YOUTUBE_THUMBNAIL_FONTFILE_CANDIDATES = (
-    "/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf",
-    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-    "/System/Library/Fonts/Supplemental/Trebuchet MS Bold.ttf",
-    "/Library/Fonts/Arial Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-)
-
-_STOP_WORDS = {
-    "a",
-    "an",
-    "and",
-    "are",
-    "as",
-    "at",
-    "be",
-    "by",
-    "for",
-    "from",
-    "how",
-    "in",
-    "into",
-    "is",
-    "it",
-    "of",
-    "on",
-    "or",
-    "that",
-    "the",
-    "their",
-    "this",
-    "to",
-    "was",
-    "what",
-    "why",
-    "with",
-    "ao",
-    "aos",
-    "as",
-    "com",
-    "como",
-    "da",
-    "das",
-    "de",
-    "do",
-    "dos",
-    "e",
-    "em",
-    "na",
-    "nas",
-    "no",
-    "nos",
-    "o",
-    "os",
-    "para",
-    "pela",
-    "pelas",
-    "pelo",
-    "pelos",
-    "por",
-    "que",
-    "se",
-    "sem",
-    "sobre",
-    "um",
-    "uma",
-}
-_THUMBNAIL_TEXT_REPLACEMENTS = {
-    "\u00a0": " ",
-    "\u200b": " ",
-    "\u200c": "",
-    "\u200d": "",
-    "\ufeff": "",
-    "\u2018": "'",
-    "\u2019": "'",
-    "\u201c": '"',
-    "\u201d": '"',
-    "\u2013": "-",
-    "\u2014": "-",
-    "\u2026": "...",
 }
 
 
@@ -223,6 +63,7 @@ class YouTubePublishDraft:
     project_dir: str = ""
     video_path: str = ""
     captions_path: str | None = None
+    thumbnail_path: str | None = None
     title: str = ""
     title_suggestions: list[str] = field(default_factory=list)
     description: str = ""
@@ -231,20 +72,6 @@ class YouTubePublishDraft:
     tags: list[str] = field(default_factory=list)
     category: str = YOUTUBE_CATEGORY_DEFAULT
     upload_captions: bool = False
-    thumbnail_path: str | None = None
-    thumbnail_source: str = "none"
-    thumbnail_prompt: str = ""
-    thumbnail_text: str = ""
-    thumbnail_badge_text: str = ""
-    thumbnail_font_color: str = YOUTUBE_THUMBNAIL_DEFAULT_FONT_COLOR
-    thumbnail_outline_color: str = YOUTUBE_THUMBNAIL_DEFAULT_OUTLINE_COLOR
-    thumbnail_font_size_mode: str = YOUTUBE_THUMBNAIL_DEFAULT_FONT_SIZE
-    thumbnail_anchor: str = YOUTUBE_THUMBNAIL_DEFAULT_ANCHOR
-    thumbnail_offset_x: int = 0
-    thumbnail_offset_y: int = 0
-    thumbnail_text_align: str = YOUTUBE_THUMBNAIL_DEFAULT_TEXT_ALIGN
-    thumbnail_text_plate: str = YOUTUBE_THUMBNAIL_DEFAULT_TEXT_PLATE
-    thumbnail_background_variant: int = 0
     updated_at: str = ""
 
     @classmethod
@@ -255,6 +82,7 @@ class YouTubePublishDraft:
             project_dir=str(payload.get("project_dir") or "").strip(),
             video_path=str(payload.get("video_path") or "").strip(),
             captions_path=_optional_str(payload.get("captions_path")),
+            thumbnail_path=_optional_str(payload.get("thumbnail_path")),
             title=str(payload.get("title") or "").strip(),
             title_suggestions=_string_list(payload.get("title_suggestions")),
             description=str(payload.get("description") or "").strip(),
@@ -263,28 +91,6 @@ class YouTubePublishDraft:
             tags=_string_list(payload.get("tags")),
             category=str(payload.get("category") or YOUTUBE_CATEGORY_DEFAULT).strip() or YOUTUBE_CATEGORY_DEFAULT,
             upload_captions=bool(payload.get("upload_captions")),
-            thumbnail_path=_optional_str(payload.get("thumbnail_path")),
-            thumbnail_source=str(payload.get("thumbnail_source") or "none").strip() or "none",
-            thumbnail_prompt=str(payload.get("thumbnail_prompt") or "").strip(),
-            thumbnail_text=str(payload.get("thumbnail_text") or payload.get("thumbnail_prompt") or "").strip(),
-            thumbnail_badge_text=str(payload.get("thumbnail_badge_text") or "").strip(),
-            thumbnail_font_color=_normalize_thumbnail_color(
-                payload.get("thumbnail_font_color"),
-                YOUTUBE_THUMBNAIL_DEFAULT_FONT_COLOR,
-                choices=YOUTUBE_THUMBNAIL_FONT_COLOR_CHOICES,
-            ),
-            thumbnail_outline_color=_normalize_thumbnail_color(
-                payload.get("thumbnail_outline_color"),
-                YOUTUBE_THUMBNAIL_DEFAULT_OUTLINE_COLOR,
-                choices=YOUTUBE_THUMBNAIL_OUTLINE_COLOR_CHOICES,
-            ),
-            thumbnail_font_size_mode=_normalize_thumbnail_font_size_mode(payload.get("thumbnail_font_size_mode")),
-            thumbnail_anchor=_normalize_thumbnail_anchor(payload.get("thumbnail_anchor")),
-            thumbnail_offset_x=_normalize_thumbnail_offset(payload.get("thumbnail_offset_x")),
-            thumbnail_offset_y=_normalize_thumbnail_offset(payload.get("thumbnail_offset_y")),
-            thumbnail_text_align=_normalize_thumbnail_text_align(payload.get("thumbnail_text_align")),
-            thumbnail_text_plate=_normalize_thumbnail_text_plate(payload.get("thumbnail_text_plate")),
-            thumbnail_background_variant=max(0, _coerce_non_negative_int(payload.get("thumbnail_background_variant"))),
             updated_at=str(payload.get("updated_at") or "").strip(),
         )
 
@@ -293,42 +99,61 @@ class YouTubePublishDraft:
         payload["visibility"] = _normalize_visibility(self.visibility)
         payload["title_suggestions"] = _dedupe_strings(self.title_suggestions)
         payload["tags"] = _dedupe_strings(self.tags)
-        payload["thumbnail_font_color"] = _normalize_thumbnail_color(
-            self.thumbnail_font_color,
-            YOUTUBE_THUMBNAIL_DEFAULT_FONT_COLOR,
-            choices=YOUTUBE_THUMBNAIL_FONT_COLOR_CHOICES,
-        )
-        payload["thumbnail_outline_color"] = _normalize_thumbnail_color(
-            self.thumbnail_outline_color,
-            YOUTUBE_THUMBNAIL_DEFAULT_OUTLINE_COLOR,
-            choices=YOUTUBE_THUMBNAIL_OUTLINE_COLOR_CHOICES,
-        )
-        payload["thumbnail_font_size_mode"] = _normalize_thumbnail_font_size_mode(self.thumbnail_font_size_mode)
-        payload["thumbnail_anchor"] = _normalize_thumbnail_anchor(self.thumbnail_anchor)
-        payload["thumbnail_offset_x"] = _normalize_thumbnail_offset(self.thumbnail_offset_x)
-        payload["thumbnail_offset_y"] = _normalize_thumbnail_offset(self.thumbnail_offset_y)
-        payload["thumbnail_text_align"] = _normalize_thumbnail_text_align(self.thumbnail_text_align)
-        payload["thumbnail_text_plate"] = _normalize_thumbnail_text_plate(self.thumbnail_text_plate)
-        payload["thumbnail_background_variant"] = max(0, _coerce_non_negative_int(self.thumbnail_background_variant))
-        payload["thumbnail_text"] = str(self.thumbnail_text or self.thumbnail_prompt or "").strip()
-        payload["thumbnail_badge_text"] = str(self.thumbnail_badge_text or "").strip()
         return payload
 
 
-@dataclass
-class PreparedYouTubeThumbnail:
-    path: Path
-    mime_type: str
-    source_path: Path
-    source_size_bytes: int
-    upload_size_bytes: int
-    optimized: bool
-    optimization_reason: str | None = None
-    cleanup_path: Path | None = None
+@dataclass(frozen=True)
+class VideoPackagePaths:
+    package_dir: Path
+    metadata_dir: Path
+    video_path: Path
+    captions_path: Path
+    prompt_path: Path
+    script_path: Path
+    timeline_path: Path
+    rights_manifest_path: Path
+    run_report_path: Path
+    run_log_path: Path
+    review_dir: Path
+    publish_dir: Path
+    output_dir: Path
+
+
+def resolve_video_package(path: Path) -> VideoPackagePaths:
+    resolved = path.expanduser().resolve()
+    if resolved.suffix.lower() == ".mp4":
+        package_dir = resolved.parent
+        video_path = resolved
+    elif resolved.name == "metadata":
+        package_dir = resolved.parent
+        video_path = package_dir / f"{package_dir.name}.mp4"
+    elif (resolved / "metadata").exists():
+        package_dir = resolved
+        video_path = package_dir / f"{package_dir.name}.mp4"
+    else:
+        package_dir = resolved.parent
+        video_path = package_dir / f"{package_dir.name}.mp4"
+
+    metadata_dir = package_dir / "metadata"
+    return VideoPackagePaths(
+        package_dir=package_dir,
+        metadata_dir=metadata_dir,
+        video_path=video_path,
+        captions_path=metadata_dir / "final.srt",
+        prompt_path=metadata_dir / "prompt.txt",
+        script_path=metadata_dir / "script.json",
+        timeline_path=metadata_dir / "timeline.json",
+        rights_manifest_path=metadata_dir / "rights_manifest.json",
+        run_report_path=metadata_dir / "run_report.json",
+        run_log_path=metadata_dir / "run.log",
+        review_dir=metadata_dir / "review",
+        publish_dir=metadata_dir / "publish",
+        output_dir=metadata_dir / "output",
+    )
 
 
 def youtube_publish_dir(project_dir: Path) -> Path:
-    return project_dir.expanduser().resolve() / "publish"
+    return resolve_video_package(project_dir).publish_dir
 
 
 def youtube_draft_path(project_dir: Path) -> Path:
@@ -337,10 +162,6 @@ def youtube_draft_path(project_dir: Path) -> Path:
 
 def youtube_report_path(project_dir: Path) -> Path:
     return youtube_publish_dir(project_dir) / "youtube_report.json"
-
-
-def youtube_thumbnail_work_path(project_dir: Path) -> Path:
-    return project_dir.expanduser().resolve() / YOUTUBE_WORKING_THUMBNAIL_PATH
 
 
 def youtube_auth_client_secrets_path() -> Path:
@@ -660,390 +481,15 @@ def save_youtube_publish_draft(draft: YouTubePublishDraft) -> Path:
     return draft_path
 
 
-def ensure_project_youtube_thumbnail(
+def build_youtube_publish_draft(
     project_dir: Path,
     *,
-    prompt_text: str = "",
-    overwrite: bool = False,
-    notify: Callable[[str], None] | None = None,
-) -> Path | None:
-    resolved_project_dir = project_dir.expanduser().resolve()
-    existing_thumbnail = _detect_thumbnail_path(resolved_project_dir)
-    if existing_thumbnail is not None and not overwrite:
-        return existing_thumbnail
-
-    final_mp4 = resolved_project_dir / "output" / "final.mp4"
-    if not final_mp4.exists():
-        return existing_thumbnail
-
-    return render_project_youtube_thumbnail(
-        resolved_project_dir,
-        thumbnail_text=_default_thumbnail_text(resolved_project_dir, fallback_prompt=prompt_text),
-        thumbnail_badge_text="",
-        font_color=YOUTUBE_THUMBNAIL_DEFAULT_FONT_COLOR,
-        outline_color=YOUTUBE_THUMBNAIL_DEFAULT_OUTLINE_COLOR,
-        font_size_mode=YOUTUBE_THUMBNAIL_DEFAULT_FONT_SIZE,
-        anchor=YOUTUBE_THUMBNAIL_DEFAULT_ANCHOR,
-        offset_x=0,
-        offset_y=0,
-        text_align=YOUTUBE_THUMBNAIL_DEFAULT_TEXT_ALIGN,
-        text_plate=YOUTUBE_THUMBNAIL_DEFAULT_TEXT_PLATE,
-        background_variant=0,
-        notify=notify,
-    ) or existing_thumbnail
-
-
-def render_youtube_thumbnail_for_draft(
-    draft: YouTubePublishDraft,
-    *,
-    notify: Callable[[str], None] | None = None,
-) -> Path | None:
-    project_dir = Path(draft.project_dir).expanduser().resolve()
-    thumbnail_text = str(draft.thumbnail_text or draft.thumbnail_prompt or draft.title or "").strip()
-    rendered_path = render_project_youtube_thumbnail(
-        project_dir,
-        thumbnail_text=thumbnail_text,
-        thumbnail_badge_text=str(draft.thumbnail_badge_text or "").strip(),
-        font_color=draft.thumbnail_font_color,
-        outline_color=draft.thumbnail_outline_color,
-        font_size_mode=draft.thumbnail_font_size_mode,
-        anchor=draft.thumbnail_anchor,
-        offset_x=draft.thumbnail_offset_x,
-        offset_y=draft.thumbnail_offset_y,
-        text_align=draft.thumbnail_text_align,
-        text_plate=draft.thumbnail_text_plate,
-        background_variant=draft.thumbnail_background_variant,
-        notify=notify,
-    )
-    if rendered_path is None:
-        return None
-    draft.thumbnail_path = str(rendered_path)
-    draft.thumbnail_source = "generated"
-    draft.thumbnail_prompt = thumbnail_text
-    draft.thumbnail_text = thumbnail_text
-    return rendered_path
-
-
-def render_project_youtube_thumbnail(
-    project_dir: Path,
-    *,
-    thumbnail_text: str,
-    thumbnail_badge_text: str,
-    font_color: str,
-    outline_color: str,
-    font_size_mode: str,
-    anchor: str,
-    offset_x: int,
-    offset_y: int,
-    text_align: str,
-    text_plate: str,
-    background_variant: int,
-    notify: Callable[[str], None] | None = None,
-    output_path: Path | None = None,
-) -> Path | None:
-    resolved_project_dir = project_dir.expanduser().resolve()
-    resolved_output_path = (output_path or (resolved_project_dir / YOUTUBE_DEFAULT_THUMBNAIL_PATH)).resolve()
-    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if Image is not None and ImageDraw is not None and ImageFont is not None:
-        rendered = _render_project_youtube_thumbnail_pillow(
-            resolved_project_dir,
-            thumbnail_text=thumbnail_text,
-            thumbnail_badge_text=thumbnail_badge_text,
-            font_color=font_color,
-            outline_color=outline_color,
-            font_size_mode=font_size_mode,
-            anchor=anchor,
-            offset_x=offset_x,
-            offset_y=offset_y,
-            text_align=text_align,
-            text_plate=text_plate,
-            background_variant=background_variant,
-            notify=notify,
-            output_path=resolved_output_path,
-        )
-        if rendered is not None:
-            return rendered
-        if notify is not None:
-            notify("WARN: Pillow thumbnail compositor failed; falling back to ffmpeg legacy renderer.")
-
-    return _render_project_youtube_thumbnail_ffmpeg_legacy(
-        resolved_project_dir,
-        thumbnail_text=thumbnail_text,
-        font_color=font_color,
-        outline_color=outline_color,
-        font_size_mode=font_size_mode,
-        anchor=anchor,
-        offset_x=offset_x,
-        offset_y=offset_y,
-        text_align=text_align,
-        text_plate=text_plate,
-        background_variant=background_variant,
-        notify=notify,
-        output_path=resolved_output_path,
-    )
-
-
-def _render_project_youtube_thumbnail_ffmpeg_legacy(
-    project_dir: Path,
-    *,
-    thumbnail_text: str,
-    font_color: str,
-    outline_color: str,
-    font_size_mode: str,
-    anchor: str,
-    offset_x: int,
-    offset_y: int,
-    text_align: str,
-    text_plate: str,
-    background_variant: int,
-    notify: Callable[[str], None] | None = None,
-    output_path: Path | None = None,
-) -> Path | None:
-    ffmpeg_bin = shutil.which("ffmpeg")
-    if ffmpeg_bin is None:
-        if notify is not None:
-            notify("WARN: ffmpeg not found; skipping YouTube thumbnail rendering.")
-        return None
-
-    resolved_output_path = (output_path or (project_dir / YOUTUBE_DEFAULT_THUMBNAIL_PATH)).resolve()
-    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    width = 1280
-    height = 720
-    wrapped_text = _wrap_youtube_thumbnail_text(thumbnail_text)
-    title_lines = [line for line in wrapped_text.splitlines() if line.strip()] or ["WHY THIS MATTERS NOW"]
-    base_font = _youtube_thumbnail_title_font_size(width=width, height=height, title_lines=title_lines)
-    normalized_font_size_mode = _normalize_thumbnail_font_size_mode(font_size_mode)
-    font_multiplier = YOUTUBE_THUMBNAIL_FONT_SIZE_MULTIPLIERS.get(normalized_font_size_mode, 1.0)
-    title_font = max(34, int(base_font * font_multiplier))
-    line_spacing = max(10, int(title_font * 0.16))
-
-    normalized_anchor = _normalize_thumbnail_anchor(anchor)
-    normalized_align = _normalize_thumbnail_text_align(text_align)
-    normalized_text_plate = _normalize_thumbnail_text_plate(text_plate)
-    normalized_offset_x = _normalize_thumbnail_offset(offset_x)
-    normalized_offset_y = _normalize_thumbnail_offset(offset_y)
-    font_color_value = _thumbnail_color_value(font_color)
-    outline_color_value = _thumbnail_color_value(outline_color)
-    x_expr, y_expr = _thumbnail_drawtext_position(
-        width=width,
-        height=height,
-        anchor=normalized_anchor,
-        text_align=normalized_align,
-        offset_x=normalized_offset_x,
-        offset_y=normalized_offset_y,
-    )
-
-    cleanup_paths: list[Path] = []
-    input_args, background_cleanup_paths = _thumbnail_render_input(
-        resolved_project_dir,
-        background_variant=max(0, int(background_variant)),
-        working_dir=resolved_output_path.parent,
-        notify=notify,
-    )
-    cleanup_paths.extend(background_cleanup_paths)
-
-    try:
-        with tempfile.NamedTemporaryFile(
-            prefix="youtube-thumbnail-text-",
-            suffix=".txt",
-            dir=str(resolved_output_path.parent),
-            delete=False,
-            mode="w",
-            encoding="utf-8",
-        ) as handle:
-            handle.write(wrapped_text)
-            text_path = Path(handle.name)
-        cleanup_paths.append(text_path)
-
-        fontfile_clause = _youtube_thumbnail_fontfile_clause()
-        text_plate_options = _thumbnail_text_plate_drawtext_options(normalized_text_plate)
-        textfile_value = _escape_drawtext_path(text_path)
-        filter_parts = [
-            (
-                f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},"
-                "eq=contrast=1.06:saturation=1.04:brightness=-0.04,"
-                "drawbox=x=0:y=0:w=iw:h=ih:color=black@0.10:t=fill,"
-                f"drawtext=textfile='{textfile_value}':reload=1{fontfile_clause}:fontcolor={font_color_value}:"
-                f"fontsize={title_font}:line_spacing={line_spacing}:"
-                f"x={x_expr}:y={y_expr}:borderw=7:bordercolor={outline_color_value}@0.96:"
-                f"shadowcolor={outline_color_value}@0.96:shadowx=3:shadowy=3{text_plate_options}[v]"
-            )
-        ]
-        command = [
-            ffmpeg_bin,
-            "-y",
-            *input_args,
-            "-frames:v",
-            "1",
-            "-filter_complex",
-            ";".join(filter_parts),
-            "-map",
-            "[v]",
-            str(resolved_output_path),
-        ]
-        run = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=False,
-        )
-        if int(run.returncode or 0) != 0:
-            stderr_text = str(run.stderr or "").strip()
-            if notify is not None:
-                notify(f"WARN: YouTube thumbnail rendering failed: {stderr_text or 'unknown ffmpeg error'}")
-            return None
-    finally:
-        for cleanup_path in cleanup_paths:
-            cleanup_path.unlink(missing_ok=True)
-
-    if resolved_output_path.exists():
-        if notify is not None:
-            notify(f"Prepared YouTube thumbnail: {resolved_output_path.name}")
-        return resolved_output_path
-    return None
-
-
-def export_youtube_thumbnail_work_image(
-    draft: YouTubePublishDraft,
-    *,
-    source_path: Path | None = None,
-    notify: Callable[[str], None] | None = None,
-) -> Path | None:
-    project_dir = Path(draft.project_dir).expanduser().resolve()
-    work_path = youtube_thumbnail_work_path(project_dir)
-    work_path.parent.mkdir(parents=True, exist_ok=True)
-
-    resolved_source = source_path.expanduser().resolve() if source_path is not None else None
-    if resolved_source is not None and resolved_source.exists():
-        rendered = _export_image_as_png(resolved_source, work_path, notify=notify)
-        if rendered is not None:
-            return rendered
-
-    return render_project_youtube_thumbnail(
-        project_dir,
-        thumbnail_text=str(draft.thumbnail_text or draft.thumbnail_prompt or draft.title or "").strip(),
-        thumbnail_badge_text=str(draft.thumbnail_badge_text or "").strip(),
-        font_color=draft.thumbnail_font_color,
-        outline_color=draft.thumbnail_outline_color,
-        font_size_mode=draft.thumbnail_font_size_mode,
-        anchor=draft.thumbnail_anchor,
-        offset_x=draft.thumbnail_offset_x,
-        offset_y=draft.thumbnail_offset_y,
-        text_align=draft.thumbnail_text_align,
-        text_plate=draft.thumbnail_text_plate,
-        background_variant=draft.thumbnail_background_variant,
-        notify=notify,
-        output_path=work_path,
-    )
-
-
-def _render_project_youtube_thumbnail_pillow(
-    project_dir: Path,
-    *,
-    thumbnail_text: str,
-    thumbnail_badge_text: str,
-    font_color: str,
-    outline_color: str,
-    font_size_mode: str,
-    anchor: str,
-    offset_x: int,
-    offset_y: int,
-    text_align: str,
-    text_plate: str,
-    background_variant: int,
-    notify: Callable[[str], None] | None = None,
-    output_path: Path,
-) -> Path | None:
-    if Image is None or ImageDraw is None or ImageFont is None or ImageColor is None:
-        return None
-
-    width, height = YOUTUBE_THUMBNAIL_CANVAS_SIZE
-    cleanup_paths: list[Path] = []
-    try:
-        background_path, background_cleanup_paths = _thumbnail_background_source_path(
-            project_dir,
-            background_variant=max(0, int(background_variant)),
-            working_dir=output_path.parent,
-            notify=notify,
-        )
-        cleanup_paths.extend(background_cleanup_paths)
-        image = _load_thumbnail_background_image(background_path, size=(width, height))
-        canvas = image.convert("RGBA")
-        draw = ImageDraw.Draw(canvas)
-
-        wrapped_text = _wrap_youtube_thumbnail_text(thumbnail_text)
-        title_lines = [line for line in wrapped_text.splitlines() if line.strip()] or ["WHY THIS MATTERS NOW"]
-        base_font = _youtube_thumbnail_title_font_size(width=width, height=height, title_lines=title_lines)
-        normalized_font_size_mode = _normalize_thumbnail_font_size_mode(font_size_mode)
-        font_multiplier = YOUTUBE_THUMBNAIL_FONT_SIZE_MULTIPLIERS.get(normalized_font_size_mode, 1.0)
-        title_font_size = max(34, int(base_font * font_multiplier))
-        line_spacing = max(10, int(title_font_size * 0.16))
-        normalized_anchor = _normalize_thumbnail_anchor(anchor)
-        normalized_align = _normalize_thumbnail_text_align(text_align)
-        normalized_offset_x = _normalize_thumbnail_offset(offset_x)
-        normalized_offset_y = _normalize_thumbnail_offset(offset_y)
-        normalized_text_plate = _normalize_thumbnail_text_plate(text_plate)
-        title_font = _load_thumbnail_font(title_font_size)
-        badge_font = _load_thumbnail_font(max(28, int(title_font_size * 0.42)))
-        title_fill = _thumbnail_rgb(font_color, fallback="#FFFFFF")
-        outline_fill = _thumbnail_rgb(outline_color, fallback="#111111")
-        x_pos, y_pos, text_bbox = _thumbnail_pillow_text_layout(
-            wrapped_text=wrapped_text,
-            font=title_font,
-            line_spacing=line_spacing,
-            canvas_size=(width, height),
-            anchor=normalized_anchor,
-            text_align=normalized_align,
-            offset_x=normalized_offset_x,
-            offset_y=normalized_offset_y,
-        )
-
-        _apply_thumbnail_global_grade(canvas)
-        _apply_thumbnail_text_plate_region(
-            canvas,
-            bbox=text_bbox,
-            mode=normalized_text_plate,
-        )
-        draw = ImageDraw.Draw(canvas)
-        draw.multiline_text(
-            (x_pos, y_pos),
-            wrapped_text,
-            font=title_font,
-            fill=title_fill,
-            spacing=line_spacing,
-            align=normalized_align,
-            stroke_width=max(5, int(title_font_size * 0.07)),
-            stroke_fill=outline_fill,
-        )
-        _draw_thumbnail_badge(
-            canvas,
-            badge_text=str(thumbnail_badge_text or "").strip(),
-            font=badge_font,
-        )
-        _save_thumbnail_canvas(canvas, output_path)
-    except Exception as exc:  # noqa: BLE001
-        if notify is not None:
-            notify(f"WARN: Pillow thumbnail rendering failed: {exc}")
-        return None
-    finally:
-        for cleanup_path in cleanup_paths:
-            cleanup_path.unlink(missing_ok=True)
-
-    if output_path.exists():
-        if notify is not None:
-            notify(f"Prepared YouTube thumbnail: {output_path.name}")
-        return output_path
-    return None
-
-
-def build_youtube_publish_draft(project_dir: Path, *, fallback_prompt: str = "") -> YouTubePublishDraft:
-    resolved_project_dir = project_dir.expanduser().resolve()
-    script_payload = _load_json_object(resolved_project_dir / "script.json")
-    rights_payload = _load_json_object(resolved_project_dir / "rights_manifest.json")
+    fallback_prompt: str = "",
+) -> YouTubePublishDraft:
+    package = resolve_video_package(project_dir)
+    resolved_project_dir = package.metadata_dir
+    script_payload = _load_json_object(package.script_path)
+    rights_payload = _load_json_object(package.rights_manifest_path)
 
     prompt_value = _load_prompt_text(resolved_project_dir, fallback_prompt=fallback_prompt)
     script_title = _optional_str(script_payload.get("title")) if script_payload else None
@@ -1056,7 +502,7 @@ def build_youtube_publish_draft(project_dir: Path, *, fallback_prompt: str = "")
     title = _first_non_empty(
         script_title,
         prompt_value,
-        _humanize_project_name(resolved_project_dir.name),
+        _humanize_project_name(package.package_dir.name),
         "Untitled video",
     )
     title_suggestions = _title_suggestions(title=title, prompt_value=prompt_value, scene_headings=scene_headings)
@@ -1068,19 +514,14 @@ def build_youtube_publish_draft(project_dir: Path, *, fallback_prompt: str = "")
     )
     tags = _tag_suggestions(title=title, prompt_value=prompt_value, scene_headings=scene_headings, asset_keywords=asset_keywords)
 
-    video_path = resolved_project_dir / "output" / "final.mp4"
-    captions_path = resolved_project_dir / "output" / "final.srt"
-    default_thumbnail_text = _default_thumbnail_text(resolved_project_dir, fallback_prompt=title)
-    thumbnail_path = ensure_project_youtube_thumbnail(
-        resolved_project_dir,
-        prompt_text=title,
-        overwrite=False,
-    )
-
+    video_path = package.video_path
+    captions_path = package.captions_path
+    thumbnail_path = _default_thumbnail_path(package)
     return YouTubePublishDraft(
         project_dir=str(resolved_project_dir),
         video_path=str(video_path),
         captions_path=str(captions_path) if captions_path.exists() else None,
+        thumbnail_path=str(thumbnail_path) if thumbnail_path is not None else None,
         title=title,
         title_suggestions=title_suggestions,
         description=description,
@@ -1089,42 +530,24 @@ def build_youtube_publish_draft(project_dir: Path, *, fallback_prompt: str = "")
         tags=tags,
         category=YOUTUBE_CATEGORY_DEFAULT,
         upload_captions=not burn_subtitles,
-        thumbnail_path=str(thumbnail_path) if thumbnail_path is not None else None,
-        thumbnail_source="auto" if thumbnail_path is not None else "none",
-        thumbnail_prompt=title,
-        thumbnail_text=default_thumbnail_text,
-        thumbnail_badge_text="",
-        thumbnail_font_color=YOUTUBE_THUMBNAIL_DEFAULT_FONT_COLOR,
-        thumbnail_outline_color=YOUTUBE_THUMBNAIL_DEFAULT_OUTLINE_COLOR,
-        thumbnail_font_size_mode=YOUTUBE_THUMBNAIL_DEFAULT_FONT_SIZE,
-        thumbnail_anchor=YOUTUBE_THUMBNAIL_DEFAULT_ANCHOR,
-        thumbnail_offset_x=0,
-        thumbnail_offset_y=0,
-        thumbnail_text_align=YOUTUBE_THUMBNAIL_DEFAULT_TEXT_ALIGN,
-        thumbnail_text_plate=YOUTUBE_THUMBNAIL_DEFAULT_TEXT_PLATE,
-        thumbnail_background_variant=0,
         updated_at=dt.datetime.now(dt.timezone.utc).isoformat(),
     )
 
 
-def ensure_youtube_publish_draft(project_dir: Path, *, fallback_prompt: str = "") -> YouTubePublishDraft:
-    draft = load_youtube_publish_draft(project_dir)
+def ensure_youtube_publish_draft(
+    project_dir: Path,
+    *,
+    fallback_prompt: str = "",
+) -> YouTubePublishDraft:
+    package = resolve_video_package(project_dir)
+    draft = load_youtube_publish_draft(package.metadata_dir)
     if draft is not None:
-        thumbnail_path = Path(draft.thumbnail_path).expanduser().resolve() if draft.thumbnail_path else None
-        if thumbnail_path is None or not thumbnail_path.exists():
-            generated_thumbnail = ensure_project_youtube_thumbnail(
-                project_dir,
-                prompt_text=draft.thumbnail_prompt or draft.title or fallback_prompt,
-                overwrite=False,
-            )
-            if generated_thumbnail is not None:
-                draft.thumbnail_path = str(generated_thumbnail)
-                if draft.thumbnail_source in {"", "none"}:
-                    draft.thumbnail_source = "auto"
-                save_youtube_publish_draft(draft)
         return draft
 
-    draft = build_youtube_publish_draft(project_dir, fallback_prompt=fallback_prompt)
+    draft = build_youtube_publish_draft(
+        package.metadata_dir,
+        fallback_prompt=fallback_prompt,
+    )
     save_youtube_publish_draft(draft)
     return draft
 
@@ -1147,6 +570,7 @@ def publish_youtube_draft(
     chunk_bytes: int = YOUTUBE_RESUMABLE_CHUNK_BYTES,
 ) -> dict[str, Any]:
     project_dir = Path(draft.project_dir).expanduser().resolve()
+    package = resolve_video_package(project_dir)
     video_path = Path(draft.video_path).expanduser().resolve()
     if not video_path.exists():
         raise RuntimeError(f"Video file not found for YouTube publish: {video_path}")
@@ -1167,6 +591,7 @@ def publish_youtube_draft(
 
     status: dict[str, Any] = {
         "privacyStatus": _normalize_visibility(draft.visibility),
+        "selfDeclaredMadeForKids": False,
     }
     if draft.schedule_at:
         scheduled_at = _normalize_publish_at(draft.schedule_at)
@@ -1195,51 +620,31 @@ def publish_youtube_draft(
     video_id = str(resource.get("id") or "").strip()
     video_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else None
     warnings: list[str] = []
-    thumbnail_result: dict[str, Any] | None = None
     captions_result: dict[str, Any] | None = None
+    thumbnail_result: dict[str, Any] | None = None
 
-    thumbnail_upload_details: dict[str, Any] | None = None
-
-    if video_id and draft.thumbnail_path:
-        thumbnail_path = Path(draft.thumbnail_path).expanduser().resolve()
-        if thumbnail_path.exists():
-            prepared_thumbnail: PreparedYouTubeThumbnail | None = None
+    thumbnail_path_value = str(draft.thumbnail_path or "").strip()
+    if video_id and thumbnail_path_value:
+        thumbnail_path = Path(thumbnail_path_value).expanduser().resolve()
+        if not thumbnail_path.exists():
+            warning = f"Thumbnail file not found: {thumbnail_path}"
+            warnings.append(warning)
+            if notify is not None:
+                notify(f"WARN: {warning}")
+        else:
             try:
-                prepared_thumbnail = prepare_youtube_thumbnail_for_upload(
-                    project_dir=project_dir,
-                    thumbnail_path=thumbnail_path,
-                    notify=notify,
-                )
-                thumbnail_upload_details = {
-                    "source_path": str(prepared_thumbnail.source_path),
-                    "source_size_bytes": prepared_thumbnail.source_size_bytes,
-                    "upload_size_bytes": prepared_thumbnail.upload_size_bytes,
-                    "upload_mime_type": prepared_thumbnail.mime_type,
-                    "optimized": prepared_thumbnail.optimized,
-                    "optimization_reason": prepared_thumbnail.optimization_reason,
-                }
                 if notify is not None:
-                    notify(f"Uploading thumbnail {prepared_thumbnail.path.name}.")
+                    notify(f"Uploading thumbnail {thumbnail_path.name}.")
                 thumbnail_result = set_youtube_thumbnail(
                     access_token=access_token,
                     video_id=video_id,
-                    thumbnail_path=prepared_thumbnail.path,
-                    mime_type=prepared_thumbnail.mime_type,
+                    thumbnail_path=thumbnail_path,
                 )
             except Exception as exc:  # noqa: BLE001
                 warning = f"Thumbnail upload skipped/failed: {exc}"
                 warnings.append(warning)
                 if notify is not None:
                     notify(f"WARN: {warning}")
-            finally:
-                cleanup_path = prepared_thumbnail.cleanup_path if prepared_thumbnail is not None else None
-                if cleanup_path is not None:
-                    cleanup_path.unlink(missing_ok=True)
-        else:
-            warning = f"Thumbnail file not found: {thumbnail_path}"
-            warnings.append(warning)
-            if notify is not None:
-                notify(f"WARN: {warning}")
 
     if video_id and draft.upload_captions and draft.captions_path:
         captions_path = Path(draft.captions_path).expanduser().resolve()
@@ -1278,18 +683,20 @@ def publish_youtube_draft(
         "status": "uploaded_with_warnings" if warnings else "uploaded",
         "uploaded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "project_dir": str(project_dir),
+        "package_dir": str(package.package_dir),
         "video_path": str(video_path),
         "draft_path": str(youtube_draft_path(project_dir)),
         "video_id": video_id or None,
         "video_url": video_url,
         "visibility": status["privacyStatus"],
+        "self_declared_made_for_kids": bool(status.get("selfDeclaredMadeForKids")),
         "publish_at": status.get("publishAt"),
-        "upload_captions_requested": bool(draft.upload_captions),
+        "thumbnail_path": thumbnail_path_value or None,
         "thumbnail_uploaded": bool(thumbnail_result),
+        "upload_captions_requested": bool(draft.upload_captions),
         "captions_uploaded": bool(captions_result),
         "warnings": warnings,
         "thumbnail_response": thumbnail_result,
-        "thumbnail_upload": thumbnail_upload_details,
         "captions_response": captions_result,
         "response": resource,
     }
@@ -1301,19 +708,17 @@ def publish_youtube_draft(
 def draft_review_text(draft: YouTubePublishDraft) -> str:
     tag_text = ", ".join(draft.tags) if draft.tags else "(none)"
     schedule_text = draft.schedule_at or "publish immediately"
-    thumbnail_text = draft.thumbnail_path or "(none selected)"
     captions_text = draft.captions_path or "(no captions file found)"
+    thumbnail_text = draft.thumbnail_path or "(none selected)"
     return "\n".join(
         [
             f"Project: {draft.project_dir}",
             f"Video: {draft.video_path}",
             f"Captions: {captions_text}",
+            f"Thumbnail: {thumbnail_text}",
             f"Visibility: {draft.visibility}",
             f"Schedule: {schedule_text}",
             f"Category: {draft.category}",
-            f"Thumbnail: {thumbnail_text}",
-            f"Thumbnail source: {draft.thumbnail_source}",
-            f"Thumbnail badge: {draft.thumbnail_badge_text or '(none)'}",
             f"Upload captions: {'yes' if draft.upload_captions else 'no'}",
             "",
             f"Title: {draft.title}",
@@ -1349,6 +754,16 @@ def _load_json_object(path: Path) -> dict[str, Any] | None:
         return None
     payload = json.loads(path.read_text(encoding="utf-8"))
     return payload if isinstance(payload, dict) else None
+
+
+def _load_prompt_text(project_dir: Path, *, fallback_prompt: str = "") -> str:
+    package = resolve_video_package(project_dir)
+    prompt_path = package.prompt_path
+    if prompt_path.exists():
+        text = prompt_path.read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    return str(fallback_prompt or "").strip()
 
 
 def _load_youtube_client_secrets_payload() -> dict[str, Any]:
@@ -1630,1152 +1045,23 @@ def set_youtube_thumbnail(
     access_token: str,
     video_id: str,
     thumbnail_path: Path,
-    mime_type: str | None = None,
 ) -> dict[str, Any]:
-    resolved_mime_type = mime_type or mimetypes.guess_type(thumbnail_path.name)[0] or "application/octet-stream"
-    with thumbnail_path.open("rb") as handle:
-        response = requests.post(
-            "https://www.googleapis.com/upload/youtube/v3/thumbnails/set",
-            params={"videoId": video_id},
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": resolved_mime_type,
-            },
-            data=handle.read(),
-            timeout=120,
-        )
+    mime_type = mimetypes.guess_type(thumbnail_path.name)[0] or "image/jpeg"
+    response = requests.post(
+        "https://www.googleapis.com/upload/youtube/v3/thumbnails/set",
+        params={"videoId": video_id},
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": mime_type,
+        },
+        data=thumbnail_path.read_bytes(),
+        timeout=120,
+    )
     _raise_for_status(response, "Failed to upload YouTube thumbnail")
     payload = response.json()
     if not isinstance(payload, dict):
-        raise RuntimeError("YouTube thumbnail upload returned an invalid response payload.")
+        raise RuntimeError("YouTube thumbnail upload completed, but the response payload was invalid.")
     return payload
-
-
-def prepare_youtube_thumbnail_for_upload(
-    *,
-    project_dir: Path,
-    thumbnail_path: Path,
-    notify: Callable[[str], None] | None = None,
-) -> PreparedYouTubeThumbnail:
-    resolved_thumbnail_path = thumbnail_path.expanduser().resolve()
-    source_size_bytes = resolved_thumbnail_path.stat().st_size
-    source_mime_type = mimetypes.guess_type(resolved_thumbnail_path.name)[0] or "application/octet-stream"
-    direct_upload_supported = (
-        source_mime_type in YOUTUBE_ALLOWED_THUMBNAIL_MIME_TYPES
-        and source_size_bytes <= YOUTUBE_THUMBNAIL_MAX_BYTES
-    )
-    if direct_upload_supported:
-        return PreparedYouTubeThumbnail(
-            path=resolved_thumbnail_path,
-            mime_type=source_mime_type,
-            source_path=resolved_thumbnail_path,
-            source_size_bytes=source_size_bytes,
-            upload_size_bytes=source_size_bytes,
-            optimized=False,
-        )
-
-    optimization_reasons: list[str] = []
-    if source_mime_type not in YOUTUBE_ALLOWED_THUMBNAIL_MIME_TYPES:
-        optimization_reasons.append(f"format {source_mime_type} is not directly supported by YouTube thumbnails")
-    if source_size_bytes > YOUTUBE_THUMBNAIL_MAX_BYTES:
-        optimization_reasons.append(
-            f"file size {source_size_bytes} bytes exceeds YouTube's {YOUTUBE_THUMBNAIL_MAX_BYTES}-byte limit"
-        )
-    reason_text = "; ".join(optimization_reasons) or "thumbnail needs upload-safe normalization"
-
-    ffmpeg_bin = shutil.which("ffmpeg")
-    if ffmpeg_bin is None:
-        raise RuntimeError(
-            "Thumbnail cannot be uploaded as-is because "
-            f"{reason_text}, and ffmpeg was not found to prepare an upload-safe image."
-        )
-
-    if notify is not None:
-        notify(f"Preparing thumbnail for YouTube upload because {reason_text}.")
-
-    project_publish_dir = youtube_publish_dir(project_dir)
-    project_publish_dir.mkdir(parents=True, exist_ok=True)
-    last_size_bytes = source_size_bytes
-    for width, height in YOUTUBE_THUMBNAIL_SCALE_STEPS:
-        for quality in YOUTUBE_THUMBNAIL_JPEG_QUALITIES:
-            with tempfile.NamedTemporaryFile(
-                prefix="youtube-thumbnail-",
-                suffix=".jpg",
-                dir=str(project_publish_dir),
-                delete=False,
-            ) as handle:
-                candidate_path = Path(handle.name)
-
-            command = [
-                ffmpeg_bin,
-                "-y",
-                "-i",
-                str(resolved_thumbnail_path),
-                "-frames:v",
-                "1",
-                "-vf",
-                f"scale={width}:{height}:force_original_aspect_ratio=decrease",
-                "-q:v",
-                str(quality),
-                str(candidate_path),
-            ]
-            run = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
-            )
-            if int(run.returncode or 0) != 0:
-                candidate_path.unlink(missing_ok=True)
-                stderr_text = str(run.stderr or "").strip()
-                raise RuntimeError(f"ffmpeg could not prepare a YouTube thumbnail: {stderr_text or 'unknown error'}")
-
-            candidate_size_bytes = candidate_path.stat().st_size if candidate_path.exists() else 0
-            if 0 < candidate_size_bytes <= YOUTUBE_THUMBNAIL_MAX_BYTES:
-                return PreparedYouTubeThumbnail(
-                    path=candidate_path,
-                    mime_type="image/jpeg",
-                    source_path=resolved_thumbnail_path,
-                    source_size_bytes=source_size_bytes,
-                    upload_size_bytes=candidate_size_bytes,
-                    optimized=True,
-                    optimization_reason=reason_text,
-                    cleanup_path=candidate_path,
-                )
-
-            last_size_bytes = candidate_size_bytes
-            candidate_path.unlink(missing_ok=True)
-
-    raise RuntimeError(
-        "Could not prepare a YouTube thumbnail under "
-        f"{YOUTUBE_THUMBNAIL_MAX_BYTES} bytes; smallest attempt was {last_size_bytes} bytes."
-    )
-
-
-def insert_youtube_captions(
-    *,
-    access_token: str,
-    video_id: str,
-    captions_path: Path,
-    language: str,
-    name: str,
-) -> dict[str, Any]:
-    boundary = f"===============ImagineCaption{secrets.token_hex(12)}=="
-    metadata = {
-        "snippet": {
-            "videoId": video_id,
-            "language": language,
-            "name": name,
-            "isDraft": False,
-        }
-    }
-    mime_type = mimetypes.guess_type(captions_path.name)[0] or "application/octet-stream"
-    metadata_bytes = json.dumps(metadata, ensure_ascii=True).encode("utf-8")
-    media_bytes = captions_path.read_bytes()
-    body = (
-        b"--" + boundary.encode("ascii") + b"\r\n"
-        + b"Content-Type: application/json; charset=UTF-8\r\n\r\n"
-        + metadata_bytes
-        + b"\r\n--" + boundary.encode("ascii") + b"\r\n"
-        + f"Content-Type: {mime_type}\r\n\r\n".encode("ascii")
-        + media_bytes
-        + b"\r\n--" + boundary.encode("ascii") + b"--\r\n"
-    )
-
-    response = requests.post(
-        "https://www.googleapis.com/upload/youtube/v3/captions",
-        params={"part": "snippet", "uploadType": "multipart"},
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": f'multipart/related; boundary="{boundary}"',
-        },
-        data=body,
-        timeout=120,
-    )
-    _raise_for_status(response, "Failed to upload YouTube captions")
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise RuntimeError("YouTube captions upload returned an invalid response payload.")
-    return payload
-
-
-def _load_prompt_text(project_dir: Path, *, fallback_prompt: str) -> str:
-    prompt_path = project_dir / "prompt.txt"
-    if prompt_path.exists():
-        value = prompt_path.read_text(encoding="utf-8").strip()
-        if value:
-            return value
-    return str(fallback_prompt or "").strip()
-
-
-def _default_thumbnail_prompt_text(project_dir: Path, *, fallback_prompt: str) -> str:
-    script_payload = _load_json_object(project_dir / "script.json")
-    if isinstance(script_payload, dict):
-        title = _optional_str(script_payload.get("title"))
-        if title:
-            return title
-    prompt_value = _load_prompt_text(project_dir, fallback_prompt=fallback_prompt)
-    if prompt_value:
-        return prompt_value
-    return _humanize_project_name(project_dir.name) or "Why this matters now"
-
-
-def youtube_thumbnail_text_suggestions(
-    project_dir: Path,
-    *,
-    title: str = "",
-    fallback_prompt: str = "",
-    preferred_text: str = "",
-) -> list[str]:
-    resolved_project_dir = project_dir.expanduser().resolve()
-    script_payload = _load_json_object(resolved_project_dir / "script.json")
-    script_title = _optional_str(script_payload.get("title")) if isinstance(script_payload, dict) else None
-    summary = _optional_str(script_payload.get("summary")) if isinstance(script_payload, dict) else None
-    scene_headings = _scene_headings(script_payload if isinstance(script_payload, dict) else None)
-    prompt_value = _load_prompt_text(resolved_project_dir, fallback_prompt=fallback_prompt)
-    return _thumbnail_text_suggestions_from_inputs(
-        title=title or script_title or "",
-        prompt_value=prompt_value,
-        scene_headings=scene_headings,
-        summary=summary or "",
-        preferred_text=preferred_text,
-    )
-
-
-def youtube_thumbnail_diagnostics(
-    text: str,
-    *,
-    font_color: str = YOUTUBE_THUMBNAIL_DEFAULT_FONT_COLOR,
-    text_plate: str = YOUTUBE_THUMBNAIL_DEFAULT_TEXT_PLATE,
-) -> dict[str, Any]:
-    sanitized = " ".join(_sanitize_youtube_thumbnail_text(text).split()).strip()
-    wrapped = _wrap_youtube_thumbnail_text(text)
-    words = re.findall(r"[A-Za-z0-9']+", sanitized)
-    lines = [line for line in wrapped.splitlines() if line.strip()]
-    notes: list[str] = []
-    warnings: list[str] = []
-
-    if 2 <= len(words) <= 4:
-        notes.append("Hook length is in the strongest mobile-readable range.")
-    elif len(words) <= 6:
-        warnings.append("Hook is getting wordy. Aim for 2 to 4 words when possible.")
-    else:
-        warnings.append("Hook is too long for a strong YouTube thumbnail. Trim it aggressively.")
-
-    if len(lines) <= 2:
-        notes.append("Text should stay readable at mobile size.")
-    else:
-        warnings.append(f"Current text will wrap to {len(lines)} lines. Strong thumbnails usually stay at 1 to 2 lines.")
-
-    if _normalize_thumbnail_color(font_color, YOUTUBE_THUMBNAIL_DEFAULT_FONT_COLOR, choices=YOUTUBE_THUMBNAIL_FONT_COLOR_CHOICES) == "black" and _normalize_thumbnail_text_plate(text_plate) == "none":
-        warnings.append("Black text without a text plate is risky unless the background is very bright.")
-    if sanitized != " ".join(str(text or "").split()).strip():
-        notes.append("Unsupported characters were normalized for FFmpeg-safe rendering.")
-    if _normalize_thumbnail_text_plate(text_plate) != "none":
-        notes.append("Text plate enabled for stronger contrast on busy frames.")
-
-    rating = "strong"
-    if warnings:
-        rating = "fair" if len(warnings) == 1 else "risky"
-
-    return {
-        "rating": rating,
-        "word_count": len(words),
-        "line_count": len(lines),
-        "wrapped_text": wrapped,
-        "sanitized_text": sanitized,
-        "notes": notes,
-        "warnings": warnings,
-    }
-
-
-def _scene_headings(script_payload: dict[str, Any] | None) -> list[str]:
-    if not isinstance(script_payload, dict):
-        return []
-    raw_scenes = script_payload.get("scenes")
-    if not isinstance(raw_scenes, list):
-        return []
-    headings: list[str] = []
-    for scene in raw_scenes:
-        if not isinstance(scene, dict):
-            continue
-        heading = _optional_str(scene.get("heading"))
-        if heading:
-            headings.append(heading)
-    return _dedupe_strings(headings)[:6]
-
-
-def _asset_keywords(rights_payload: dict[str, Any] | None) -> list[str]:
-    if not isinstance(rights_payload, dict):
-        return []
-    config = rights_payload.get("config")
-    if not isinstance(config, dict):
-        return []
-    raw_keywords = config.get("asset_keywords")
-    if not isinstance(raw_keywords, list):
-        return []
-    return _dedupe_strings(str(item).strip() for item in raw_keywords if str(item).strip())[:8]
-
-
-def _manifest_burn_subtitles(rights_payload: dict[str, Any] | None) -> bool:
-    if not isinstance(rights_payload, dict):
-        return True
-    config = rights_payload.get("config")
-    if not isinstance(config, dict):
-        return True
-    value = config.get("burn_subtitles")
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"1", "true", "yes", "on"}:
-            return True
-        if lowered in {"0", "false", "no", "off"}:
-            return False
-    return True
-
-
-def _title_suggestions(*, title: str, prompt_value: str, scene_headings: list[str]) -> list[str]:
-    candidates = [
-        title,
-        prompt_value,
-        scene_headings[0] if scene_headings else "",
-    ]
-    normalized: list[str] = []
-    for item in candidates:
-        cleaned = _title_case_sentence(item)
-        if not cleaned:
-            continue
-        normalized.append(cleaned[:100].strip())
-    return _dedupe_strings(normalized)[:3]
-
-
-def _description_text(
-    *,
-    title: str,
-    summary: str,
-    scene_headings: list[str],
-    required_credits_block: str = "",
-) -> str:
-    parts: list[str] = []
-    cleaned_summary = str(summary or "").strip()
-    if cleaned_summary:
-        parts.append(cleaned_summary)
-    else:
-        parts.append(f"This video breaks down {title.lower()}.")
-
-    if scene_headings:
-        parts.append("In this video:")
-        parts.extend(f"- {heading}" for heading in scene_headings[:5])
-
-    parts.append("")
-    parts.append("Built with the local Imagine workflow.")
-    cleaned_credits = str(required_credits_block or "").strip()
-    if cleaned_credits:
-        parts.extend(["", cleaned_credits])
-    return "\n".join(part.rstrip() for part in parts).strip()
-
-
-def _manifest_required_credits_block(rights_payload: dict[str, Any] | None) -> str:
-    if not isinstance(rights_payload, dict):
-        return ""
-    credits = rights_payload.get("credits")
-    if isinstance(credits, dict):
-        return str(credits.get("required_description_block") or "").strip()
-    return ""
-
-
-def _tag_suggestions(
-    *,
-    title: str,
-    prompt_value: str,
-    scene_headings: list[str],
-    asset_keywords: list[str],
-) -> list[str]:
-    tokens: list[str] = []
-    for source in [title, prompt_value, *scene_headings[:3], *asset_keywords]:
-        for token in re.split(r"[^a-z0-9]+", str(source).lower()):
-            cleaned = token.strip()
-            if len(cleaned) < 3 or cleaned in _STOP_WORDS:
-                continue
-            tokens.append(cleaned)
-    return _dedupe_strings(tokens)[:8]
-
-
-def _coerce_non_negative_int(value: Any) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return 0
-    return max(0, parsed)
-
-
-def _normalize_thumbnail_color(value: Any, default: str, *, choices: tuple[str, ...]) -> str:
-    normalized = str(value or "").strip().lower()
-    if normalized in choices:
-        return normalized
-    return default
-
-
-def _normalize_thumbnail_font_size_mode(value: Any) -> str:
-    normalized = str(value or "").strip().lower()
-    if normalized in YOUTUBE_THUMBNAIL_FONT_SIZE_CHOICES:
-        return normalized
-    return YOUTUBE_THUMBNAIL_DEFAULT_FONT_SIZE
-
-
-def _normalize_thumbnail_anchor(value: Any) -> str:
-    normalized = str(value or "").strip().lower()
-    if normalized in YOUTUBE_THUMBNAIL_ANCHOR_CHOICES:
-        return normalized
-    return YOUTUBE_THUMBNAIL_DEFAULT_ANCHOR
-
-
-def _normalize_thumbnail_text_align(value: Any) -> str:
-    normalized = str(value or "").strip().lower()
-    if normalized in YOUTUBE_THUMBNAIL_TEXT_ALIGN_CHOICES:
-        return normalized
-    return YOUTUBE_THUMBNAIL_DEFAULT_TEXT_ALIGN
-
-
-def _normalize_thumbnail_text_plate(value: Any) -> str:
-    normalized = str(value or "").strip().lower()
-    if normalized in YOUTUBE_THUMBNAIL_TEXT_PLATE_CHOICES:
-        return normalized
-    return YOUTUBE_THUMBNAIL_DEFAULT_TEXT_PLATE
-
-
-def _normalize_thumbnail_offset(value: Any) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return 0
-    return max(-YOUTUBE_THUMBNAIL_MAX_OFFSET, min(YOUTUBE_THUMBNAIL_MAX_OFFSET, parsed))
-
-
-def _thumbnail_color_value(color_name: Any) -> str:
-    normalized = str(color_name or "").strip().lower()
-    return YOUTUBE_THUMBNAIL_COLOR_VALUES.get(normalized, YOUTUBE_THUMBNAIL_COLOR_VALUES[YOUTUBE_THUMBNAIL_DEFAULT_FONT_COLOR])
-
-
-def _wrap_youtube_thumbnail_text(prompt_text: str) -> str:
-    cleaned = " ".join(_sanitize_youtube_thumbnail_text(prompt_text).split()).strip()
-    if not cleaned:
-        return "Why this matters now"
-
-    lines = textwrap.wrap(
-        cleaned,
-        width=18,
-        replace_whitespace=False,
-        drop_whitespace=True,
-        break_long_words=False,
-        break_on_hyphens=False,
-    )
-    if not lines:
-        return "Why this matters now"
-    limited = lines[:4]
-    if len(lines) > 4:
-        tail = limited[-1].rstrip(". ")
-        limited[-1] = f"{tail}..."
-    return "\n".join(line.upper() for line in limited if line)
-
-
-def _default_thumbnail_text(project_dir: Path, *, fallback_prompt: str) -> str:
-    suggestions = youtube_thumbnail_text_suggestions(
-        project_dir,
-        title="",
-        fallback_prompt=fallback_prompt,
-        preferred_text="",
-    )
-    if suggestions:
-        return suggestions[0]
-    return "Why This Matters"
-
-
-def _thumbnail_text_suggestions_from_inputs(
-    *,
-    title: str,
-    prompt_value: str,
-    scene_headings: list[str],
-    summary: str,
-    preferred_text: str,
-) -> list[str]:
-    ranked_candidates: list[tuple[int, str]] = []
-    seed_values = [
-        (preferred_text, 80),
-        (title, 70),
-        (prompt_value, 50),
-        (scene_headings[0] if scene_headings else "", 36),
-        (summary, 18),
-    ]
-    for raw_value, base_score in seed_values:
-        cleaned = _thumbnail_candidate_text(raw_value)
-        if not cleaned:
-            continue
-        for candidate_score, candidate in _thumbnail_variants_for_source(cleaned, base_score=base_score):
-            ranked_candidates.append((candidate_score, candidate))
-
-    if not ranked_candidates:
-        return ["Why This Matters"]
-
-    deduped: dict[str, tuple[int, str]] = {}
-    for candidate_score, candidate in ranked_candidates:
-        normalized_key = candidate.lower()
-        existing = deduped.get(normalized_key)
-        if existing is None or candidate_score > existing[0]:
-            deduped[normalized_key] = (candidate_score, candidate)
-
-    ordered = sorted(deduped.values(), key=lambda item: (-item[0], len(item[1]), item[1]))
-    return [item[1] for item in ordered[:6]]
-
-
-def _thumbnail_variants_for_source(source_text: str, *, base_score: int) -> list[tuple[int, str]]:
-    variants: list[tuple[int, str]] = []
-    clauses = _thumbnail_candidate_clauses(source_text)
-    for index, clause in enumerate(clauses):
-        clause_bonus = 10 * index
-        for candidate in [
-            _thumbnail_phrase_window(clause, max_words=4, take_tail=False),
-            _thumbnail_phrase_window(clause, max_words=4, take_tail=True),
-            _thumbnail_phrase_window(clause, max_words=3, take_tail=False),
-            _thumbnail_phrase_window(clause, max_words=3, take_tail=True),
-        ]:
-            normalized = _thumbnail_candidate_text(candidate)
-            if not normalized:
-                continue
-            variants.append((_thumbnail_suggestion_score(normalized, base_score + clause_bonus), normalized))
-    return variants
-
-
-def _thumbnail_candidate_clauses(value: str) -> list[str]:
-    cleaned = _thumbnail_candidate_text(value)
-    if not cleaned:
-        return []
-    clauses = re.split(r":\s*|\s+[|/]\s+|\s+[-–—]\s+", cleaned)
-    normalized = [cleaned]
-    for clause in clauses:
-        normalized_clause = _thumbnail_candidate_text(clause)
-        if normalized_clause and normalized_clause.lower() != cleaned.lower():
-            normalized.append(normalized_clause)
-    return _dedupe_strings(normalized)
-
-
-def _thumbnail_phrase_window(value: str, *, max_words: int, take_tail: bool) -> str:
-    words = re.findall(r"[A-Za-z0-9']+", _thumbnail_candidate_text(value))
-    if not words:
-        return ""
-    if 2 <= len(words) <= max_words:
-        return " ".join(words)
-    filtered = [word for word in words if word.lower() not in _STOP_WORDS or any(ch.isdigit() for ch in word)]
-    selected = filtered or words
-    if len(selected) <= max_words:
-        return " ".join(selected)
-    window = selected[-max_words:] if take_tail else selected[:max_words]
-    return " ".join(window)
-
-
-def _thumbnail_candidate_text(value: str) -> str:
-    sanitized = " ".join(_sanitize_youtube_thumbnail_text(value).split()).strip()
-    if not sanitized:
-        return ""
-    sanitized = sanitized.strip(" -:|/.,")
-    sanitized = _title_case_sentence(sanitized)
-    return sanitized[:52].strip()
-
-
-def _thumbnail_suggestion_score(candidate: str, base_score: int) -> int:
-    words = re.findall(r"[A-Za-z0-9']+", candidate)
-    if not words:
-        return -9999
-    word_count = len(words)
-    char_count = len(candidate.replace(" ", ""))
-    score = base_score
-    if 2 <= word_count <= 4:
-        score += 30
-    elif word_count == 1:
-        score += 18
-    elif word_count == 5:
-        score += 8
-    else:
-        score -= 12 * max(1, word_count - 4)
-    if 8 <= char_count <= 24:
-        score += 12
-    elif char_count > 30:
-        score -= 10
-    if any(any(ch.isdigit() for ch in word) for word in words):
-        score += 10
-    return score
-
-
-def _sanitize_youtube_thumbnail_text(value: str) -> str:
-    cleaned_lines: list[str] = []
-    raw_text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
-    for source, replacement in _THUMBNAIL_TEXT_REPLACEMENTS.items():
-        raw_text = raw_text.replace(source, replacement)
-
-    for raw_line in raw_text.split("\n"):
-        safe_chars: list[str] = []
-        for ch in raw_line:
-            if ch == "\t":
-                safe_chars.append(" ")
-                continue
-            if ord(ch) < 127 and ch.isprintable():
-                safe_chars.append(ch)
-                continue
-            category = unicodedata.category(ch)
-            if category[:1] in {"L", "N", "P", "Z"}:
-                safe_chars.append(ch)
-        safe_line = "".join(safe_chars).strip()
-        if safe_line:
-            cleaned_lines.append(safe_line)
-    return "\n".join(cleaned_lines).strip()
-
-
-def _youtube_thumbnail_fontfile_clause() -> str:
-    font_path = _thumbnail_fontfile_path()
-    if font_path is not None:
-        return f":fontfile='{_escape_drawtext_path(font_path)}'"
-    return ""
-
-
-def _thumbnail_text_plate_drawtext_options(mode: str) -> str:
-    normalized = _normalize_thumbnail_text_plate(mode)
-    if normalized == "soft":
-        return ":box=1:boxcolor=black@0.22:boxborderw=18"
-    if normalized == "strong":
-        return ":box=1:boxcolor=black@0.36:boxborderw=24"
-    return ""
-
-
-def _thumbnail_fontfile_path() -> Path | None:
-    for candidate in YOUTUBE_THUMBNAIL_FONTFILE_CANDIDATES:
-        path = Path(candidate).expanduser()
-        if path.exists():
-            return path.resolve()
-    return None
-
-
-def _load_thumbnail_font(size: int) -> Any:
-    if ImageFont is None:
-        return None
-    font_path = _thumbnail_fontfile_path()
-    if font_path is not None:
-        try:
-            return ImageFont.truetype(str(font_path), size=size)
-        except Exception:
-            pass
-    return ImageFont.load_default()
-
-
-def _thumbnail_rgb(color_name: str, *, fallback: str) -> tuple[int, int, int]:
-    if ImageColor is None:
-        return (255, 255, 255)
-    hex_value = _thumbnail_color_value(color_name).replace("0x", "#")
-    try:
-        return cast(tuple[int, int, int], ImageColor.getrgb(hex_value))
-    except Exception:
-        return cast(tuple[int, int, int], ImageColor.getrgb(fallback))
-
-
-def _load_thumbnail_background_image(path: Path | None, *, size: tuple[int, int]) -> Any:
-    if Image is None:
-        return None
-    if path is not None and path.exists():
-        with Image.open(path) as source:
-            source = source.convert("RGBA")
-            return _cover_thumbnail_image(source, size=size)
-    return Image.new("RGBA", size, "#152238")
-
-
-def _cover_thumbnail_image(image: Any, *, size: tuple[int, int]) -> Any:
-    if Image is None:
-        return image
-    target_width, target_height = size
-    source_width, source_height = image.size
-    if source_width <= 0 or source_height <= 0:
-        return Image.new("RGBA", size, "#152238")
-    scale = max(target_width / float(source_width), target_height / float(source_height))
-    resized = image.resize(
-        (
-            max(1, int(round(source_width * scale))),
-            max(1, int(round(source_height * scale))),
-        ),
-        Image.Resampling.LANCZOS,
-    )
-    left = max(0, (resized.size[0] - target_width) // 2)
-    top = max(0, (resized.size[1] - target_height) // 2)
-    return resized.crop((left, top, left + target_width, top + target_height))
-
-
-def _thumbnail_pillow_text_layout(
-    *,
-    wrapped_text: str,
-    font: Any,
-    line_spacing: int,
-    canvas_size: tuple[int, int],
-    anchor: str,
-    text_align: str,
-    offset_x: int,
-    offset_y: int,
-) -> tuple[int, int, tuple[int, int, int, int]]:
-    if Image is None or ImageDraw is None:
-        return 0, 0, (0, 0, 0, 0)
-    width, height = canvas_size
-    temp = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(temp)
-    text_bbox = draw.multiline_textbbox(
-        (0, 0),
-        wrapped_text,
-        font=font,
-        spacing=line_spacing,
-        align=text_align,
-        stroke_width=max(4, int(getattr(font, "size", 48) * 0.07)),
-    )
-    text_width = int(text_bbox[2] - text_bbox[0])
-    text_height = int(text_bbox[3] - text_bbox[1])
-    horizontal_key, vertical_key = _thumbnail_anchor_parts(anchor)
-    anchor_x_values = {
-        "left": int(width * 0.06),
-        "center": int(width * 0.50),
-        "right": int(width * 0.94),
-    }
-    anchor_y_values = {
-        "top": int(height * 0.08),
-        "center": int(height * 0.50),
-        "bottom": int(height * 0.88),
-    }
-    anchor_x = anchor_x_values[horizontal_key]
-    anchor_y = anchor_y_values[vertical_key]
-    if text_align == "center":
-        x_pos = int(anchor_x - (text_width / 2) + offset_x)
-    elif text_align == "right":
-        x_pos = int(anchor_x - text_width + offset_x)
-    else:
-        x_pos = int(anchor_x + offset_x)
-    if vertical_key == "center":
-        y_pos = int(anchor_y - (text_height / 2) + offset_y)
-    elif vertical_key == "bottom":
-        y_pos = int(anchor_y - text_height + offset_y)
-    else:
-        y_pos = int(anchor_y + offset_y)
-    return x_pos, y_pos, (x_pos, y_pos, x_pos + text_width, y_pos + text_height)
-
-
-def _apply_thumbnail_global_grade(image: Any) -> None:
-    if Image is None:
-        return
-    overlay = Image.new("RGBA", image.size, (0, 0, 0, 26))
-    image.alpha_composite(overlay)
-
-
-def _apply_thumbnail_text_plate_region(
-    image: Any,
-    *,
-    bbox: tuple[int, int, int, int],
-    mode: str,
-) -> None:
-    if Image is None:
-        return
-    normalized = _normalize_thumbnail_text_plate(mode)
-    if normalized == "none":
-        return
-    left, top, right, bottom = bbox
-    padding_x = 28 if normalized == "soft" else 38
-    padding_y = 18 if normalized == "soft" else 24
-    x0 = max(0, left - padding_x)
-    y0 = max(0, top - padding_y)
-    x1 = min(image.size[0], right + padding_x)
-    y1 = min(image.size[1], bottom + padding_y)
-    if x1 <= x0 or y1 <= y0:
-        return
-    region = image.crop((x0, y0, x1, y1))
-    blurred = region.filter(ImageFilter.GaussianBlur(radius=18 if normalized == "soft" else 26))
-    image.paste(blurred, (x0, y0))
-    plate_opacity = 70 if normalized == "soft" else 110
-    plate = Image.new("RGBA", (x1 - x0, y1 - y0), (0, 0, 0, plate_opacity))
-    image.alpha_composite(plate, dest=(x0, y0))
-
-
-def _draw_thumbnail_badge(
-    image: Any,
-    *,
-    badge_text: str,
-    font: Any,
-) -> None:
-    if ImageDraw is None:
-        return
-    cleaned = " ".join(_sanitize_youtube_thumbnail_text(badge_text).split()).strip()
-    if not cleaned:
-        return
-    if len(cleaned) > 18:
-        cleaned = cleaned[:18].rstrip() + "..."
-    cleaned = cleaned.upper()
-    draw = ImageDraw.Draw(image)
-    bbox = draw.textbbox((0, 0), cleaned, font=font, stroke_width=0)
-    text_width = int(bbox[2] - bbox[0])
-    text_height = int(bbox[3] - bbox[1])
-    padding_x = 18
-    padding_y = 10
-    box_width = text_width + (padding_x * 2)
-    box_height = text_height + (padding_y * 2)
-    x1 = image.size[0] - 40
-    y0 = 32
-    x0 = x1 - box_width
-    y1 = y0 + box_height
-    draw.rounded_rectangle(
-        (x0, y0, x1, y1),
-        radius=18,
-        fill=YOUTUBE_THUMBNAIL_PRIMARY_BADGE_FILL,
-        outline=(255, 255, 255, 42),
-        width=2,
-    )
-    draw.text(
-        (x0 + padding_x, y0 + padding_y - 1),
-        cleaned,
-        font=font,
-        fill=YOUTUBE_THUMBNAIL_PRIMARY_BADGE_TEXT,
-    )
-
-
-def _save_thumbnail_canvas(image: Any, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    rgba_image = image.convert("RGBA")
-    if output_path.suffix.lower() == ".png":
-        rgba_image.save(output_path, format="PNG", optimize=True)
-        return
-    rgb_background = Image.new("RGB", rgba_image.size, (9, 9, 9))
-    rgb_background.paste(rgba_image, mask=rgba_image.getchannel("A"))
-    rgb_background.save(output_path, format="JPEG", quality=92, optimize=True)
-
-
-def _export_image_as_png(
-    source_path: Path,
-    output_path: Path,
-    *,
-    notify: Callable[[str], None] | None = None,
-) -> Path | None:
-    if Image is None:
-        return None
-    try:
-        with Image.open(source_path) as source:
-            converted = source.convert("RGBA")
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            converted.save(output_path, format="PNG", optimize=True)
-        if notify is not None:
-            notify(f"Prepared Thumbnail Studio working file: {output_path.name}")
-        return output_path
-    except Exception as exc:  # noqa: BLE001
-        if notify is not None:
-            notify(f"WARN: Could not export Thumbnail Studio working file: {exc}")
-        return None
-
-
-def _youtube_thumbnail_title_font_size(
-    *,
-    width: int,
-    height: int,
-    title_lines: list[str],
-) -> int:
-    line_count = max(1, len([line for line in title_lines if line.strip()]))
-    longest = max((len(line.strip()) for line in title_lines if line.strip()), default=12)
-
-    base = int(height * 0.118)
-    if line_count == 2:
-        base = int(height * 0.104)
-    elif line_count == 3:
-        base = int(height * 0.088)
-    elif line_count >= 4:
-        base = int(height * 0.076)
-
-    if longest >= 22:
-        base = int(base * 0.88)
-    elif longest >= 18:
-        base = int(base * 0.94)
-
-    max_by_width = int((width * 0.88) / max(6, longest) * 1.85)
-    return max(34, min(base, max_by_width))
-
-
-def _youtube_thumbnail_seek_seconds(media_path: Path, variant_index: int = 0) -> float:
-    duration = _probe_media_duration_seconds(media_path)
-    if duration <= 0.5:
-        return 0.0
-    fraction = YOUTUBE_THUMBNAIL_VARIANT_FRACTIONS[variant_index % len(YOUTUBE_THUMBNAIL_VARIANT_FRACTIONS)]
-    return max(0.0, min(duration - 0.2, duration * fraction))
-
-
-def _probe_media_duration_seconds(media_path: Path) -> float:
-    ffprobe_bin = shutil.which("ffprobe")
-    if ffprobe_bin is None or not media_path.exists():
-        return 0.0
-
-    command = [
-        ffprobe_bin,
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(media_path),
-    ]
-    run = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    if int(run.returncode or 0) != 0:
-        return 0.0
-    try:
-        return max(0.0, float(str(run.stdout or "").strip()))
-    except Exception:
-        return 0.0
-
-
-def _escape_drawtext_path(path: Path) -> str:
-    value = str(path.expanduser().resolve()).replace("\\", r"\\")
-    value = value.replace(":", r"\:")
-    value = value.replace("'", r"\'")
-    value = value.replace(",", r"\,")
-    value = value.replace("%", r"\%")
-    return value
-
-
-def _thumbnail_drawtext_position(
-    *,
-    width: int,
-    height: int,
-    anchor: str,
-    text_align: str,
-    offset_x: int,
-    offset_y: int,
-) -> tuple[str, str]:
-    horizontal_key, vertical_key = _thumbnail_anchor_parts(anchor)
-    anchor_x_values = {
-        "left": int(width * 0.06),
-        "center": int(width * 0.50),
-        "right": int(width * 0.94),
-    }
-    anchor_y_values = {
-        "top": int(height * 0.08),
-        "center": int(height * 0.50),
-        "bottom": int(height * 0.88),
-    }
-    anchor_x = anchor_x_values[horizontal_key]
-    anchor_y = anchor_y_values[vertical_key]
-
-    if text_align == "center":
-        x_expr = f"{anchor_x}-(text_w/2)+({offset_x})"
-    elif text_align == "right":
-        x_expr = f"{anchor_x}-text_w+({offset_x})"
-    else:
-        x_expr = f"{anchor_x}+({offset_x})"
-
-    if vertical_key == "center":
-        y_expr = f"{anchor_y}-(text_h/2)+({offset_y})"
-    elif vertical_key == "bottom":
-        y_expr = f"{anchor_y}-text_h+({offset_y})"
-    else:
-        y_expr = f"{anchor_y}+({offset_y})"
-    return x_expr, y_expr
-
-
-def _thumbnail_anchor_parts(anchor: str) -> tuple[str, str]:
-    normalized = _normalize_thumbnail_anchor(anchor)
-    if "-" not in normalized:
-        return "center", "center"
-    vertical_key, horizontal_key = normalized.split("-", 1)
-    if vertical_key not in {"top", "center", "bottom"}:
-        vertical_key = "center"
-    if horizontal_key not in {"left", "center", "right"}:
-        horizontal_key = "center"
-    return horizontal_key, vertical_key
-
-
-def _extract_thumbnail_frame(
-    media_path: Path,
-    *,
-    variant_index: int,
-    working_dir: Path,
-    notify: Callable[[str], None] | None,
-) -> Path | None:
-    ffmpeg_bin = shutil.which("ffmpeg")
-    if ffmpeg_bin is None:
-        return None
-    frame_path = working_dir / f"thumbnail-background-{variant_index:02d}.jpg"
-    timestamp = _youtube_thumbnail_seek_seconds(media_path, variant_index)
-    command = [
-        ffmpeg_bin,
-        "-y",
-        "-ss",
-        f"{timestamp:.3f}",
-        "-i",
-        str(media_path),
-        "-frames:v",
-        "1",
-        "-q:v",
-        "2",
-        str(frame_path),
-    ]
-    run = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-    if int(run.returncode or 0) == 0 and frame_path.exists():
-        return frame_path
-    if notify is not None:
-        notify(
-            f"WARN: Could not extract thumbnail frame from {media_path.name}: "
-            f"{str(run.stderr or '').strip() or 'unknown ffmpeg error'}"
-        )
-    frame_path.unlink(missing_ok=True)
-    return None
-
-
-def _thumbnail_background_source_path(
-    project_dir: Path,
-    *,
-    background_variant: int,
-    working_dir: Path,
-    notify: Callable[[str], None] | None,
-) -> tuple[Path | None, list[Path]]:
-    ffmpeg_bin = shutil.which("ffmpeg")
-    if ffmpeg_bin is None:
-        return None, []
-
-    source_candidates = _youtube_thumbnail_source_assets(project_dir)
-    cleanup_paths: list[Path] = []
-    candidate_media = source_candidates[background_variant % len(source_candidates)] if source_candidates else None
-
-    if candidate_media is not None and candidate_media.exists():
-        if candidate_media.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
-            return candidate_media.resolve(), cleanup_paths
-        extracted = _extract_thumbnail_frame(
-            candidate_media,
-            variant_index=background_variant,
-            working_dir=working_dir,
-            notify=notify,
-        )
-        if extracted is not None:
-            cleanup_paths.append(extracted)
-            return extracted.resolve(), cleanup_paths
-
-    final_mp4 = project_dir / "output" / "final.mp4"
-    if final_mp4.exists():
-        extracted = _extract_thumbnail_frame(
-            final_mp4,
-            variant_index=background_variant,
-            working_dir=working_dir,
-            notify=notify,
-        )
-        if extracted is not None:
-            cleanup_paths.append(extracted)
-            return extracted.resolve(), cleanup_paths
-
-    brand_candidates = [
-        project_dir / "publish" / "thumbnail_background.jpg",
-        project_dir / "publish" / "thumbnail_background.png",
-        project_dir.parent / "brand-kit" / "channel-bg-intro.jpg",
-        project_dir.parent / "brand-kit" / "channel-bg-outro.jpg",
-    ]
-    for candidate in brand_candidates:
-        if candidate.exists():
-            return candidate.resolve(), cleanup_paths
-
-    return None, cleanup_paths
-
-
-def _thumbnail_render_input(
-    project_dir: Path,
-    *,
-    background_variant: int,
-    working_dir: Path,
-    notify: Callable[[str], None] | None,
-) -> tuple[list[str], list[Path]]:
-    background_path, cleanup_paths = _thumbnail_background_source_path(
-        project_dir,
-        background_variant=background_variant,
-        working_dir=working_dir,
-        notify=notify,
-    )
-    if background_path is not None:
-        return ["-i", str(background_path)], cleanup_paths
-    return ["-f", "lavfi", "-i", "color=c=0x152238:s=1280x720"], cleanup_paths
-
-
-def _youtube_thumbnail_source_assets(project_dir: Path) -> list[Path]:
-    candidates: list[Path] = []
-    seen: set[Path] = set()
-
-    def add(path_value: str | None) -> None:
-        if not path_value:
-            return
-        resolved = Path(str(path_value)).expanduser().resolve()
-        if not resolved.exists() or resolved in seen:
-            return
-        seen.add(resolved)
-        candidates.append(resolved)
-
-    timeline_path = project_dir / "timeline.json"
-    if timeline_path.exists():
-        try:
-            payload = json.loads(timeline_path.read_text(encoding="utf-8"))
-        except Exception:
-            payload = None
-        clips = payload.get("clips") if isinstance(payload, dict) else None
-        if isinstance(clips, list):
-            for clip in clips:
-                if not isinstance(clip, dict):
-                    continue
-                scene_id = str(clip.get("scene_id") or "").strip()
-                if scene_id in {"", "__intro", "__outro"}:
-                    continue
-                add(str(clip.get("source_path") or "").strip() or None)
-
-    clip_catalog_path = project_dir / "review" / "clip_catalog.json"
-    if clip_catalog_path.exists():
-        try:
-            payload = json.loads(clip_catalog_path.read_text(encoding="utf-8"))
-        except Exception:
-            payload = None
-        clips = payload.get("clips") if isinstance(payload, dict) else None
-        if isinstance(clips, list):
-            for clip in clips:
-                if not isinstance(clip, dict):
-                    continue
-                add(str(clip.get("asset_path") or "").strip() or None)
-
-    return candidates
-
-
-def _detect_thumbnail_path(project_dir: Path) -> Path | None:
-    candidates = [
-        project_dir / YOUTUBE_DEFAULT_THUMBNAIL_PATH,
-        project_dir / "output" / "thumbnail_yt.png",
-        project_dir / "thumbnail_yt.png",
-        project_dir / "output" / "thumbnail_yt.jpg",
-        project_dir / "thumbnail_yt.jpg",
-        project_dir / "review" / "debug" / "thumbnail",
-    ]
-
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate.resolve()
-        if candidate.is_dir():
-            matches = sorted(
-                [path for path in candidate.iterdir() if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}],
-                key=lambda item: item.stat().st_mtime,
-                reverse=True,
-            )
-            if matches:
-                return matches[0].resolve()
-    return None
 
 
 def _humanize_project_name(value: str) -> str:
@@ -2831,3 +1117,130 @@ def _first_non_empty(*values: str | None) -> str:
         if cleaned:
             return cleaned
     return ""
+
+
+def _scene_headings(script_payload: dict[str, Any] | None) -> list[str]:
+    if not isinstance(script_payload, dict):
+        return []
+    scenes = script_payload.get("scenes")
+    if not isinstance(scenes, list):
+        return []
+    headings: list[str] = []
+    seen: set[str] = set()
+    for scene in scenes:
+        if not isinstance(scene, dict):
+            continue
+        heading = str(scene.get("heading") or "").strip()
+        if not heading:
+            continue
+        key = heading.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        headings.append(heading)
+    return headings
+
+
+def _asset_keywords(rights_payload: dict[str, Any] | None) -> list[str]:
+    if not isinstance(rights_payload, dict):
+        return []
+    config_payload = rights_payload.get("config")
+    if not isinstance(config_payload, dict):
+        return []
+    raw_keywords = config_payload.get("asset_keywords")
+    if not isinstance(raw_keywords, list):
+        return []
+    return _dedupe_strings(str(item).strip() for item in raw_keywords if str(item).strip())
+
+
+def _manifest_burn_subtitles(rights_payload: dict[str, Any] | None) -> bool:
+    if not isinstance(rights_payload, dict):
+        return False
+    config_payload = rights_payload.get("config")
+    if not isinstance(config_payload, dict):
+        return False
+    return bool(config_payload.get("burn_subtitles"))
+
+
+def _manifest_required_credits_block(rights_payload: dict[str, Any] | None) -> str:
+    if not isinstance(rights_payload, dict):
+        return ""
+    credits_payload = rights_payload.get("credits")
+    if not isinstance(credits_payload, dict):
+        return ""
+    return str(credits_payload.get("required_description_block") or "").strip()
+
+
+def _title_suggestions(
+    *,
+    title: str,
+    prompt_value: str,
+    scene_headings: list[str],
+) -> list[str]:
+    candidates = [title]
+    if prompt_value:
+        candidates.append(_title_case_sentence(prompt_value))
+    if scene_headings:
+        candidates.append(_title_case_sentence(f"{title}: {scene_headings[0]}"))
+    if len(scene_headings) >= 2:
+        candidates.append(_title_case_sentence(f"{scene_headings[0]} e {scene_headings[1]}"))
+    return _dedupe_strings(candidate for candidate in candidates if str(candidate).strip())[:4]
+
+
+def _description_text(
+    *,
+    title: str,
+    summary: str,
+    scene_headings: list[str],
+    required_credits_block: str,
+) -> str:
+    lines: list[str] = []
+    cleaned_summary = str(summary or "").strip()
+    if cleaned_summary:
+        lines.append(cleaned_summary)
+    elif title.strip():
+        lines.append(title.strip())
+
+    if scene_headings:
+        lines.append("")
+        lines.append("Neste video:")
+        for heading in scene_headings[:6]:
+            lines.append(f"- {heading}")
+
+    if required_credits_block:
+        lines.append("")
+        lines.append(required_credits_block.strip())
+
+    return "\n".join(lines).strip()
+
+
+def _tag_suggestions(
+    *,
+    title: str,
+    prompt_value: str,
+    scene_headings: list[str],
+    asset_keywords: list[str],
+) -> list[str]:
+    candidates: list[str] = []
+    candidates.extend(asset_keywords[:8])
+    if title.strip():
+        candidates.append(title.strip())
+    if prompt_value.strip():
+        candidates.append(prompt_value.strip())
+    candidates.extend(scene_headings[:6])
+    return _dedupe_strings(candidate for candidate in candidates if str(candidate).strip())[:12]
+
+
+def _default_thumbnail_path(package: VideoPackagePaths) -> Path | None:
+    candidates = [
+        package.package_dir / "thumbnail_yt.png",
+        package.package_dir / "thumbnail_yt.jpg",
+        package.package_dir / "thumbnail_yt.jpeg",
+        package.publish_dir / "thumbnail_yt.png",
+        package.publish_dir / "thumbnail_yt.jpg",
+        package.publish_dir / "thumbnail_yt.jpeg",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
