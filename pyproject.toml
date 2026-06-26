@@ -18,10 +18,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# ponytail: MeloTTS dropped — it pins transformers==4.27.4, dragging an ancient
+# tokenizers that won't build on Python 3.12 / rustc and conflicts with kokoro.
+# Re-add MeloTTS only in a dedicated Python 3.11 env if you specifically need it.
 voice = [
-  "MeloTTS @ git+https://github.com/myshell-ai/MeloTTS.git",
   "kokoro>=0.7.16",
 ]
+melo = ["MeloTTS @ git+https://github.com/myshell-ai/MeloTTS.git"]
 captions = ["faster-whisper>=1.1.0"]
 
 [project.scripts]
