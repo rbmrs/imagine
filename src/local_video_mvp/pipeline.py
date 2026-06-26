@@ -4186,18 +4186,11 @@ class VideoPipeline:
             Use visual_strategy=news-source-screenshot only when the source's visual_strategy says news-source-screenshot.
             """
         ).strip()
-        result = self._run_command(
-            ["ollama", "run", self.config.ollama_model, prompt],
-            timeout=600,
-            check=False,
-        )
-        if result.returncode != 0:
-            stderr = (result.stderr or "").strip()
-            if stderr:
-                self._warn(f"Ollama news error: {stderr}")
+        stdout = self._ollama_generate(prompt, timeout=600)
+        if stdout is None:
             return None
 
-        return self._extract_json_object(result.stdout)
+        return self._extract_json_object(stdout)
 
     def _generate_news_script_plan_template(self, brief: NewsBrief) -> dict[str, Any]:
         approved = list(brief.sources)
@@ -4253,6 +4246,36 @@ class VideoPipeline:
             "scenes": scenes,
         }
 
+    def _ollama_generate(self, prompt: str, timeout: int) -> str | None:
+        """Return Ollama's raw completion via the HTTP API.
+
+        We use /api/generate instead of `ollama run` because the CLI injects
+        terminal reflow/ANSI control codes into stdout even when piped, which
+        corrupt the JSON the model emits. Returns None on any failure.
+        """
+        host = (os.environ.get("OLLAMA_HOST") or "127.0.0.1:11434").strip()
+        if not host.startswith(("http://", "https://")):
+            host = f"http://{host}"
+        try:
+            response = self.http.post(
+                f"{host.rstrip('/')}/api/generate",
+                # format=json constrains the model to emit syntactically valid JSON.
+                # Every caller asks for JSON, so this is safe and kills the
+                # intermittent parse failures from prose-wrapped/malformed output.
+                json={
+                    "model": self.config.ollama_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "format": "json",
+                },
+                timeout=(5, timeout),
+            )
+            response.raise_for_status()
+            return str(response.json().get("response") or "")
+        except requests.exceptions.RequestException as exc:
+            self._warn(f"Ollama error: {exc}")
+            return None
+
     def _generate_script_plan_ollama(self) -> dict[str, Any] | None:
         controls = self._script_prompt_controls()
         scene_target = self._script_scene_target()
@@ -4303,18 +4326,11 @@ class VideoPipeline:
             )
             prompt += f"\n- language: Generate ALL content (scene titles, voiceovers, narration) in {lang_name}. Do NOT use English."
 
-        result = self._run_command(
-            ["ollama", "run", self.config.ollama_model, prompt],
-            timeout=600,
-            check=False,
-        )
-        if result.returncode != 0:
-            stderr = (result.stderr or "").strip()
-            if stderr:
-                self._warn(f"Ollama error: {stderr}")
+        stdout = self._ollama_generate(prompt, timeout=600)
+        if stdout is None:
             return None
 
-        parsed = self._extract_json_object(result.stdout)
+        parsed = self._extract_json_object(stdout)
         if parsed is None:
             return None
         return parsed
@@ -4808,14 +4824,11 @@ class VideoPipeline:
             """
         ).strip()
 
-        result = self._run_command(["ollama", "run", self.config.ollama_model, prompt], timeout=900, check=False)
-        if result.returncode != 0:
-            stderr = (result.stderr or "").strip()
-            if stderr:
-                self._warn(f"Ollama expansion error: {stderr}")
+        stdout = self._ollama_generate(prompt, timeout=900)
+        if stdout is None:
             return None
 
-        parsed = self._extract_json_object(result.stdout)
+        parsed = self._extract_json_object(stdout)
         if parsed is None:
             return None
         return self._normalize_script_plan(parsed)
@@ -4863,14 +4876,11 @@ class VideoPipeline:
             """
         ).strip()
 
-        result = self._run_command(["ollama", "run", self.config.ollama_model, prompt], timeout=900, check=False)
-        if result.returncode != 0:
-            stderr = (result.stderr or "").strip()
-            if stderr:
-                self._warn(f"Ollama compression error: {stderr}")
+        stdout = self._ollama_generate(prompt, timeout=900)
+        if stdout is None:
             return None
 
-        parsed = self._extract_json_object(result.stdout)
+        parsed = self._extract_json_object(stdout)
         if parsed is None:
             return None
         return self._normalize_script_plan(parsed)
@@ -5496,9 +5506,13 @@ class VideoPipeline:
             _orig_g2p = pipeline.g2p
 
             class _G2PWrapper:
-                def __call__(self_, text: str) -> str:  # noqa: N805
+                # kokoro >=0.9 unpacks `ps, _ = self.g2p(chunk)` in its
+                # non-English path, so return a 2-tuple (phoneme string first),
+                # not a bare string (which unpacks char-by-char and explodes).
+                def __call__(self_, text: str):  # noqa: N805
                     result = _orig_g2p(text)
-                    return result[0] if isinstance(result, tuple) else result
+                    ps = result[0] if isinstance(result, tuple) else result
+                    return ps, None
 
             pipeline.g2p = _G2PWrapper()
 
