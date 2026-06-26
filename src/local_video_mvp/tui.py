@@ -637,7 +637,7 @@ class LocalVideoMvpTui:
         return preview_dir
 
     def _thumbnail_export_dir(self) -> Path:
-        target = Path("/Users/rafaelbm/Imagine").resolve()
+        target = self._mp4_export_dir()
         target.mkdir(parents=True, exist_ok=True)
         return target
 
@@ -3190,7 +3190,7 @@ class LocalVideoMvpTui:
     def _select_youtube_publish_video(self) -> tuple[str, Path | None]:
         candidates = self._youtube_publish_candidates()
         if not candidates:
-            self._set_status("No packaged videos found yet in /Users/rafaelbm/Imagine.")
+            self._set_status(f"No packaged videos found yet in {self._mp4_export_dir()}.")
             return ("cancel", None)
         if self._stdscr is None:
             return ("cancel", None)
@@ -3623,7 +3623,7 @@ class LocalVideoMvpTui:
         self._set_status("YouTube upload completed successfully.")
 
     def _iter_youtube_thumbnail_candidates(self) -> list[Path]:
-        root = Path("/Users/rafaelbm/Imagine").resolve()
+        root = self._mp4_export_dir()
         if not root.exists():
             return []
 
@@ -3647,7 +3647,7 @@ class LocalVideoMvpTui:
         if self._stdscr is None:
             return None, False
 
-        root = Path("/Users/rafaelbm/Imagine").resolve()
+        root = self._mp4_export_dir()
         current_path = Path(current_thumbnail).expanduser().resolve() if str(current_thumbnail or "").strip() else None
         candidates = self._iter_youtube_thumbnail_candidates()
         if current_path is not None and current_path.exists() and all(candidate != current_path for candidate in candidates):
@@ -3716,7 +3716,7 @@ class LocalVideoMvpTui:
                             win.addstr(preview_top + row_index, preview_left, " " * preview_width, self._attr("backdrop"))
 
                         if selected_path is None:
-                            placeholder = "No thumbnails found in /Users/rafaelbm/Imagine"
+                            placeholder = f"No thumbnails found in {self._mp4_export_dir()}"
                             win.addstr(
                                 preview_top + max(0, preview_height // 2),
                                 preview_left + 1,
@@ -4032,7 +4032,11 @@ class LocalVideoMvpTui:
         return metadata_dir
 
     def _mp4_export_dir(self) -> Path:
-        return Path("/Users/rafaelbm/Imagine").resolve()
+        # ponytail: export to the current user's ~/Imagine instead of a hardcoded
+        # home; override via IMAGINE_EXPORT_DIR if you want it elsewhere.
+        override = os.environ.get("IMAGINE_EXPORT_DIR")
+        base = Path(override) if override else Path.home() / "Imagine"
+        return base.expanduser().resolve()
 
     def _package_dir_for_project(self, project_dir: Path) -> Path:
         return resolve_video_package(project_dir).package_dir
