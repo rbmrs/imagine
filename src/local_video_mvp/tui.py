@@ -982,6 +982,13 @@ class LocalVideoMvpTui:
             _add(package.package_dir)
         except Exception:
             pass
+        # Fall back to the most recent project so the sandbox finds footage even
+        # without an in-session run (matches the pattern used elsewhere, e.g. the
+        # export flow's `self._active_project_dir or self._latest_project_workspace()`).
+        try:
+            _add(self._latest_project_workspace())
+        except Exception:
+            pass
         return roots
 
     def _thumbnail_hero_image(self, concept: ThumbnailConcept) -> Any:
