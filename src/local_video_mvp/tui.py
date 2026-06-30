@@ -29,11 +29,12 @@ from pathlib import Path
 from typing import Any, Callable, Deque, Literal, Optional, TextIO, TypeVar, cast, overload
 
 try:
-    from PIL import Image, ImageColor, ImageDraw, ImageFilter, ImageFont
+    from PIL import Image, ImageColor, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 except Exception:  # noqa: BLE001
     Image = None
     ImageColor = None
     ImageDraw = None
+    ImageEnhance = None
     ImageFilter = None
     ImageFont = None
 
@@ -829,19 +830,27 @@ class LocalVideoMvpTui:
         return normalized[:2]
 
     def _thumbnail_color(self, raw_value: str, default: str) -> tuple[int, int, int]:
+        # Always return RGB: getrgb yields a 4-tuple for rgba()/8-digit-hex inputs,
+        # and callers append their own alpha (accent + (255,)) which would otherwise
+        # build an invalid 5-element fill and crash the render.
         if ImageColor is None:
             fallback = {"white": (255, 255, 255), "yellow": (255, 225, 64), "black": (0, 0, 0)}
             return fallback.get(default, (20, 184, 255))
         try:
-            return cast(tuple[int, int, int], ImageColor.getrgb(str(raw_value or default)))
+            rgb = ImageColor.getrgb(str(raw_value or default))
         except Exception:
-            return cast(tuple[int, int, int], ImageColor.getrgb(default))
+            rgb = ImageColor.getrgb(default)
+        return cast("tuple[int, int, int]", tuple(rgb[:3]))
 
     def _thumbnail_font_path(self) -> Path | None:
+        # Prefer the bundled heavy display font (Anton, SIL OFL) so output is
+        # identical across machines; fall back to whatever heavy faces the OS has.
+        bundled = Path(__file__).resolve().parent / "assets" / "fonts" / "Anton-Regular.ttf"
         candidates = (
+            str(bundled),
+            "/System/Library/Fonts/Supplemental/Impact.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Black.ttf",
             "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-            "/System/Library/Fonts/Supplemental/DIN Alternate Bold.ttf",
-            "/System/Library/Fonts/Supplemental/Verdana Bold.ttf",
             "/Library/Fonts/Arial Bold.ttf",
         )
         for candidate in candidates:
@@ -867,7 +876,7 @@ class LocalVideoMvpTui:
     def _thumbnail_diffusion_runtime(self) -> tuple[str, Any]:
         if not self._thumbnail_diffusion_backend_ready():
             raise RuntimeError(
-                "Local thumbnail image backend is not installed. Install torch + diffusers in the Imagine environment."
+                "Local thumbnail image backend is not installed. Run: pip install -e '.[thumbnail]'"
             )
         if torch is not None and torch.backends.mps.is_available():
             return "mps", torch.float16
@@ -897,8 +906,32 @@ class LocalVideoMvpTui:
         return pipe
 
     def _generate_thumbnail_background_image(self, concept: ThumbnailConcept) -> Any:
+        """Resolve a 1280x720 RGBA background.
+
+        Order: real footage/stock from the project (most on-brand), then a clean
+        designed gradient. Set IMAGINE_THUMBNAIL_BG=ai to use the local SD-Turbo
+        image model instead.
+        """
         if Image is None:
             raise RuntimeError("Pillow is unavailable for thumbnail rendering.")
+        mode = str(os.environ.get("IMAGINE_THUMBNAIL_BG") or "auto").strip().lower()
+        if mode == "ai":
+            if self._thumbnail_diffusion_backend_ready():
+                try:
+                    return self._generate_thumbnail_ai_background(concept)
+                except Exception as exc:  # noqa: BLE001
+                    self._append_log(f"WARN: AI thumbnail background failed, using footage/gradient: {exc}")
+            else:
+                self._append_log(
+                    "WARN: IMAGINE_THUMBNAIL_BG=ai but the image backend is missing "
+                    "(run: pip install -e '.[thumbnail]'); using footage/gradient instead."
+                )
+        hero = self._thumbnail_hero_image(concept)
+        if hero is not None:
+            return hero
+        return self._designed_gradient_background(concept)
+
+    def _generate_thumbnail_ai_background(self, concept: ThumbnailConcept) -> Any:
         pipe = self._load_thumbnail_diffusion_pipeline()
         device = self._thumbnail_diffusion_device or "cpu"
         subject_prompt = re.sub(r"\s+", " ", str(concept.background_prompt or concept.subject_hint or "").strip())
@@ -916,15 +949,174 @@ class LocalVideoMvpTui:
             height=512,
             width=896,
         )
-        image = result.images[0].convert("RGBA")
-        if image.size != (1280, 720):
-            image = image.resize((1280, 720), Image.Resampling.LANCZOS)
+        image = self._thumbnail_cover_resize(result.images[0])
         if device == "mps" and torch is not None:
             try:
                 torch.mps.empty_cache()
             except Exception:
                 pass
         return image
+
+    def _thumbnail_candidate_roots(self) -> list[Path]:
+        """Directories that may hold the project's rendered video and cached assets."""
+        roots: list[Path] = []
+        seen: set[Path] = set()
+
+        def _add(candidate: Path | None) -> None:
+            if candidate is None:
+                return
+            try:
+                resolved = candidate.expanduser().resolve()
+            except Exception:
+                return
+            if resolved in seen or not resolved.exists():
+                return
+            seen.add(resolved)
+            roots.append(resolved)
+
+        _add(self._active_project_dir)
+        _add(self.config.project_dir)
+        try:
+            package = resolve_video_package(self.config.project_dir)
+            _add(package.metadata_dir)
+            _add(package.package_dir)
+        except Exception:
+            pass
+        return roots
+
+    def _thumbnail_hero_image(self, concept: ThumbnailConcept) -> Any:
+        """A graded 1280x720 background from the project's own footage/stock, or None.
+
+        Prefers the clean downloaded stock assets (no burned-in captions). The
+        rendered final.mp4 is only a last resort because its frames carry the
+        burned subtitle text, which would clash with the headline.
+        """
+        if Image is None:
+            return None
+        roots = self._thumbnail_candidate_roots()
+
+        # 1) Clean cached stock: highest-resolution image, else a frame from a clip.
+        # Sort by (-size, name) so selection is deterministic across machines.
+        images: list[Path] = []
+        clips: list[Path] = []
+        for root in roots:
+            cache = root / "assets" / "cache"
+            if not cache.is_dir():
+                continue
+            for asset in cache.iterdir():
+                suffix = asset.suffix.lower()
+                if suffix in self.IMAGE_SUFFIXES:
+                    images.append(asset)
+                elif suffix in self.VIDEO_SUFFIXES:
+                    clips.append(asset)
+        for asset in sorted(images, key=lambda p: (-self._safe_file_size(p), p.name)):
+            try:
+                with Image.open(asset) as opened:
+                    image = opened.convert("RGB")
+            except Exception:
+                continue
+            self._append_log(f"Thumbnail background: cached image {asset.name}")
+            return self._grade_thumbnail_photo(self._thumbnail_cover_resize(image))
+        for asset in sorted(clips, key=lambda p: (-self._safe_file_size(p), p.name)):
+            frame = self._grab_thumbnail_video_frame(asset)
+            if frame is not None:
+                self._append_log(f"Thumbnail background: cached clip {asset.name}")
+                return self._grade_thumbnail_photo(self._thumbnail_cover_resize(frame))
+
+        # 2) Last resort: a frame from the rendered video (carries burned captions).
+        seen_videos: set[Path] = set()
+        for root in roots:
+            for video in (root / "output" / "final.mp4", root / "final.mp4", *sorted(root.glob("*.mp4"))):
+                if not video.exists() or video in seen_videos:
+                    continue
+                seen_videos.add(video)
+                frame = self._grab_thumbnail_video_frame(video)
+                if frame is not None:
+                    self._append_log(f"Thumbnail background: frame from {video.name} (captions may be present)")
+                    return self._grade_thumbnail_photo(self._thumbnail_cover_resize(frame))
+        return None
+
+    def _safe_file_size(self, path: Path) -> int:
+        try:
+            return path.stat().st_size
+        except OSError:
+            return -1
+
+    def _grab_thumbnail_video_frame(self, video_path: Path, *, fraction: float = 0.4) -> Any:
+        """Extract one representative frame as a PIL RGB image, or None on failure."""
+        if Image is None:
+            return None
+        ffmpeg_bin = self._resolve_ffmpeg_binary()
+        if ffmpeg_bin is None:
+            return None
+        duration = self._probe_media_duration_seconds(video_path) or 0.0
+        timestamp = duration * fraction if duration > 0 else 1.0
+        digest = hashlib.sha1(f"{video_path}|{timestamp:.2f}".encode("utf-8")).hexdigest()[:12]
+        tmp_frame = self._thumbnail_preview_dir() / f"_frame_{digest}.png"
+        frame: Any = None
+        try:
+            completed = subprocess.run(
+                [
+                    ffmpeg_bin,
+                    "-y",
+                    "-ss",
+                    f"{timestamp:.2f}",
+                    "-i",
+                    str(video_path),
+                    "-frames:v",
+                    "1",
+                    "-q:v",
+                    "2",
+                    str(tmp_frame),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if int(completed.returncode or 0) != 0:
+                self._append_log(
+                    f"WARN: ffmpeg frame grab failed for {video_path.name}: "
+                    f"{str(completed.stderr or '').strip()[-300:]}"
+                )
+            elif tmp_frame.exists():
+                with Image.open(tmp_frame) as opened:
+                    frame = opened.convert("RGB")
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"WARN: ffmpeg frame grab errored for {video_path.name}: {exc}")
+        finally:
+            try:
+                tmp_frame.unlink()
+            except OSError:
+                pass
+        return frame
+
+    def _thumbnail_cover_resize(self, image: Any, size: tuple[int, int] = (1280, 720)) -> Any:
+        """Scale-and-crop (cover) so the image fills the target, returning RGBA."""
+        target_w, target_h = size
+        src_w, src_h = image.size
+        if src_w <= 0 or src_h <= 0:
+            return image.convert("RGBA").resize(size, Image.Resampling.LANCZOS)
+        scale = max(target_w / src_w, target_h / src_h)
+        new_w = max(target_w, int(round(src_w * scale)))
+        new_h = max(target_h, int(round(src_h * scale)))
+        resized = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        left = (new_w - target_w) // 2
+        top = (new_h - target_h) // 2
+        cropped = resized.crop((left, top, left + target_w, top + target_h))
+        return cropped.convert("RGBA")
+
+    def _grade_thumbnail_photo(self, image: Any) -> Any:
+        """Light cinematic grade so disparate stock/footage reads consistently."""
+        if ImageEnhance is None:
+            return image
+        try:
+            graded = ImageEnhance.Color(image).enhance(1.18)
+            graded = ImageEnhance.Contrast(graded).enhance(1.12)
+            graded = ImageEnhance.Brightness(graded).enhance(0.98)
+        except Exception:
+            return image
+        return graded
 
     def _thumbnail_headline_lines(
         self,
@@ -955,80 +1147,61 @@ class LocalVideoMvpTui:
                 return grouped
         return [" ".join(words[: max(1, len(words) // 2)]), " ".join(words[max(1, len(words) // 2) :])][:max_line_count]
 
-    def _render_thumbnail_background(self, image: Any, concept: ThumbnailConcept) -> None:
-        if ImageDraw is None or ImageFilter is None:
-            return
-        width, height = image.size
+    def _designed_gradient_background(self, concept: ThumbnailConcept) -> Any:
+        """Clean deterministic gradient used when no project footage/stock exists.
+
+        Deep navy base blended toward a darkened brand accent, with a soft radial
+        highlight for depth. No literal shapes or icons.
+        """
+        width, height = 1280, 720
         accent = self._thumbnail_color(concept.accent_color, "#14b8ff")
-        digest = hashlib.sha1(f"{concept.background_prompt}|{concept.seed}".encode("utf-8")).hexdigest()
-        base_top = (
-            int(digest[0:2], 16) // 2,
-            int(digest[2:4], 16) // 3,
-            int(digest[4:6], 16) // 2,
-        )
-        base_bottom = (
-            max(0, accent[0] // 5),
-            max(0, accent[1] // 5),
-            max(0, accent[2] // 5),
-        )
-        px = image.load()
+        top = (12, 16, 28)
+        bottom = (max(6, accent[0] // 4), max(8, accent[1] // 4), max(12, accent[2] // 4))
+        base = Image.new("RGB", (width, height))
+        draw = ImageDraw.Draw(base)
         for y in range(height):
-            ratio = y / max(1, height - 1)
-            row_color = tuple(int(base_top[i] * (1.0 - ratio) + base_bottom[i] * ratio) for i in range(3))
-            for x in range(width):
-                px[x, y] = row_color
-
-        overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
-
-        subject = concept.subject_hint.lower()
-        hero_box = (int(width * 0.47), int(height * 0.15), int(width * 0.92), int(height * 0.90))
-        if any(token in subject for token in ("face", "human", "person", "man", "woman", "head", "ai")):
-            draw.ellipse(hero_box, fill=accent + (190,))
-            shoulder_box = (int(width * 0.40), int(height * 0.52), int(width * 0.98), int(height * 1.08))
-            draw.ellipse(shoulder_box, fill=(accent[0], accent[1], accent[2], 130))
-        elif any(token in subject for token in ("box", "cube", "package", "console")):
-            draw.rounded_rectangle(hero_box, radius=36, fill=accent + (220,))
-            draw.polygon(
-                [
-                    (hero_box[0], hero_box[1]),
-                    (hero_box[0] + 80, hero_box[1] - 60),
-                    (hero_box[2] + 80, hero_box[1] - 60),
-                    (hero_box[2], hero_box[1]),
-                ],
-                fill=(min(255, accent[0] + 40), min(255, accent[1] + 40), min(255, accent[2] + 40), 160),
+            t = y / max(1, height - 1)
+            draw.line(
+                [(0, y), (width, y)],
+                fill=tuple(int(top[i] * (1.0 - t) + bottom[i] * t) for i in range(3)),
             )
-        elif any(token in subject for token in ("laptop", "screen", "monitor", "phone", "tablet", "tv")):
-            draw.rounded_rectangle(hero_box, radius=32, fill=(245, 245, 245, 230))
-            inner = (hero_box[0] + 28, hero_box[1] + 28, hero_box[2] - 28, hero_box[3] - 70)
-            draw.rounded_rectangle(inner, radius=20, fill=accent + (210,))
-        else:
-            draw.rounded_rectangle(hero_box, radius=48, fill=accent + (210,))
 
-        for index in range(18):
-            offset = int(digest[(index * 2) % len(digest) : (index * 2) % len(digest) + 2], 16)
-            x0 = int(width * 0.45) + (offset * 3) % int(width * 0.5)
-            y0 = (offset * 17 + index * 19) % height
-            x1 = min(width, x0 + 180 + (offset % 140))
-            y1 = min(height, y0 + 2 + (offset % 5))
-            draw.rounded_rectangle((x0, y0, x1, y1), radius=3, fill=(255, 255, 255, 38))
+        highlight = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        hl_draw = ImageDraw.Draw(highlight)
+        cx, cy, radius = int(width * 0.70), int(height * 0.34), int(height * 0.55)
+        hl_draw.ellipse(
+            (cx - radius, cy - radius, cx + radius, cy + radius),
+            fill=(min(255, accent[0] + 30), min(255, accent[1] + 30), min(255, accent[2] + 30), 90),
+        )
+        if ImageFilter is not None:
+            highlight = highlight.filter(ImageFilter.GaussianBlur(radius=120))
+        base_rgba = base.convert("RGBA")
+        base_rgba.alpha_composite(highlight)
+        return base_rgba
 
-        glow = overlay.filter(ImageFilter.GaussianBlur(radius=32))
-        image.alpha_composite(glow)
-        image.alpha_composite(overlay)
+    def _thumbnail_scrim(self, width: int, height: int, block_top: int, block_bottom: int) -> Any:
+        """Darkening overlay (RGBA) covering the headline band so text stays legible.
 
-        vignette = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        vignette_draw = ImageDraw.Draw(vignette)
-        for step in range(10):
-            alpha = int(16 + step * 8)
-            inset = step * 18
-            vignette_draw.rounded_rectangle(
-                (inset, inset, width - inset, height - inset),
-                radius=48,
-                outline=(0, 0, 0, alpha),
-                width=22,
-            )
-        image.alpha_composite(vignette)
+        block_top/block_bottom bound the actual text block; the scrim is strongest
+        across that band and fades out over ~80px above and below it.
+        """
+        scrim = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(scrim)
+        draw.rectangle((0, 0, width, height), fill=(0, 0, 0, 40))  # slight global darken
+        fade = 90
+        core_top = max(0, block_top - 16)
+        core_bottom = min(height, block_bottom + 16)
+        for y in range(height):
+            if core_top <= y <= core_bottom:
+                t = 1.0
+            elif y < core_top:
+                t = max(0.0, 1.0 - (core_top - y) / fade)
+            else:
+                t = max(0.0, 1.0 - (y - core_bottom) / fade)
+            alpha = int(185 * t)
+            if alpha > 0:
+                draw.line([(0, y), (width, y)], fill=(0, 0, 0, alpha))
+        return scrim
 
     def _render_thumbnail_image(self, concept: ThumbnailConcept) -> Path:
         if Image is None or ImageDraw is None:
@@ -1037,64 +1210,68 @@ class LocalVideoMvpTui:
         image = self._generate_thumbnail_background_image(concept)
         if image.mode != "RGBA":
             image = image.convert("RGBA")
+        if image.size != (width, height):
+            image = self._thumbnail_cover_resize(image)
 
         draw = ImageDraw.Draw(image)
         headline_color = self._thumbnail_color(concept.headline_color, "white")
         outline_color = self._thumbnail_color(concept.outline_color, "black")
-        target_width = int(width * 0.86)
-        target_height = int(height * (0.34 if concept.headline_position == "top" else 0.44))
-        font_size = 168 if concept.headline_position == "top" else 184
-        font = self._thumbnail_font(font_size)
-        lines = [concept.headline_text]
-        stroke_width = 6
-        spacing = 10
-        line_boxes: list[tuple[int, int, int, int]] = []
-        text_width = 0
-        text_height = 0
+        accent = self._thumbnail_color(concept.accent_color, "#14b8ff")
+        headline = (concept.headline_text or "").strip().upper() or "BIG IDEA"
 
-        while font_size >= 72:
+        # Heavy headline, left-aligned, fit to a generous safe box by shrinking.
+        margin_x = int(width * 0.06)
+        target_width = width - 2 * margin_x
+        target_height = int(height * 0.50)
+        font_size, min_size = 200, 60
+        font = self._thumbnail_font(font_size)
+        lines: list[str] = [headline]
+        stroke_width = spacing = 0
+        line_boxes: list[tuple[int, int, int, int]] = []
+        text_width = text_height = 0
+        while font_size >= min_size:
             font = self._thumbnail_font(font_size)
-            lines = self._thumbnail_headline_lines(
-                draw,
-                concept.headline_text,
-                font,
-                max_width=target_width,
-                max_lines=2,
-            )
-            stroke_width = max(5, int(font_size * 0.09))
-            spacing = max(8, int(font_size * 0.08))
+            stroke_width = max(6, int(font_size * 0.12))
+            spacing = max(6, int(font_size * 0.06))
+            lines = self._thumbnail_headline_lines(draw, headline, font, max_width=target_width, max_lines=2)
             line_boxes = [draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width) for line in lines]
             text_width = max(box[2] - box[0] for box in line_boxes)
-            text_height = sum((box[3] - box[1]) for box in line_boxes) + spacing * max(0, len(line_boxes) - 1)
+            text_height = sum(box[3] - box[1] for box in line_boxes) + spacing * max(0, len(line_boxes) - 1)
             if text_width <= target_width and text_height <= target_height:
                 break
-            font_size -= 10
+            font_size -= 8
 
+        # Composition: top band, or lower third by default.
         if concept.headline_position == "top":
-            text_x = int((width - text_width) / 2)
-            text_y = int(height * 0.08)
+            block_top = int(height * 0.08)
         else:
-            text_x = int((width - text_width) / 2)
-            text_y = int((height - text_height) / 2)
+            block_top = max(int(height * 0.06), int(height - text_height - height * 0.12))
 
-        plate_margin_x = 42
-        plate_margin_y = 28
-        plate_box = (
-            max(18, text_x - plate_margin_x),
-            max(18, text_y - plate_margin_y),
-            min(width - 18, text_x + text_width + plate_margin_x),
-            min(height - 18, text_y + text_height + plate_margin_y),
-        )
-        plate = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        plate_draw = ImageDraw.Draw(plate)
-        plate_draw.rounded_rectangle(plate_box, radius=30, fill=(0, 0, 0, 96))
-        plate = plate.filter(ImageFilter.GaussianBlur(radius=14))
-        image.alpha_composite(plate)
+        # Brand accent kicker bar just above the headline.
+        bar_h = max(8, int(height * 0.016))
+        bar_y = max(int(height * 0.04), block_top - int(font_size * 0.18) - bar_h)
+        bar_w = min(target_width, max(160, int(text_width * 0.35)))
 
-        current_y = text_y
+        # Darkening scrim sized to the actual headline+bar block, so the text
+        # reads over any footage wherever it landed.
+        scrim = self._thumbnail_scrim(width, height, min(bar_y, block_top), block_top + text_height)
+        image.alpha_composite(scrim)
+        draw = ImageDraw.Draw(image)  # rebind after composite
+
+        draw.rounded_rectangle((margin_x, bar_y, margin_x + bar_w, bar_y + bar_h), radius=bar_h // 2, fill=accent + (255,))
+
+        shadow = max(3, int(font_size * 0.05))
+        current_y = block_top
         for line, box in zip(lines, line_boxes):
-            line_width = box[2] - box[0]
-            line_x = int((width - line_width) / 2)
+            line_x = margin_x - box[0]  # flush-left including stroke overhang
+            draw.text(
+                (line_x + shadow, current_y + shadow),
+                line,
+                font=font,
+                fill=(0, 0, 0),
+                stroke_width=stroke_width,
+                stroke_fill=(0, 0, 0),
+            )
             draw.text(
                 (line_x, current_y),
                 line,
@@ -1256,6 +1433,15 @@ class LocalVideoMvpTui:
         target = self._thumbnail_export_path(prompt)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(render_result.image_path, target)
+        # Also drop the canonical thumbnail_yt.jpg into the active package so the
+        # YouTube publish flow auto-detects it (see youtube._default_thumbnail_path).
+        if self._active_project_dir is not None:
+            try:
+                publish_dir = self._active_project_dir / "publish"
+                publish_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(render_result.image_path, publish_dir / "thumbnail_yt.jpg")
+            except Exception as exc:  # noqa: BLE001
+                self._append_log(f"WARN: Could not write canonical thumbnail_yt.jpg: {exc}")
         return target
 
     def _open_thumbnail_sandbox(self) -> None:

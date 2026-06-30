@@ -26,6 +26,11 @@ voice = [
 ]
 melo = ["MeloTTS @ git+https://github.com/myshell-ai/MeloTTS.git"]
 captions = ["faster-whisper>=1.1.0"]
+# Local SD-Turbo thumbnail backend. torch comes via the voice extra (kokoro).
+thumbnail = [
+  "diffusers>=0.38.0",
+  "accelerate>=1.0.0",
+]
 
 [project.scripts]
 local-video-mvp = "local_video_mvp.cli:main"
@@ -36,3 +41,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+local_video_mvp = ["assets/fonts/*.ttf"]
